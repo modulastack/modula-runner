@@ -18,6 +18,7 @@ import {
 } from '@modulastack/runner-protocol'
 import { backoffDelay, type BackoffOptions } from './backoff.js'
 import { ChannelStore } from './channels.js'
+import { assertSecureUrl } from './secureUrl.js'
 
 const DEFAULT_HIGH_WATER_BYTES = 4 * 1024 * 1024
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
@@ -42,11 +43,13 @@ export type ChannelHandle = {
 }
 
 type Phase = 'idle' | 'running' | 'stopped' | 'failed'
+type ClosingEntry = { reason?: string; sent: boolean }
 
 export class RunnerClient extends EventEmitter {
   private readonly options: RunnerClientOptions
   private readonly store: ChannelStore
-  private readonly pendingCloses = new Map<string, string | undefined>()
+  private readonly closing = new Map<string, ClosingEntry>()
+  private presented = new Set<string>()
   private ws?: WebSocket
   private phase: Phase = 'idle'
   private connected = false
@@ -72,6 +75,7 @@ export class RunnerClient extends EventEmitter {
 
   stop() {
     this.phase = 'stopped'
+    this.connected = false
     this.clearTimers()
     this.ws?.close()
     this.emit('stopped')
@@ -92,6 +96,7 @@ export class RunnerClient extends EventEmitter {
       id: state.id,
       kind,
       send: payload => {
+        if (this.closing.has(state.id)) throw new Error(`channel closing: ${state.id}`)
         this.store.record(state.id, payload)
         this.pump(state.id)
       },
@@ -99,18 +104,47 @@ export class RunnerClient extends EventEmitter {
     }
   }
 
-  // A close while offline leaves a tombstone: dropping silently would orphan the
-  // channel on the control plane, since the next hello no longer presents it.
+  // Close is drain-then-close: the channel stays in the store (and in resume
+  // snapshots) until its buffered frames and the close frame are actually written,
+  // so neither a disconnect nor backpressure can orphan it or drop its tail.
   private closeChannel(id: string, reason?: string) {
-    this.store.drop(id)
-    if (this.connected) this.sendRaw({ type: 'close', channel: id, ...(reason ? { reason } : {}) })
-    else this.pendingCloses.set(id, reason)
+    if (!this.store.get(id) || this.closing.has(id)) return
+    this.closing.set(id, { sent: false, ...(reason === undefined ? {} : { reason }) })
+    if (this.connected) this.finishClose(id)
+  }
+
+  private finishClose(id: string) {
+    const entry = this.closing.get(id)
+    if (!entry || entry.sent || !this.connected) return
+    const state = this.store.get(id)
+    if (!state) {
+      this.closing.delete(id)
+      return
+    }
+    this.pump(id)
+    if (state.flushedSeq === state.sentSeq) this.sendClose(id, entry)
+    else this.scheduleFlush()
+  }
+
+  private sendClose(id: string, entry: ClosingEntry) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return
+    entry.sent = true
+    const frame: Frame = { type: 'close', channel: id, ...(entry.reason === undefined ? {} : { reason: entry.reason }) }
+    this.ws.send(encodeFrame(frame), error => {
+      if (error) {
+        entry.sent = false
+        return
+      }
+      this.store.drop(id)
+      this.closing.delete(id)
+    })
   }
 
   private dial() {
     const ws = new WebSocket(this.options.url, {
       headers: { authorization: `Bearer ${this.options.token}` },
       maxPayload: MAX_FRAME_BYTES,
+      handshakeTimeout: this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
     })
     this.ws = ws
     ws.on('open', () => this.startHandshake())
@@ -122,6 +156,7 @@ export class RunnerClient extends EventEmitter {
 
   private startHandshake() {
     const protocol = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
+    this.presented = new Set(this.store.ids())
     this.sendRaw({ type: 'hello', protocol, runner: this.options.runner, channels: this.store.resumeStates() })
     const timeoutMs = this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
     this.handshakeTimer = setTimeout(() => this.ws?.terminate(), timeoutMs)
@@ -138,6 +173,7 @@ export class RunnerClient extends EventEmitter {
   private handleClose() {
     if (this.phase !== 'running') return
     this.clearTimers()
+    for (const entry of this.closing.values()) entry.sent = false
     if (this.connected) {
       this.connected = false
       this.emit('offline')
@@ -181,37 +217,50 @@ export class RunnerClient extends EventEmitter {
     this.attempt = 0
     this.connected = true
     this.startHeartbeat(frame.heartbeat)
-    const unresumed = new Set(this.store.ids())
-    for (const result of frame.channels) this.resumeChannel(result, unresumed)
-    for (const id of unresumed) this.announceChannel(id)
-    for (const [id, reason] of this.pendingCloses) {
-      this.sendRaw({ type: 'close', channel: id, ...(reason ? { reason } : {}) })
-      this.pendingCloses.delete(id)
-    }
+    this.reconcileChannels(frame.channels)
     this.emit('connected', { protocol: frame.protocol })
   }
 
-  // A resume result for a channel this runner never presented is control-plane
-  // misbehavior; it must be surfaced and skipped, never allowed to throw.
-  private resumeChannel(result: ChannelResumeResult, unresumed: Set<string>) {
-    const state = this.store.get(result.id)
-    if (!state) {
-      this.emit('protocol-error', { message: 'resume result for unknown channel', channel: result.id })
-      return
+  // The welcome is reconciled against the exact hello snapshot: results for channels
+  // never presented are misbehavior to surface, presented channels the welcome omits
+  // are re-announced from sequence zero (never trusted to a stale flush position),
+  // and channels created mid-handshake are announced now.
+  private reconcileChannels(results: ChannelResumeResult[]) {
+    const unanswered = new Set(this.presented)
+    for (const result of results) {
+      if (!this.presented.has(result.id)) {
+        this.emit('protocol-error', { message: 'resume result for unknown channel', channel: result.id })
+        continue
+      }
+      unanswered.delete(result.id)
+      this.resumeChannel(result)
     }
-    unresumed.delete(result.id)
+    for (const id of unanswered) this.reannounce(id)
+    for (const id of this.store.ids()) if (!this.presented.has(id)) this.announceChannel(id)
+    for (const id of [...this.closing.keys()]) this.finishClose(id)
+  }
+
+  private resumeChannel(result: ChannelResumeResult) {
+    const state = this.store.get(result.id)
+    if (!state) return
     if (result.status === 'expired') {
       this.store.drop(result.id)
-      this.emit('channel-expired', { channel: result.id })
+      if (!this.closing.delete(result.id)) this.emit('channel-expired', { channel: result.id })
       return
     }
     state.flushedSeq = Math.min(result.receivedSeq, state.sentSeq)
     const outcome = this.pump(result.id)
-    this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
+    if (!this.closing.has(result.id)) this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
   }
 
-  // A channel opened between hello and welcome was in neither the resume snapshot
-  // nor the results; it is announced now so its frames have a registered target.
+  private reannounce(id: string) {
+    const state = this.store.get(id)
+    if (!state) return
+    this.emit('protocol-error', { message: 'welcome omitted a presented channel', channel: id })
+    state.flushedSeq = 0
+    this.announceChannel(id)
+  }
+
   private announceChannel(id: string) {
     const state = this.store.get(id)
     if (!state) return
@@ -250,7 +299,10 @@ export class RunnerClient extends EventEmitter {
     if (this.flushTimer) return
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined
-      for (const id of this.store.ids()) this.pump(id)
+      for (const id of this.store.ids()) {
+        this.pump(id)
+        if (this.closing.has(id)) this.finishClose(id)
+      }
     }, FLUSH_INTERVAL_MS)
   }
 
@@ -269,6 +321,7 @@ export class RunnerClient extends EventEmitter {
 
   private handleChannelClose(channel: string, reason?: string) {
     this.store.drop(channel)
+    this.closing.delete(channel)
     this.emit('channel-closed', { channel, ...(reason ? { reason } : {}) })
   }
 
@@ -288,6 +341,7 @@ export class RunnerClient extends EventEmitter {
 
   private fail(event: string, detail: unknown) {
     this.phase = 'failed'
+    this.connected = false
     this.clearTimers()
     this.emit(event, detail)
     this.ws?.close()
@@ -311,15 +365,4 @@ export class RunnerClient extends EventEmitter {
     this.flushTimer = undefined
     this.clearHandshakeTimer()
   }
-}
-
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
-
-// No override exists on purpose: the bearer token rides the upgrade request, so
-// plaintext toward anything but loopback would expose the connection credential.
-function assertSecureUrl(url: string) {
-  const parsed = new URL(url)
-  if (parsed.protocol === 'wss:') return
-  if (parsed.protocol !== 'ws:') throw new Error(`unsupported URL scheme: ${parsed.protocol}`)
-  if (!LOOPBACK_HOSTS.has(parsed.hostname)) throw new Error('plaintext ws:// is only allowed toward loopback')
 }

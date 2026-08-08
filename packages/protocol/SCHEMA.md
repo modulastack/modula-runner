@@ -71,7 +71,9 @@ answers each with `{id, status: 'resumed', receivedSeq}` or `{id, status: 'expir
 | `pong` | both | `id` (echoed) |
 
 The `welcome.heartbeat` policy governs: a peer that hears nothing for `timeoutMs` treats
-the connection as dead. The runner reconnects; the control plane marks the runner offline
+the connection as dead. Policy values are bounded by the schema — `intervalMs` is at
+least 200 ms, `timeoutMs` is at least `intervalMs`, and both stay within the 32-bit
+timer range — so a welcome cannot dictate a busy-loop ping rate or an overflowed timer. The runner reconnects; the control plane marks the runner offline
 — visibly, within one heartbeat window.
 
 ### Channels

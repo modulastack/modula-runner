@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import type { ChannelKind, ChannelResumeState, DataFrame, Payload, ResetFrame } from '@modulastack/runner-protocol'
+import { MAX_FRAME_BYTES, type ChannelKind, type ChannelResumeState, type DataFrame, type Payload, type ResetFrame } from '@modulastack/runner-protocol'
 
 const DEFAULT_BUFFER_BYTES = 512 * 1024
 
@@ -56,18 +56,23 @@ export class ChannelStore {
     this.channels.delete(id)
   }
 
-  // The frame is proven serializable before any state mutates: an unencodable body
-  // must fail the caller, not leave a hole in the sequence.
+  // The frame is proven serializable, checked against the wire cap, and snapshotted
+  // before any state mutates: an unencodable or oversized body must fail the caller
+  // without leaving a hole, and a caller mutating its payload afterwards must not be
+  // able to change what a replay retransmits under the same sequence number.
   record(id: string, payload: Payload): DataFrame {
     const state = this.require(id)
-    const frame: DataFrame = { type: 'data', channel: id, seq: state.sentSeq + 1, payload }
-    const bytes = frameBytes(frame)
+    const candidate: DataFrame = { type: 'data', channel: id, seq: state.sentSeq + 1, payload }
+    const serialized = JSON.stringify(candidate)
+    const bytes = Buffer.byteLength(serialized, 'utf8')
+    if (bytes > MAX_FRAME_BYTES) throw new RangeError('frame exceeds MAX_FRAME_BYTES')
+    const frame = JSON.parse(serialized) as DataFrame
     state.sentSeq = frame.seq
     state.buffer.push(frame)
     state.bufferBytes += bytes
     while (state.bufferBytes > this.bufferLimit && state.buffer.length > 1) {
       const evicted = state.buffer.shift()
-      if (evicted) state.bufferBytes -= frameBytes(evicted)
+      if (evicted) state.bufferBytes -= Buffer.byteLength(JSON.stringify(evicted), 'utf8')
     }
     return frame
   }
@@ -99,13 +104,14 @@ export class ChannelStore {
 
   // The next thing to put on the wire after flushedSeq: a buffered frame when the
   // buffer still covers the gap, an explicit reset when eviction has outrun it.
+  // The buffer holds contiguous ascending sequences, so the lookup is index math.
   nextOutbound(id: string, flushedSeq: number): NextOutbound {
     const state = this.require(id)
     if (flushedSeq >= state.sentSeq) return {}
     const oldest = state.buffer[0]
     if (!oldest) return {}
     if (oldest.seq > flushedSeq + 1) return { reset: { type: 'reset', channel: id, seq: oldest.seq } }
-    const frame = state.buffer.find(candidate => candidate.seq > flushedSeq)
+    const frame = state.buffer[flushedSeq + 1 - oldest.seq]
     return frame ? { frame } : {}
   }
 
@@ -114,8 +120,4 @@ export class ChannelStore {
     if (!state) throw new Error(`unknown channel: ${id}`)
     return state
   }
-}
-
-function frameBytes(frame: DataFrame) {
-  return Buffer.byteLength(JSON.stringify(frame), 'utf8')
 }

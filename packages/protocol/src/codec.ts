@@ -127,8 +127,15 @@ function isRunnerInfo(value: unknown): value is { name: string; version: string;
     && typeof value.os === 'string' && typeof value.arch === 'string'
 }
 
+// Bounded so one authenticated welcome cannot dictate a busy-loop ping rate, and so
+// no value overflows Node's 32-bit timer range (which coerces the delay to 1 ms).
+const MIN_HEARTBEAT_INTERVAL_MS = 200
+const MAX_TIMER_MS = 2_147_483_647
+
 function isHeartbeat(value: unknown): value is { intervalMs: number; timeoutMs: number } {
-  return isRecord(value) && isPositiveInt(value.intervalMs) && isPositiveInt(value.timeoutMs)
+  if (!isRecord(value) || !isPositiveInt(value.intervalMs) || !isPositiveInt(value.timeoutMs)) return false
+  return value.intervalMs >= MIN_HEARTBEAT_INTERVAL_MS && value.intervalMs <= MAX_TIMER_MS
+    && value.timeoutMs >= value.intervalMs && value.timeoutMs <= MAX_TIMER_MS
 }
 
 function isToken(value: unknown): value is string {

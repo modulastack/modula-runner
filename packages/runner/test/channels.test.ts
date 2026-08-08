@@ -38,6 +38,24 @@ describe('channel store', () => {
     expect(store.get(id)?.buffer).toHaveLength(1)
   })
 
+  it('rejects a frame over the wire cap without corrupting state', () => {
+    const store = new ChannelStore()
+    const { id } = store.open('terminal')
+    expect(() => store.record(id, text('x'.repeat(1024 * 1024)))).toThrow(RangeError)
+    const frame = store.record(id, text('small'))
+    expect(frame.seq).toBe(1)
+  })
+
+  it('buffers a snapshot immune to later caller mutation', () => {
+    const store = new ChannelStore()
+    const { id } = store.open('terminal')
+    const body = { value: 1 }
+    store.record(id, { codec: 'json', body })
+    body.value = 2
+    const next = store.nextOutbound(id, 0)
+    expect((next.frame?.payload as { body: { value: number } }).body.value).toBe(1)
+  })
+
   it('offers a reset when eviction has outrun the flush position', () => {
     const store = new ChannelStore(1)
     const { id } = store.open('terminal')

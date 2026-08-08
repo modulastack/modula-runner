@@ -93,10 +93,81 @@ describe('channel lifecycle under pressure', () => {
     channel.close('abandoned')
     await reconnected
     await until(() => stub!.closes.length === 1)
+    await until(() => runner.channelIds().length === 0)
 
     expect(stub.closes).toEqual([{ channel: channel.id, reason: 'abandoned' }])
     expect(stub.channels.has(channel.id)).toBe(false)
-    expect(runner.channelIds()).toEqual([])
+    expect(() => channel.send(text('after-close'))).toThrow(/closing|unknown channel/)
+  })
+
+  it('drains buffered frames before delivering a close', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { highWaterBytes: 1 })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    channel.send(text('two'))
+    channel.send(text('three'))
+    channel.close('done')
+    await until(() => stub!.closes.length === 1)
+
+    expect(stub.received.map(entry => entry.seq)).toEqual([1, 2, 3])
+    expect(stub.closes).toEqual([{ channel: channel.id, reason: 'done' }])
+    await until(() => runner.channelIds().length === 0)
+  })
+
+  it('re-announces and fully replays a presented channel the welcome omitted', async () => {
+    stub = await new StubControlPlane({ omitResume: true }).start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 150, capMs: 300 } })
+    const errors: { message: string }[] = []
+    runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    channel.send(text('two'))
+    await until(() => stub!.received.length === 2)
+
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await reconnected
+    await until(() => stub!.received.length === 4)
+
+    expect(errors.map(entry => entry.message)).toContain('welcome omitted a presented channel')
+    expect(stub.received.slice(-2).map(entry => entry.seq)).toEqual([1, 2])
+  })
+
+  it('reports disconnected immediately after stop', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    runner.stop()
+    expect(runner.isConnected()).toBe(false)
+  })
+
+  it('abandons an upgrade the server never completes', async () => {
+    const net = await import('node:net')
+    let connections = 0
+    const sockets = new Set<import('node:net').Socket>()
+    const server = net.createServer(socket => {
+      connections += 1
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('no port')
+    const runner = makeClient(`ws://127.0.0.1:${address.port}`, { handshakeTimeoutMs: 150 })
+    runner.connect()
+    await until(() => connections >= 2)
+    runner.stop()
+    for (const socket of sockets) socket.destroy()
+    await new Promise<void>(resolve => server.close(() => resolve()))
   })
 
   it('announces a channel opened between hello and welcome', async () => {

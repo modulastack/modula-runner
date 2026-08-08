@@ -23,6 +23,7 @@ export type StubOptions = {
   welcomeVersionOverride?: number
   extraResumeIds?: string[]
   delayWelcomeMs?: number
+  omitResume?: boolean
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -137,7 +138,7 @@ export class StubControlPlane {
       return
     }
     const heartbeat = this.options.heartbeat ?? { intervalMs: 200, timeoutMs: 1_000 }
-    const channels = hello.channels.map(state => this.resume(state.id, state.kind, state.attachToken))
+    const channels = this.options.omitResume ? [] : hello.channels.map(state => this.resume(state.id, state.kind, state.attachToken))
     for (const ghost of this.options.extraResumeIds ?? []) channels.push({ id: ghost, status: 'resumed', receivedSeq: 0 })
     const welcome = encodeFrame({ type: 'welcome', protocol: this.options.welcomeVersionOverride ?? version, heartbeat, channels })
     const delay = this.options.delayWelcomeMs ?? 0

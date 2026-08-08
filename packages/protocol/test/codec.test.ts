@@ -50,6 +50,15 @@ describe('codec', () => {
     expect(decodeFrame(JSON.stringify({ type: 'hello', protocol: { min: 2, max: 1 }, runner: { name: 'r', version: 'v', os: 'l', arch: 'x' }, channels: [] }))).toBeNull()
   })
 
+  it('bounds heartbeat policy values', () => {
+    const welcome = (intervalMs: number, timeoutMs: number) =>
+      decodeFrame(JSON.stringify({ type: 'welcome', protocol: 1, heartbeat: { intervalMs, timeoutMs }, channels: [] }))
+    expect(welcome(1, 1000)).toBeNull()
+    expect(welcome(2_147_483_648, 2_147_483_648)).toBeNull()
+    expect(welcome(1000, 500)).toBeNull()
+    expect(welcome(200, 200)).not.toBeNull()
+  })
+
   it('drops frames past the size cap', () => {
     const oversized = encodeFrame({ type: 'data', channel: 'ch1', seq: 1, payload: { codec: 'text', body: 'x'.repeat(MAX_FRAME_BYTES) } })
     expect(decodeFrame(oversized)).toBeNull()

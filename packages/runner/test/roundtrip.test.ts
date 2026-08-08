@@ -58,7 +58,7 @@ describe('stub round-trip', () => {
   })
 
   it('keeps heartbeats flowing in both directions', async () => {
-    stub = await new StubControlPlane({ heartbeat: { intervalMs: 50, timeoutMs: 500 } }).start()
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 1_000 } }).start()
     const runner = await connectedClient(stub.url)
     await until(() => stub!.runnerPings.length >= 2)
     stub.pingRunner('cp-hb-1')
@@ -67,7 +67,7 @@ describe('stub round-trip', () => {
   })
 
   it('treats a silent control plane as dead and reconnects', async () => {
-    stub = await new StubControlPlane({ heartbeat: { intervalMs: 50, timeoutMs: 200 }, mutePings: true }).start()
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     await connectedClient(stub.url)
     await until(() => stub!.connectionCount >= 2)
     expect(stub.runnerPings.length).toBeGreaterThan(0)
