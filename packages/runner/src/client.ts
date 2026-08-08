@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import {
+  MAX_FRAME_BYTES,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   decodeFrame,
@@ -18,6 +19,10 @@ import {
 import { backoffDelay, type BackoffOptions } from './backoff.js'
 import { ChannelStore } from './channels.js'
 
+const DEFAULT_HIGH_WATER_BYTES = 4 * 1024 * 1024
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
+const FLUSH_INTERVAL_MS = 20
+
 export type RunnerClientOptions = {
   url: string
   token: string
@@ -25,7 +30,8 @@ export type RunnerClientOptions = {
   protocol?: VersionRange
   backoff?: BackoffOptions
   bufferBytes?: number
-  allowInsecure?: boolean
+  highWaterBytes?: number
+  handshakeTimeoutMs?: number
 }
 
 export type ChannelHandle = {
@@ -40,6 +46,7 @@ type Phase = 'idle' | 'running' | 'stopped' | 'failed'
 export class RunnerClient extends EventEmitter {
   private readonly options: RunnerClientOptions
   private readonly store: ChannelStore
+  private readonly pendingCloses = new Map<string, string | undefined>()
   private ws?: WebSocket
   private phase: Phase = 'idle'
   private connected = false
@@ -47,10 +54,12 @@ export class RunnerClient extends EventEmitter {
   private lastSeen = 0
   private heartbeatTimer: NodeJS.Timeout | undefined
   private reconnectTimer: NodeJS.Timeout | undefined
+  private handshakeTimer: NodeJS.Timeout | undefined
+  private flushTimer: NodeJS.Timeout | undefined
 
   constructor(options: RunnerClientOptions) {
     super()
-    assertSecureUrl(options.url, options.allowInsecure ?? false)
+    assertSecureUrl(options.url)
     this.options = options
     this.store = new ChannelStore(options.bufferBytes)
   }
@@ -78,31 +87,44 @@ export class RunnerClient extends EventEmitter {
 
   openChannel(kind: ChannelKind): ChannelHandle {
     const state = this.store.open(kind)
-    this.sendFrame({ type: 'open', channel: state.id, kind, attachToken: state.attachToken })
+    if (this.connected) this.sendRaw({ type: 'open', channel: state.id, kind, attachToken: state.attachToken })
     return {
       id: state.id,
       kind,
-      send: payload => this.sendFrame(this.store.record(state.id, payload)),
-      close: reason => {
-        this.store.drop(state.id)
-        this.sendFrame({ type: 'close', channel: state.id, ...(reason ? { reason } : {}) })
+      send: payload => {
+        this.store.record(state.id, payload)
+        this.pump(state.id)
       },
+      close: reason => this.closeChannel(state.id, reason),
     }
   }
 
+  // A close while offline leaves a tombstone: dropping silently would orphan the
+  // channel on the control plane, since the next hello no longer presents it.
+  private closeChannel(id: string, reason?: string) {
+    this.store.drop(id)
+    if (this.connected) this.sendRaw({ type: 'close', channel: id, ...(reason ? { reason } : {}) })
+    else this.pendingCloses.set(id, reason)
+  }
+
   private dial() {
-    const ws = new WebSocket(this.options.url, { headers: { authorization: `Bearer ${this.options.token}` } })
+    const ws = new WebSocket(this.options.url, {
+      headers: { authorization: `Bearer ${this.options.token}` },
+      maxPayload: MAX_FRAME_BYTES,
+    })
     this.ws = ws
-    ws.on('open', () => this.sendHello())
+    ws.on('open', () => this.startHandshake())
     ws.on('message', raw => this.handleRaw(String(raw)))
     ws.on('unexpected-response', (_request, response) => this.handleUpgradeFailure(response.statusCode))
     ws.on('error', () => undefined)
     ws.on('close', () => this.handleClose())
   }
 
-  private sendHello() {
+  private startHandshake() {
     const protocol = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
     this.sendRaw({ type: 'hello', protocol, runner: this.options.runner, channels: this.store.resumeStates() })
+    const timeoutMs = this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
+    this.handshakeTimer = setTimeout(() => this.ws?.terminate(), timeoutMs)
   }
 
   private handleUpgradeFailure(statusCode?: number) {
@@ -150,29 +172,93 @@ export class RunnerClient extends EventEmitter {
   }
 
   private handleWelcome(frame: WelcomeFrame) {
+    this.clearHandshakeTimer()
+    const offered = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
+    if (frame.protocol < offered.min || frame.protocol > offered.max) {
+      this.fail('protocol-error', { message: 'welcome selected an unsupported protocol version', protocol: frame.protocol })
+      return
+    }
     this.attempt = 0
     this.connected = true
     this.startHeartbeat(frame.heartbeat)
-    for (const result of frame.channels) this.resumeChannel(result)
+    const unresumed = new Set(this.store.ids())
+    for (const result of frame.channels) this.resumeChannel(result, unresumed)
+    for (const id of unresumed) this.announceChannel(id)
+    for (const [id, reason] of this.pendingCloses) {
+      this.sendRaw({ type: 'close', channel: id, ...(reason ? { reason } : {}) })
+      this.pendingCloses.delete(id)
+    }
     this.emit('connected', { protocol: frame.protocol })
   }
 
-  private resumeChannel(result: ChannelResumeResult) {
+  // A resume result for a channel this runner never presented is control-plane
+  // misbehavior; it must be surfaced and skipped, never allowed to throw.
+  private resumeChannel(result: ChannelResumeResult, unresumed: Set<string>) {
+    const state = this.store.get(result.id)
+    if (!state) {
+      this.emit('protocol-error', { message: 'resume result for unknown channel', channel: result.id })
+      return
+    }
+    unresumed.delete(result.id)
     if (result.status === 'expired') {
       this.store.drop(result.id)
       this.emit('channel-expired', { channel: result.id })
       return
     }
-    const replay = this.store.replayAfter(result.id, result.receivedSeq)
-    if (replay.reset) this.sendRaw(replay.reset)
-    for (const dataFrame of replay.frames) this.sendRaw(dataFrame)
-    this.emit('channel-resumed', { channel: result.id, replayed: replay.frames.length, reset: Boolean(replay.reset) })
+    state.flushedSeq = Math.min(result.receivedSeq, state.sentSeq)
+    const outcome = this.pump(result.id)
+    this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
+  }
+
+  // A channel opened between hello and welcome was in neither the resume snapshot
+  // nor the results; it is announced now so its frames have a registered target.
+  private announceChannel(id: string) {
+    const state = this.store.get(id)
+    if (!state) return
+    this.sendRaw({ type: 'open', channel: id, kind: state.kind, attachToken: state.attachToken })
+    this.pump(id)
+  }
+
+  // All data transmission funnels through here: frames flow only while the socket
+  // buffer is under the high-water mark, and everything else waits in the replay
+  // buffer — backpressure never breaks sequence continuity, it only delays it.
+  private pump(id: string): { sent: number; reset: boolean } {
+    const outcome = { sent: 0, reset: false }
+    const state = this.store.get(id)
+    if (!state) return outcome
+    while (this.connected && state.flushedSeq < state.sentSeq) {
+      if ((this.ws?.bufferedAmount ?? 0) > (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) {
+        this.scheduleFlush()
+        break
+      }
+      const next = this.store.nextOutbound(id, state.flushedSeq)
+      if (next.reset) {
+        this.sendRaw(next.reset)
+        state.flushedSeq = next.reset.seq - 1
+        outcome.reset = true
+        continue
+      }
+      if (!next.frame) break
+      this.sendRaw(next.frame)
+      state.flushedSeq = next.frame.seq
+      outcome.sent++
+    }
+    return outcome
+  }
+
+  private scheduleFlush() {
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined
+      for (const id of this.store.ids()) this.pump(id)
+    }, FLUSH_INTERVAL_MS)
   }
 
   private handleData(channel: string, seq: number, payload: Payload) {
     if (!this.store.get(channel)) return
-    const fresh = this.store.receive({ type: 'data', channel, seq, payload })
-    if (fresh) this.emit('data', { channel, seq, payload: fresh })
+    const result = this.store.receive({ type: 'data', channel, seq, payload })
+    if (result.status === 'accepted') this.emit('data', { channel, seq, payload: result.payload })
+    else if (result.status === 'gap') this.emit('protocol-error', { message: 'sequence gap', channel, seq })
   }
 
   private handleReset(channel: string, seq: number) {
@@ -207,29 +293,33 @@ export class RunnerClient extends EventEmitter {
     this.ws?.close()
   }
 
-  private sendFrame(frame: Frame) {
-    if (this.connected) this.sendRaw(frame)
-  }
-
   private sendRaw(frame: Frame) {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(encodeFrame(frame))
+  }
+
+  private clearHandshakeTimer() {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
+    this.handshakeTimer = undefined
   }
 
   private clearTimers() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    if (this.flushTimer) clearTimeout(this.flushTimer)
     this.heartbeatTimer = undefined
     this.reconnectTimer = undefined
+    this.flushTimer = undefined
+    this.clearHandshakeTimer()
   }
 }
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
-function assertSecureUrl(url: string, allowInsecure: boolean) {
+// No override exists on purpose: the bearer token rides the upgrade request, so
+// plaintext toward anything but loopback would expose the connection credential.
+function assertSecureUrl(url: string) {
   const parsed = new URL(url)
   if (parsed.protocol === 'wss:') return
   if (parsed.protocol !== 'ws:') throw new Error(`unsupported URL scheme: ${parsed.protocol}`)
-  if (!LOOPBACK_HOSTS.has(parsed.hostname) && !allowInsecure) {
-    throw new Error('plaintext ws:// is only allowed toward loopback')
-  }
+  if (!LOOPBACK_HOSTS.has(parsed.hostname)) throw new Error('plaintext ws:// is only allowed toward loopback')
 }

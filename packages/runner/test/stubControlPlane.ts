@@ -19,6 +19,10 @@ export type StubOptions = {
   heartbeat?: HeartbeatPolicy
   echo?: boolean
   mutePings?: boolean
+  muteWelcome?: boolean
+  welcomeVersionOverride?: number
+  extraResumeIds?: string[]
+  delayWelcomeMs?: number
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -28,6 +32,7 @@ export class StubControlPlane {
   readonly channels = new Map<string, StubChannel>()
   readonly received: ReceivedData[] = []
   readonly resets: { channel: string; seq: number }[] = []
+  readonly closes: { channel: string; reason?: string }[] = []
   readonly hellos: HelloFrame[] = []
   readonly runnerPings: string[] = []
   readonly runnerPongs: string[] = []
@@ -80,6 +85,10 @@ export class StubControlPlane {
     for (const socket of this.sockets) socket.send(encodeFrame({ type: 'ping', id }))
   }
 
+  sendTextToAll(raw: string) {
+    for (const socket of this.sockets) socket.send(raw)
+  }
+
   private upgrade(request: IncomingMessage, socket: Duplex, head: Buffer) {
     const expected = `Bearer ${this.options.token ?? 'stub-token'}`
     if (request.headers.authorization !== expected) {
@@ -106,7 +115,10 @@ export class StubControlPlane {
     if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
     if (frame.type === 'ping') return this.handlePing(ws, frame.id)
     if (frame.type === 'pong') this.runnerPongs.push(frame.id)
-    if (frame.type === 'close') this.channels.delete(frame.channel)
+    if (frame.type === 'close') {
+      this.closes.push({ channel: frame.channel, ...(frame.reason ? { reason: frame.reason } : {}) })
+      this.channels.delete(frame.channel)
+    }
   }
 
   private handlePing(ws: WebSocket, id: string) {
@@ -116,6 +128,7 @@ export class StubControlPlane {
 
   private handleHello(ws: WebSocket, hello: HelloFrame) {
     this.hellos.push(hello)
+    if (this.options.muteWelcome) return
     const supported = this.options.supportedVersions ?? [PROTOCOL_VERSION]
     const version = negotiate(hello.protocol, supported)
     if (version === null) {
@@ -125,7 +138,11 @@ export class StubControlPlane {
     }
     const heartbeat = this.options.heartbeat ?? { intervalMs: 200, timeoutMs: 1_000 }
     const channels = hello.channels.map(state => this.resume(state.id, state.kind, state.attachToken))
-    ws.send(encodeFrame({ type: 'welcome', protocol: version, heartbeat, channels }))
+    for (const ghost of this.options.extraResumeIds ?? []) channels.push({ id: ghost, status: 'resumed', receivedSeq: 0 })
+    const welcome = encodeFrame({ type: 'welcome', protocol: this.options.welcomeVersionOverride ?? version, heartbeat, channels })
+    const delay = this.options.delayWelcomeMs ?? 0
+    if (delay > 0) setTimeout(() => { if (ws.readyState === ws.OPEN) ws.send(welcome) }, delay)
+    else ws.send(welcome)
   }
 
   // Unknown channels are adopted: a channel opened while the control plane was away

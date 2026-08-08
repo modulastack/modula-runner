@@ -9,11 +9,17 @@ export type ChannelState = {
   attachToken: string
   sentSeq: number
   receivedSeq: number
+  flushedSeq: number
   buffer: DataFrame[]
   bufferBytes: number
 }
 
-export type Replay = { reset?: ResetFrame; frames: DataFrame[] }
+export type ReceiveResult =
+  | { status: 'accepted'; payload: Payload }
+  | { status: 'duplicate' }
+  | { status: 'gap' }
+
+export type NextOutbound = { reset?: ResetFrame; frame?: DataFrame }
 
 export class ChannelStore {
   private readonly channels = new Map<string, ChannelState>()
@@ -30,6 +36,7 @@ export class ChannelStore {
       attachToken: randomBytes(24).toString('base64url'),
       sentSeq: 0,
       receivedSeq: 0,
+      flushedSeq: 0,
       buffer: [],
       bufferBytes: 0,
     }
@@ -49,11 +56,15 @@ export class ChannelStore {
     this.channels.delete(id)
   }
 
+  // The frame is proven serializable before any state mutates: an unencodable body
+  // must fail the caller, not leave a hole in the sequence.
   record(id: string, payload: Payload): DataFrame {
     const state = this.require(id)
-    const frame: DataFrame = { type: 'data', channel: id, seq: ++state.sentSeq, payload }
+    const frame: DataFrame = { type: 'data', channel: id, seq: state.sentSeq + 1, payload }
+    const bytes = frameBytes(frame)
+    state.sentSeq = frame.seq
     state.buffer.push(frame)
-    state.bufferBytes += frameBytes(frame)
+    state.bufferBytes += bytes
     while (state.bufferBytes > this.bufferLimit && state.buffer.length > 1) {
       const evicted = state.buffer.shift()
       if (evicted) state.bufferBytes -= frameBytes(evicted)
@@ -61,12 +72,15 @@ export class ChannelStore {
     return frame
   }
 
-  // Replay is idempotent at the receiver, so duplicates are ignored there.
-  receive(frame: DataFrame): Payload | null {
+  // Only the next contiguous sequence advances the high-water mark: anything at or
+  // below it is a replay duplicate, anything past it is a gap the sender must have
+  // announced with a reset — accepting it would splice over lost frames silently.
+  receive(frame: DataFrame): ReceiveResult {
     const state = this.require(frame.channel)
-    if (frame.seq <= state.receivedSeq) return null
+    if (frame.seq <= state.receivedSeq) return { status: 'duplicate' }
+    if (frame.seq > state.receivedSeq + 1) return { status: 'gap' }
     state.receivedSeq = frame.seq
-    return frame.payload
+    return { status: 'accepted', payload: frame.payload }
   }
 
   receiveReset(id: string, seq: number) {
@@ -83,17 +97,16 @@ export class ChannelStore {
     }))
   }
 
-  // The peer confirmed peerReceivedSeq; everything after it must be replayed. When the
-  // gap has outrun the buffer, the loss is announced with a reset, never spliced over.
-  replayAfter(id: string, peerReceivedSeq: number): Replay {
+  // The next thing to put on the wire after flushedSeq: a buffered frame when the
+  // buffer still covers the gap, an explicit reset when eviction has outrun it.
+  nextOutbound(id: string, flushedSeq: number): NextOutbound {
     const state = this.require(id)
-    if (peerReceivedSeq >= state.sentSeq) return { frames: [] }
+    if (flushedSeq >= state.sentSeq) return {}
     const oldest = state.buffer[0]
-    if (!oldest || oldest.seq > peerReceivedSeq + 1) {
-      const floor = oldest?.seq ?? state.sentSeq + 1
-      return { reset: { type: 'reset', channel: id, seq: floor }, frames: [...state.buffer] }
-    }
-    return { frames: state.buffer.filter(frame => frame.seq > peerReceivedSeq) }
+    if (!oldest) return {}
+    if (oldest.seq > flushedSeq + 1) return { reset: { type: 'reset', channel: id, seq: oldest.seq } }
+    const frame = state.buffer.find(candidate => candidate.seq > flushedSeq)
+    return frame ? { frame } : {}
   }
 
   private require(id: string): ChannelState {

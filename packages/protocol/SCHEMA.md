@@ -22,7 +22,10 @@ bug to fix.
 - Every frame is one WebSocket text message containing one JSON object with a `type`
   field. Maximum encoded size: **1 MiB** (`MAX_FRAME_BYTES`). Oversized or structurally
   invalid frames are dropped by the codec (`decodeFrame` returns `null`); a peer may
-  answer with an `error` frame but must not crash or splice.
+  answer with an `error` frame but must not crash or splice. Implementations also
+  enforce the cap at the socket layer (the runner sets it as the WebSocket
+  `maxPayload`), so an oversized message terminates the connection instead of
+  being assembled in memory.
 - Identifiers on the wire (`channel`, ping `id`) satisfy the safe-segment rule
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Identifiers can reach a filesystem on the runner,
   so the wire enforces what the runner would have to enforce anyway.
@@ -91,8 +94,13 @@ later revisions (see the seam reconciliation note for why they exist now).
   resume credential for that channel — the same machinery terminal sessions already use
   for browser reattach, extended across this seam rather than replaced.
 - `data` frames carry a per-channel sequence number, starting at 1, monotonic per
-  direction. A receiver ignores `seq ≤` its high-water mark, which makes replay
-  idempotent.
+  direction. A receiver accepts exactly the next contiguous sequence: anything at or
+  below its high-water mark is a replay duplicate and is ignored (replay idempotence),
+  and anything past the next sequence is a protocol violation to surface, not splice
+  over — a compliant sender never skips ahead except through an explicit `reset`.
+- Senders pause transmission when the socket's buffered bytes exceed a high-water
+  mark; paused frames stay in the replay buffer and flush strictly in order, so
+  backpressure delays a stream but never breaks its continuity.
 - Each side retains a bounded replay buffer of sent `data` frames. On reconnect the
   `welcome`'s `receivedSeq` tells the runner exactly what the control plane missed; the
   runner replays the gap, and vice versa in later revisions when the control plane
