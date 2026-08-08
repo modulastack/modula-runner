@@ -63,6 +63,7 @@ export class RunnerClient extends EventEmitter {
   constructor(options: RunnerClientOptions) {
     super()
     assertSecureUrl(options.url)
+    assertImplementedRange(options.protocol)
     this.options = options
     this.store = new ChannelStore(options.bufferBytes)
   }
@@ -178,7 +179,8 @@ export class RunnerClient extends EventEmitter {
       this.connected = false
       this.emit('offline')
     }
-    this.scheduleReconnect()
+    // An offline listener may have called stop() synchronously just above.
+    if (this.phase === 'running') this.scheduleReconnect()
   }
 
   private scheduleReconnect() {
@@ -200,6 +202,12 @@ export class RunnerClient extends EventEmitter {
   private handleFrame(frame: Frame) {
     if (frame.type === 'welcome') return this.handleWelcome(frame)
     if (frame.type === 'reject') return this.fail('rejected', { reason: frame.reason, supported: frame.supported })
+    // Nothing else exists before negotiation completes: a peer must not be able to
+    // inject session frames into a connection whose version was never agreed.
+    if (!this.connected) {
+      this.emit('protocol-error', { message: 'frame before welcome', frame: frame.type })
+      return
+    }
     if (frame.type === 'ping') return this.sendRaw({ type: 'pong', id: frame.id })
     if (frame.type === 'data') return this.handleData(frame.channel, frame.seq, frame.payload)
     if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
@@ -315,8 +323,8 @@ export class RunnerClient extends EventEmitter {
 
   private handleReset(channel: string, seq: number) {
     if (!this.store.get(channel)) return
-    this.store.receiveReset(channel, seq)
-    this.emit('channel-reset', { channel, seq })
+    if (this.store.receiveReset(channel, seq)) this.emit('channel-reset', { channel, seq })
+    else this.emit('protocol-error', { message: 'reset would rewind the stream', channel, seq })
   }
 
   private handleChannelClose(channel: string, reason?: string) {
@@ -364,5 +372,14 @@ export class RunnerClient extends EventEmitter {
     this.reconnectTimer = undefined
     this.flushTimer = undefined
     this.clearHandshakeTimer()
+  }
+}
+
+// A configured range wider than this build actually implements would let the client
+// negotiate a version whose codec and semantics it does not have.
+function assertImplementedRange(range: VersionRange | undefined) {
+  if (!range) return
+  if (range.min < MIN_PROTOCOL_VERSION || range.max > PROTOCOL_VERSION || range.min > range.max) {
+    throw new Error(`protocol range outside implemented versions ${MIN_PROTOCOL_VERSION}..${PROTOCOL_VERSION}`)
   }
 }

@@ -38,7 +38,7 @@ export class StubControlPlane {
   readonly runnerPings: string[] = []
   readonly runnerPongs: string[] = []
   connectionCount = 0
-  private readonly options: StubOptions
+  options: StubOptions
   private server?: Server
   private wss?: WebSocketServer
   private readonly sockets = new Set<WebSocket>()
@@ -130,6 +130,10 @@ export class StubControlPlane {
   private handleHello(ws: WebSocket, hello: HelloFrame) {
     this.hellos.push(hello)
     if (this.options.muteWelcome) return
+    // Channels the runner no longer presents are gone on its side: prune them, so a
+    // close lost in transit heals at the next reconnect instead of orphaning state.
+    const presented = new Set(hello.channels.map(state => state.id))
+    for (const id of [...this.channels.keys()]) if (!presented.has(id)) this.channels.delete(id)
     const supported = this.options.supportedVersions ?? [PROTOCOL_VERSION]
     const version = negotiate(hello.protocol, supported)
     if (version === null) {

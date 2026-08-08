@@ -56,7 +56,9 @@ describe('codec', () => {
     expect(welcome(1, 1000)).toBeNull()
     expect(welcome(2_147_483_648, 2_147_483_648)).toBeNull()
     expect(welcome(1000, 500)).toBeNull()
-    expect(welcome(200, 200)).not.toBeNull()
+    expect(welcome(200, 200)).toBeNull()
+    expect(welcome(200, 399)).toBeNull()
+    expect(welcome(200, 400)).not.toBeNull()
   })
 
   it('drops frames past the size cap', () => {

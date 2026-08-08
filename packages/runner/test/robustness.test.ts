@@ -150,6 +150,63 @@ describe('channel lifecycle under pressure', () => {
     expect(runner.isConnected()).toBe(false)
   })
 
+  it('discards session frames injected before welcome', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const events: { data: unknown[]; errors: { message: string }[] } = { data: [], errors: [] }
+    runner.on('data', detail => events.data.push(detail))
+    runner.on('protocol-error', detail => events.errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    await until(() => stub!.channels.has(channel.id))
+    stub.sendToRunner(channel.id, text('legit'))
+    await until(() => events.data.length === 1)
+
+    stub.options.delayWelcomeMs = 250
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await until(() => stub!.hellos.length === 2)
+    stub.sendToRunner(channel.id, text('injected before welcome'))
+    await reconnected
+
+    expect(events.data).toHaveLength(1)
+    expect(events.errors.map(entry => entry.message)).toContain('frame before welcome')
+  })
+
+  it('does not reconnect when stop() is called from the offline handler', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 20, capMs: 40 } })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    runner.on('offline', () => runner.stop())
+    const before = stub.connectionCount
+    stub.dropConnections()
+    await sleep(300)
+    expect(stub.connectionCount).toBe(before)
+    expect(runner.isConnected()).toBe(false)
+  })
+
+  it('prunes control-plane channels absent from a reconnect hello', async () => {
+    stub = await new StubControlPlane().start()
+    const first = makeClient(stub.url)
+    const connected = once(first, 'connected')
+    first.connect()
+    await connected
+    const channel = first.openChannel('terminal')
+    channel.send(text('one'))
+    await until(() => stub!.received.length === 1)
+    first.stop()
+
+    client = new RunnerClient({ url: stub.url, token: 'stub-token', runner: testRunnerInfo, backoff: { baseMs: 20, capMs: 40 } })
+    const fresh = once(client, 'connected')
+    client.connect()
+    await fresh
+    expect(stub.channels.has(channel.id)).toBe(false)
+  })
+
   it('abandons an upgrade the server never completes', async () => {
     const net = await import('node:net')
     let connections = 0

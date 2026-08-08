@@ -15,7 +15,11 @@ bug to fix.
 - One WebSocket per runner, dialed **outbound** by the runner to the control plane. The
   runner listens on nothing.
 - TLS (`wss://`) is mandatory except toward loopback addresses (local development and the
-  co-resident deployment).
+  co-resident deployment). The loopback exception is a stated trust boundary, not an
+  oversight: on a multi-user host, another local user able to bind the port first could
+  read the connection credential, so shared machines must front the control plane with
+  TLS even locally — the exception is designed for the single-operator co-resident
+  install.
 - The per-runner token travels as an `Authorization: Bearer` header on the upgrade
   request. It authenticates this connection and nothing else. It never appears inside a
   frame.
@@ -72,8 +76,9 @@ answers each with `{id, status: 'resumed', receivedSeq}` or `{id, status: 'expir
 
 The `welcome.heartbeat` policy governs: a peer that hears nothing for `timeoutMs` treats
 the connection as dead. Policy values are bounded by the schema — `intervalMs` is at
-least 200 ms, `timeoutMs` is at least `intervalMs`, and both stay within the 32-bit
-timer range — so a welcome cannot dictate a busy-loop ping rate or an overflowed timer. The runner reconnects; the control plane marks the runner offline
+least 200 ms, `timeoutMs` is at least twice `intervalMs` (a timeout without margin past
+the interval dies to ordinary timer jitter), and both stay within the 32-bit timer
+range — so a welcome cannot dictate a busy-loop ping rate or an overflowed timer. The runner reconnects; the control plane marks the runner offline
 — visibly, within one heartbeat window.
 
 ### Channels
@@ -113,6 +118,14 @@ later revisions (see the seam reconciliation note for why they exist now).
 - `status: 'expired'` in the resume result (attach-token mismatch or a channel the
   control plane refuses to adopt) ends the channel; reopening is an application-level
   decision.
+- Resets only move forward: a `reset` whose `seq` does not exceed the receiver's
+  high-water mark is rejected, because rewinding would make already-consumed frames
+  deliverable again.
+- The reconnect hello is the authoritative channel roster: the control plane closes
+  any channel the runner no longer presents. A `close` frame lost to a dying
+  connection therefore heals at the next reconnect instead of leaving an orphan.
+- Until `welcome` arrives, the only valid inbound frames are `welcome` and `reject`;
+  session frames on an unnegotiated connection are discarded and surfaced as errors.
 
 ## End-to-end capability
 

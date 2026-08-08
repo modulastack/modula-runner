@@ -22,8 +22,18 @@ describe('channel store', () => {
     const store = new ChannelStore()
     const { id } = store.open('terminal')
     expect(store.receive({ type: 'data', channel: id, seq: 5, payload: text('e') }).status).toBe('gap')
-    store.receiveReset(id, 5)
+    expect(store.receiveReset(id, 5)).toBe(true)
     expect(store.receive({ type: 'data', channel: id, seq: 5, payload: text('e') }).status).toBe('accepted')
+  })
+
+  it('rejects a reset that would rewind the stream', () => {
+    const store = new ChannelStore()
+    const { id } = store.open('terminal')
+    for (let seq = 1; seq <= 3; seq++) store.receive({ type: 'data', channel: id, seq, payload: text(String(seq)) })
+    expect(store.receiveReset(id, 2)).toBe(false)
+    expect(store.receiveReset(id, 0)).toBe(false)
+    expect(store.get(id)?.receivedSeq).toBe(3)
+    expect(store.receive({ type: 'data', channel: id, seq: 2, payload: text('again') }).status).toBe('duplicate')
   })
 
   it('leaves channel state untouched when a payload cannot be serialized', () => {

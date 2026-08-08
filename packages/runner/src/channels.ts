@@ -88,8 +88,13 @@ export class ChannelStore {
     return { status: 'accepted', payload: frame.payload }
   }
 
-  receiveReset(id: string, seq: number) {
-    this.require(id).receivedSeq = seq - 1
+  // A reset may only announce a forward gap: rewinding the high-water mark would
+  // make already-consumed frames deliverable again (replaying terminal input).
+  receiveReset(id: string, seq: number): boolean {
+    const state = this.require(id)
+    if (seq < 1 || seq <= state.receivedSeq) return false
+    state.receivedSeq = seq - 1
+    return true
   }
 
   resumeStates(): ChannelResumeState[] {
