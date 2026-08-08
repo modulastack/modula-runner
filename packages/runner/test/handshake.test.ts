@@ -71,6 +71,7 @@ describe('handshake', () => {
     const base = { url: 'wss://control.example.com', token: 't', runner: testRunnerInfo }
     expect(() => new RunnerClient({ ...base, protocol: { min: 2, max: 2 } })).toThrow(/implemented versions/)
     expect(() => new RunnerClient({ ...base, protocol: { min: 0, max: 1 } })).toThrow(/implemented versions/)
+    expect(() => new RunnerClient({ ...base, protocol: { min: NaN, max: NaN } })).toThrow(/implemented versions/)
     expect(() => new RunnerClient({ ...base, protocol: { min: 1, max: 1 } })).not.toThrow()
   })
 })

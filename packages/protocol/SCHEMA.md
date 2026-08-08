@@ -66,6 +66,11 @@ bug to fix.
 handshake, differing only in whether `channels` is empty. `ChannelResumeState` carries
 `{id, kind, attachToken, sentSeq, receivedSeq}` per surviving channel; `ChannelResumeResult`
 answers each with `{id, status: 'resumed', receivedSeq}` or `{id, status: 'expired'}`.
+Rosters with duplicate channel ids are invalid (contradictory entries could replay and
+delete the same channel), a resume acknowledgment can never exceed the presented
+`sentSeq`, and `runner` metadata fields are bounded at 200 characters each.
+Establishment frames are valid only while negotiation is pending: once a connection is
+welcomed, rejected, or failed, further `welcome`/`reject` frames are protocol errors.
 
 ### Liveness
 
@@ -124,6 +129,11 @@ later revisions (see the seam reconciliation note for why they exist now).
 - The reconnect hello is the authoritative channel roster: the control plane closes
   any channel the runner no longer presents. A `close` frame lost to a dying
   connection therefore heals at the next reconnect instead of leaving an orphan.
+- Close is best-effort after drain in version 1: buffered frames and the close are
+  written before the channel drops, but a link that dies mid-flight can still lose
+  the final frames along with the close — the roster rule guarantees the channel
+  closes, not that its tail was delivered. Acknowledged end-of-stream needs an ack
+  frame and is deferred to the revision that defines terminal payload semantics.
 - Until `welcome` arrives, the only valid inbound frames are `welcome` and `reject`;
   session frames on an unnegotiated connection are discarded and surfaced as errors.
 

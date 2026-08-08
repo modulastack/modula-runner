@@ -41,6 +41,29 @@ describe('codec', () => {
     expect(decodeFrame(JSON.stringify({ type: 'close', channel: '.hidden' }))).toBeNull()
   })
 
+  it('rejects zero sequences on data and reset frames', () => {
+    expect(decodeFrame(JSON.stringify({ type: 'data', channel: 'ch1', seq: 0, payload: { codec: 'text', body: 'x' } }))).toBeNull()
+    expect(decodeFrame(JSON.stringify({ type: 'reset', channel: 'ch1', seq: 0 }))).toBeNull()
+  })
+
+  it('rejects rosters with duplicate channel ids', () => {
+    const dupWelcome = { type: 'welcome', protocol: 1, heartbeat: { intervalMs: 200, timeoutMs: 1000 }, channels: [
+      { id: 'ch1', status: 'resumed', receivedSeq: 3 },
+      { id: 'ch1', status: 'expired' },
+    ] }
+    expect(decodeFrame(JSON.stringify(dupWelcome))).toBeNull()
+    const dupHello = { type: 'hello', protocol: { min: 1, max: 1 }, runner: { name: 'r', version: 'v', os: 'l', arch: 'x' }, channels: [
+      { id: 'ch1', kind: 'terminal', attachToken: token, sentSeq: 1, receivedSeq: 0 },
+      { id: 'ch1', kind: 'terminal', attachToken: token, sentSeq: 2, receivedSeq: 0 },
+    ] }
+    expect(decodeFrame(JSON.stringify(dupHello))).toBeNull()
+  })
+
+  it('bounds runner metadata fields', () => {
+    const hello = { type: 'hello', protocol: { min: 1, max: 1 }, runner: { name: 'r'.repeat(201), version: 'v', os: 'l', arch: 'x' }, channels: [] }
+    expect(decodeFrame(JSON.stringify(hello))).toBeNull()
+  })
+
   it('rejects structurally broken frames', () => {
     expect(decodeFrame(JSON.stringify({ type: 'data', channel: 'ch1', seq: -1, payload: { codec: 'text', body: 'x' } }))).toBeNull()
     expect(decodeFrame(JSON.stringify({ type: 'data', channel: 'ch1', seq: 1, payload: { codec: 'zip', body: 'x' } }))).toBeNull()

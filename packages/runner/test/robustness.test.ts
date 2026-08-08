@@ -1,6 +1,6 @@
 import { once } from 'node:events'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MAX_FRAME_BYTES, type Payload } from '@modulastack/runner-protocol'
+import { MAX_FRAME_BYTES, encodeFrame, type Payload } from '@modulastack/runner-protocol'
 import { RunnerClient } from '../src/client.js'
 import { StubControlPlane } from './stubControlPlane.js'
 import { sleep, testRunnerInfo, until } from './helpers.js'
@@ -64,6 +64,56 @@ describe('misbehaving control plane', () => {
     await connected
     expect(errors).toContainEqual({ message: 'resume result for unknown channel', channel: 'ghost-chan-01' })
     expect(runner.isConnected()).toBe(true)
+  })
+
+  it('ignores establishment frames after negotiation concluded', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url)
+    const errors: { message: string }[] = []
+    runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    stub.sendTextToAll(encodeFrame({ type: 'welcome', protocol: 1, heartbeat: { intervalMs: 200, timeoutMs: 1000 }, channels: [] }))
+    stub.sendTextToAll(encodeFrame({ type: 'reject', reason: 'late', supported: [1] }))
+    await until(() => errors.filter(entry => entry.message === 'establishment frame outside negotiation').length === 2)
+    expect(runner.isConnected()).toBe(true)
+  })
+
+  it('rejects a resume acknowledgment beyond what was sent', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const errors: { message: string }[] = []
+    runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    channel.send(text('two'))
+    await until(() => stub!.received.length === 2)
+
+    stub.options.resumeSeqOverride = 100
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await reconnected
+
+    await until(() => errors.some(entry => entry.message === 'resume beyond sent sequence'))
+    expect(runner.channelIds()).toContain(channel.id)
+  })
+
+  it('fails terminally on a hello that cannot fit the wire', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, {
+      runner: { name: 'x'.repeat(MAX_FRAME_BYTES), version: '0.0.0', os: 'linux', arch: 'x64' },
+    })
+    const failed = once(runner, 'protocol-error')
+    runner.connect()
+    const [detail] = await failed
+    expect(detail).toEqual({ message: 'outbound hello exceeds MAX_FRAME_BYTES' })
+    await sleep(200)
+    expect(stub.hellos).toHaveLength(0)
+    expect(runner.isConnected()).toBe(false)
   })
 
   it('gives up on a handshake the control plane never answers', async () => {

@@ -24,6 +24,7 @@ export type StubOptions = {
   extraResumeIds?: string[]
   delayWelcomeMs?: number
   omitResume?: boolean
+  resumeSeqOverride?: number
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -159,7 +160,7 @@ export class StubControlPlane {
       return { id, status: 'resumed', receivedSeq: 0 }
     }
     if (known.attachToken !== attachToken) return { id, status: 'expired' }
-    return { id, status: 'resumed', receivedSeq: known.receivedSeq }
+    return { id, status: 'resumed', receivedSeq: this.options.resumeSeqOverride ?? known.receivedSeq }
   }
 
   private handleData(ws: WebSocket, channel: string, seq: number, payload: Payload) {

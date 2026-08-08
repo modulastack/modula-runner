@@ -66,12 +66,12 @@ function open(value: Record<string, unknown>): Frame | null {
 
 function data(value: Record<string, unknown>): Frame | null {
   const payload = parsePayload(value.payload)
-  if (!isSafeIdentifier(value.channel) || !isSeq(value.seq) || !payload) return null
+  if (!isSafeIdentifier(value.channel) || !isDataSeq(value.seq) || !payload) return null
   return { type: 'data', channel: value.channel, seq: value.seq, payload }
 }
 
 function reset(value: Record<string, unknown>): Frame | null {
-  if (!isSafeIdentifier(value.channel) || !isSeq(value.seq)) return null
+  if (!isSafeIdentifier(value.channel) || !isDataSeq(value.seq)) return null
   return { type: 'reset', channel: value.channel, seq: value.seq }
 }
 
@@ -100,7 +100,8 @@ function parsePayload(value: unknown): Payload | null {
 function resumeStates(value: unknown): ChannelResumeState[] | null {
   if (!Array.isArray(value)) return null
   const states = value.map(resumeState)
-  return states.every(state => state !== null) ? (states as ChannelResumeState[]) : null
+  if (!states.every(state => state !== null)) return null
+  return uniqueIds(states as ChannelResumeState[]) ? (states as ChannelResumeState[]) : null
 }
 
 function resumeState(value: unknown): ChannelResumeState | null {
@@ -112,7 +113,14 @@ function resumeState(value: unknown): ChannelResumeState | null {
 function resumeResults(value: unknown): ChannelResumeResult[] | null {
   if (!Array.isArray(value)) return null
   const results = value.map(resumeResult)
-  return results.every(result => result !== null) ? (results as ChannelResumeResult[]) : null
+  if (!results.every(result => result !== null)) return null
+  return uniqueIds(results as ChannelResumeResult[]) ? (results as ChannelResumeResult[]) : null
+}
+
+// Duplicate ids in a roster are contradictory by construction (resumed-then-expired
+// for the same channel would replay and then delete it) and are rejected outright.
+function uniqueIds(entries: { id: string }[]): boolean {
+  return new Set(entries.map(entry => entry.id)).size === entries.length
 }
 
 function resumeResult(value: unknown): ChannelResumeResult | null {
@@ -123,8 +131,8 @@ function resumeResult(value: unknown): ChannelResumeResult | null {
 }
 
 function isRunnerInfo(value: unknown): value is { name: string; version: string; os: string; arch: string } {
-  return isRecord(value) && typeof value.name === 'string' && typeof value.version === 'string'
-    && typeof value.os === 'string' && typeof value.arch === 'string'
+  if (!isRecord(value)) return false
+  return [value.name, value.version, value.os, value.arch].every(field => typeof field === 'string' && field.length <= 200)
 }
 
 // Bounded so one authenticated welcome cannot dictate a busy-loop ping rate, and so
@@ -144,8 +152,14 @@ function isToken(value: unknown): value is string {
   return typeof value === 'string' && value.length >= 16 && value.length <= 512
 }
 
+// Resume counters start at zero (nothing received yet); data and reset sequences
+// start at one.
 function isSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isDataSeq(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
 }
 
 function isPositiveInt(value: unknown): value is number {

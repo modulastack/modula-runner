@@ -7,6 +7,7 @@ import {
   PROTOCOL_VERSION,
   decodeFrame,
   encodeFrame,
+  isValidRange,
   type ChannelKind,
   type ChannelResumeResult,
   type Frame,
@@ -200,10 +201,17 @@ export class RunnerClient extends EventEmitter {
   }
 
   private handleFrame(frame: Frame) {
-    if (frame.type === 'welcome') return this.handleWelcome(frame)
-    if (frame.type === 'reject') return this.fail('rejected', { reason: frame.reason, supported: frame.supported })
-    // Nothing else exists before negotiation completes: a peer must not be able to
-    // inject session frames into a connection whose version was never agreed.
+    // Establishment frames are valid only while negotiation is pending, and nothing
+    // else exists before it completes: a peer must not connect a failed client with
+    // a late welcome, nor inject session frames on an unnegotiated connection.
+    if (frame.type === 'welcome' || frame.type === 'reject') {
+      if (this.phase !== 'running' || this.connected) {
+        this.emit('protocol-error', { message: 'establishment frame outside negotiation', frame: frame.type })
+        return
+      }
+      if (frame.type === 'welcome') return this.handleWelcome(frame)
+      return this.fail('rejected', { reason: frame.reason, supported: frame.supported })
+    }
     if (!this.connected) {
       this.emit('protocol-error', { message: 'frame before welcome', frame: frame.type })
       return
@@ -256,7 +264,13 @@ export class RunnerClient extends EventEmitter {
       if (!this.closing.delete(result.id)) this.emit('channel-expired', { channel: result.id })
       return
     }
-    state.flushedSeq = Math.min(result.receivedSeq, state.sentSeq)
+    // A peer cannot have received more than was sent; clamping such a claim would
+    // silently skip replaying frames it never saw. Reject it and keep prior state.
+    if (result.receivedSeq > state.sentSeq) {
+      this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
+      return
+    }
+    state.flushedSeq = result.receivedSeq
     const outcome = this.pump(result.id)
     if (!this.closing.has(result.id)) this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
   }
@@ -356,7 +370,15 @@ export class RunnerClient extends EventEmitter {
   }
 
   private sendRaw(frame: Frame) {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(encodeFrame(frame))
+    if (this.ws?.readyState !== WebSocket.OPEN) return
+    const encoded = encodeFrame(frame)
+    if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) {
+      // An oversized hello can never handshake — retrying would loop forever.
+      if (frame.type === 'hello') return this.fail('protocol-error', { message: 'outbound hello exceeds MAX_FRAME_BYTES' })
+      this.emit('protocol-error', { message: 'outbound frame exceeds MAX_FRAME_BYTES', frame: frame.type })
+      return
+    }
+    this.ws.send(encoded)
   }
 
   private clearHandshakeTimer() {
@@ -379,7 +401,7 @@ export class RunnerClient extends EventEmitter {
 // negotiate a version whose codec and semantics it does not have.
 function assertImplementedRange(range: VersionRange | undefined) {
   if (!range) return
-  if (range.min < MIN_PROTOCOL_VERSION || range.max > PROTOCOL_VERSION || range.min > range.max) {
+  if (!isValidRange(range) || range.min < MIN_PROTOCOL_VERSION || range.max > PROTOCOL_VERSION) {
     throw new Error(`protocol range outside implemented versions ${MIN_PROTOCOL_VERSION}..${PROTOCOL_VERSION}`)
   }
 }
