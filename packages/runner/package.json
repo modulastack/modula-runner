@@ -1,0 +1,21 @@
+{
+  "name": "modula-runner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Modula Runner — the local execution daemon (work in progress)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modulastack/runner-protocol": "0.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12"
+  }
+}
