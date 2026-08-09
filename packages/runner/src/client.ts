@@ -60,6 +60,7 @@ export class RunnerClient extends EventEmitter {
   private attempt = 0
   private pendingBackoffReset = false
   private lastSeen = 0
+  private readonly outstandingPings: string[] = []
   private heartbeatTimer: NodeJS.Timeout | undefined
   private reconnectTimer: NodeJS.Timeout | undefined
   private handshakeTimer: NodeJS.Timeout | undefined
@@ -267,6 +268,13 @@ export class RunnerClient extends EventEmitter {
         this.sendRaw({ type: 'pong', id: frame.id })
       }
     }
+    else if (frame.type === 'pong') {
+      // Only a pong answering one of this connection's own pings proves liveness;
+      // fabricated or stale pongs must not hold a dead session open.
+      const index = this.outstandingPings.indexOf(frame.id)
+      if (index < 0) return false
+      this.outstandingPings.splice(index, 1)
+    }
     else if (frame.type === 'data') this.handleData(frame.channel, frame.seq, frame.payload)
     else if (frame.type === 'reset') this.handleReset(frame.channel, frame.seq)
     else if (frame.type === 'close') this.handleChannelClose(frame.channel, frame.reason)
@@ -418,6 +426,7 @@ export class RunnerClient extends EventEmitter {
 
   private startHeartbeat(policy: HeartbeatPolicy) {
     this.lastSeen = Date.now()
+    this.outstandingPings.length = 0
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(policy), policy.intervalMs)
   }
@@ -431,7 +440,10 @@ export class RunnerClient extends EventEmitter {
       this.attempt = 0
       this.pendingBackoffReset = false
     }
-    this.sendRaw({ type: 'ping', id: randomUUID() })
+    const id = randomUUID()
+    this.outstandingPings.push(id)
+    while (this.outstandingPings.length > 16) this.outstandingPings.shift()
+    this.sendRaw({ type: 'ping', id })
   }
 
   private fail(event: string, detail: unknown) {

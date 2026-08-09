@@ -126,6 +126,21 @@ describe('misbehaving control plane', () => {
     expect(runner.isConnected()).toBe(true)
   })
 
+  it('does not count fabricated pongs as liveness', async () => {
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const fake = encodeFrame({ type: 'pong', id: 'never-sent-ping-id' })
+    const spam = setInterval(() => stub?.sendTextToAll(fake), 100)
+    try {
+      await until(() => stub!.connectionCount >= 2, 5_000)
+    } finally {
+      clearInterval(spam)
+    }
+  })
+
   it('does not count state-invalid frames as liveness', async () => {
     stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     const runner = makeClient(stub.url)
