@@ -2,6 +2,9 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { MAX_FRAME_BYTES, type ChannelKind, type ChannelResumeState, type DataFrame, type Payload, type ResetFrame } from '@modulastack/runner-protocol'
 
 const DEFAULT_BUFFER_BYTES = 512 * 1024
+// Bounds total replay memory and keeps the resume hello far under the frame cap
+// (a full roster serializes to roughly 150 KiB).
+const MAX_CHANNELS = 1024
 
 export type ChannelState = {
   id: string
@@ -35,6 +38,7 @@ export class ChannelStore {
   }
 
   open(kind: ChannelKind): ChannelState {
+    if (this.channels.size >= MAX_CHANNELS) throw new Error(`channel roster limit reached (${MAX_CHANNELS})`)
     const state: ChannelState = {
       id: randomUUID(),
       kind,

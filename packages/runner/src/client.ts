@@ -232,31 +232,34 @@ export class RunnerClient extends EventEmitter {
       this.emit('protocol-error', { message: 'undecodable frame' })
       return
     }
-    this.lastSeen = Date.now()
-    this.handleFrame(frame)
+    // The same rule for state-invalid frames: a stream of late welcomes must not
+    // hold a dead session open, so only accepted frames count as liveness.
+    if (this.handleFrame(frame)) this.lastSeen = Date.now()
   }
 
-  private handleFrame(frame: Frame) {
+  private handleFrame(frame: Frame): boolean {
     // Establishment frames are valid only while negotiation is pending, and nothing
     // else exists before it completes: a peer must not connect a failed client with
     // a late welcome, nor inject session frames on an unnegotiated connection.
     if (frame.type === 'welcome' || frame.type === 'reject') {
       if (this.phase !== 'running' || this.connected) {
         this.emit('protocol-error', { message: 'establishment frame outside negotiation', frame: frame.type })
-        return
+        return false
       }
-      if (frame.type === 'welcome') return this.handleWelcome(frame)
-      return this.fail('rejected', { reason: frame.reason, supported: frame.supported })
+      if (frame.type === 'welcome') this.handleWelcome(frame)
+      else this.fail('rejected', { reason: frame.reason, supported: frame.supported })
+      return true
     }
     if (!this.connected) {
       this.emit('protocol-error', { message: 'frame before welcome', frame: frame.type })
-      return
+      return false
     }
-    if (frame.type === 'ping') return this.sendRaw({ type: 'pong', id: frame.id })
-    if (frame.type === 'data') return this.handleData(frame.channel, frame.seq, frame.payload)
-    if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
-    if (frame.type === 'close') return this.handleChannelClose(frame.channel, frame.reason)
-    if (frame.type === 'error') this.emit('protocol-error', { message: frame.message, channel: frame.channel })
+    if (frame.type === 'ping') this.sendRaw({ type: 'pong', id: frame.id })
+    else if (frame.type === 'data') this.handleData(frame.channel, frame.seq, frame.payload)
+    else if (frame.type === 'reset') this.handleReset(frame.channel, frame.seq)
+    else if (frame.type === 'close') this.handleChannelClose(frame.channel, frame.reason)
+    else if (frame.type === 'error') this.emit('protocol-error', { message: frame.message, channel: frame.channel })
+    return true
   }
 
   private handleWelcome(frame: WelcomeFrame) {
@@ -280,32 +283,33 @@ export class RunnerClient extends EventEmitter {
   // The welcome is reconciled against the exact hello snapshot: results for channels
   // never presented are misbehavior to surface, presented channels the welcome omits
   // are re-announced from sequence zero (never trusted to a stale flush position),
-  // and channels created mid-handshake are announced now.
+  // and channels created mid-handshake are announced now. Recovery is two-phase —
+  // every channel is restored and replayed before any event reaches a listener, so
+  // a handler for one channel can never act on another's half-recovered state.
   private reconcileChannels(results: ChannelResumeResult[]) {
-    // The mid-handshake announce set is snapshotted before any listener can run: a
-    // channel opened from a synchronous event handler below announces itself once,
-    // and must not be announced a second time by this loop.
+    const events: { name: string; detail: unknown }[] = []
     const announceIds = this.store.ids().filter(id => !this.presented.has(id))
     const unanswered = new Set(this.presented.keys())
     for (const result of results) {
       if (!this.presented.has(result.id)) {
-        this.emit('protocol-error', { message: 'resume result for unknown channel', channel: result.id })
+        events.push({ name: 'protocol-error', detail: { message: 'resume result for unknown channel', channel: result.id } })
         continue
       }
       unanswered.delete(result.id)
-      this.resumeChannel(result)
+      this.resumeChannel(result, events)
     }
-    for (const id of unanswered) this.reannounce(id)
+    for (const id of unanswered) this.reannounce(id, events)
     for (const id of announceIds) this.announceChannel(id)
     for (const id of [...this.closing.keys()]) this.finishClose(id)
+    for (const event of events) this.emit(event.name, event.detail)
   }
 
-  private resumeChannel(result: ChannelResumeResult) {
+  private resumeChannel(result: ChannelResumeResult, events: { name: string; detail: unknown }[]) {
     const state = this.store.get(result.id)
     if (!state) return
     if (result.status === 'expired') {
       this.store.drop(result.id)
-      if (!this.closing.delete(result.id)) this.emit('channel-expired', { channel: result.id })
+      if (!this.closing.delete(result.id)) events.push({ name: 'channel-expired', detail: { channel: result.id } })
       return
     }
     // A peer cannot have received more than the hello presented — frames recorded
@@ -313,25 +317,22 @@ export class RunnerClient extends EventEmitter {
     // covering them is a lie. Such a claim is discarded along with the stale local
     // watermark: replaying the whole retained buffer is the only position that
     // cannot silently lose frames, and the contiguity rule discards the duplicates.
-    // Recovery completes before the error is surfaced, so a listener reacting to
-    // it acts on a fully replayed channel, not a half-recovered one.
     const impossibleAck = result.receivedSeq > (this.presented.get(result.id) ?? 0)
     state.flushedSeq = impossibleAck ? 0 : result.receivedSeq
     const outcome = this.pump(result.id)
-    if (impossibleAck) this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
-    if (!this.closing.has(result.id)) this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
+    if (impossibleAck) events.push({ name: 'protocol-error', detail: { message: 'resume beyond sent sequence', channel: result.id } })
+    if (!this.closing.has(result.id)) events.push({ name: 'channel-resumed', detail: { channel: result.id, replayed: outcome.sent, reset: outcome.reset } })
   }
 
-  private reannounce(id: string) {
+  private reannounce(id: string, events: { name: string; detail: unknown }[]) {
     const state = this.store.get(id)
     if (!state) return
     // The replacement open starts both directions over: the control plane's fresh
     // stream begins at sequence one, which a stale inbound watermark would swallow.
-    // Announce and replay first — the error listener must see a recovered channel.
     state.flushedSeq = 0
     state.receivedSeq = 0
     this.announceChannel(id)
-    this.emit('protocol-error', { message: 'welcome omitted a presented channel', channel: id })
+    events.push({ name: 'protocol-error', detail: { message: 'welcome omitted a presented channel', channel: id } })
   }
 
   private announceChannel(id: string) {

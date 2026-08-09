@@ -106,17 +106,52 @@ describe('misbehaving control plane', () => {
     expect(runner.channelIds()).toContain(channel.id)
   })
 
-  it('fails terminally on a hello that cannot fit the wire', async () => {
-    stub = await new StubControlPlane().start()
+  it('bounds the channel roster so the resume hello always fits the frame cap', () => {
+    const runner = new RunnerClient({ url: 'wss://control.example.com', token: 't', runner: testRunnerInfo })
+    for (let i = 0; i < 1024; i++) runner.openChannel('terminal')
+    expect(() => runner.openChannel('terminal')).toThrow(/roster limit/)
+  })
+
+  it('does not count state-invalid frames as liveness', async () => {
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     const runner = makeClient(stub.url)
-    for (let i = 0; i < 8_000; i++) runner.openChannel('terminal')
-    const failed = once(runner, 'protocol-error')
+    const connected = once(runner, 'connected')
     runner.connect()
-    const [detail] = await failed
-    expect(detail).toEqual({ message: 'outbound hello exceeds MAX_FRAME_BYTES' })
-    await sleep(200)
-    expect(stub.hellos).toHaveLength(0)
-    expect(runner.isConnected()).toBe(false)
+    await connected
+    const lateWelcome = encodeFrame({ type: 'welcome', protocol: 1, heartbeat: { intervalMs: 200, timeoutMs: 1000 }, channels: [] })
+    const spam = setInterval(() => stub?.sendTextToAll(lateWelcome), 100)
+    try {
+      await until(() => stub!.connectionCount >= 2, 5_000)
+    } finally {
+      clearInterval(spam)
+    }
+  })
+
+  it('recovers every channel before emitting resume events', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const first = runner.openChannel('terminal')
+    const second = runner.openChannel('terminal')
+    first.send(text('a1'))
+    second.send(text('b1'))
+    await until(() => stub!.received.length === 2)
+
+    const offline = once(runner, 'offline')
+    stub.dropConnections()
+    await offline
+    second.send(text('b2'))
+    // The very first resume event closes the OTHER channel: its unflushed tail must
+    // already have been replayed, or the close would beat the data onto the wire.
+    runner.once('channel-resumed', () => second.close('bye'))
+    const reconnected = once(runner, 'connected')
+    await reconnected
+    await until(() => stub!.closes.length === 1)
+
+    expect(stub.received.filter(entry => entry.channel === second.id).map(entry => entry.seq)).toEqual([1, 2])
+    expect(stub.closes).toEqual([{ channel: second.id, reason: 'bye' }])
   })
 
   it('rejects oversized runner metadata at construction', () => {

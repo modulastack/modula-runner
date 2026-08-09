@@ -102,6 +102,8 @@ later revisions (see the seam reconciliation note for why they exist now).
 
 ## Channel model
 
+- Implementations bound their concurrent channel roster (this repository's client:
+  1024) so a resume hello always fits the frame cap.
 - The runner mints channel ids and attach tokens at `open`. The attach token is the
   resume credential for that channel — the same machinery terminal sessions already use
   for browser reattach, extended across this seam rather than replaced.
@@ -147,6 +149,9 @@ redesign:
 - Routing (`type`, `channel`, `seq`) is separate from content (`payload`) in every
   session frame. The relay routes on the envelope alone.
 - Payloads declare a codec. `json` and `text` are the version-1 cleartext codecs.
+  The `json` codec carries `JSON.stringify` semantics: values without a JSON
+  representation follow the platform's standard coercion, and the serialized
+  snapshot taken at send time is byte-identical to anything a replay retransmits.
   `sealed` is **reserved from version 1**: `{codec: 'sealed', alg, nonce, body}` — an
   opaque ciphertext envelope meaningful only to the endpoints. A relay that can route a
   `text` payload can route a `sealed` one without modification, and validators already
