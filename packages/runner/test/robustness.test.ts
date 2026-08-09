@@ -112,6 +112,20 @@ describe('misbehaving control plane', () => {
     expect(() => runner.openChannel('terminal')).toThrow(/roster limit/)
   })
 
+  it('rejects direction-invalid frames from the control plane', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url)
+    const errors: { message: string }[] = []
+    runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    stub.sendTextToAll(encodeFrame({ type: 'open', channel: 'ghost-chan-02', kind: 'terminal', attachToken: 'a'.repeat(32) }))
+    stub.sendTextToAll(encodeFrame({ type: 'hello', protocol: { min: 1, max: 1 }, runner: testRunnerInfo, channels: [] }))
+    await until(() => errors.filter(entry => entry.message === 'direction-invalid frame').length === 2)
+    expect(runner.isConnected()).toBe(true)
+  })
+
   it('does not count state-invalid frames as liveness', async () => {
     stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     const runner = makeClient(stub.url)

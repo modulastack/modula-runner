@@ -71,7 +71,21 @@ describe('channel store', () => {
     expect(() => new ChannelStore(Number.POSITIVE_INFINITY)).toThrow(/positive integer/)
     expect(() => new ChannelStore(0)).toThrow(/positive integer/)
     expect(() => new ChannelStore(-5)).toThrow(/positive integer/)
+    expect(() => new ChannelStore(1, Number.NaN)).toThrow(/totalBufferBytes/)
+    expect(() => new ChannelStore(1000, 500)).toThrow(/totalBufferBytes/)
     expect(() => new ChannelStore(1)).not.toThrow()
+  })
+
+  it('enforces an aggregate replay budget across channels', () => {
+    const store = new ChannelStore(1_000, 1_000)
+    const first = store.open('terminal')
+    const second = store.open('terminal')
+    store.record(first.id, text('x'.repeat(700)))
+    store.record(second.id, text('x'.repeat(700)))
+    // The aggregate budget emptied the first channel entirely; its stream restarts
+    // with a full reset instead of stalling on unreachable frames.
+    expect(store.nextOutbound(first.id, 0)).toEqual({ reset: { type: 'reset', channel: first.id, seq: 2 } })
+    expect(store.nextOutbound(second.id, 0).frame?.seq).toBe(1)
   })
 
   it('offers a reset when eviction has outrun the flush position', () => {

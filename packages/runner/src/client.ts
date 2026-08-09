@@ -33,6 +33,7 @@ export type RunnerClientOptions = {
   protocol?: VersionRange
   backoff?: BackoffOptions
   bufferBytes?: number
+  totalBufferBytes?: number
   highWaterBytes?: number
   handshakeTimeoutMs?: number
 }
@@ -82,7 +83,7 @@ export class RunnerClient extends EventEmitter {
       ...(options.protocol ? { protocol: { ...options.protocol } } : {}),
       ...(options.backoff ? { backoff: { ...options.backoff } } : {}),
     }
-    this.store = new ChannelStore(options.bufferBytes)
+    this.store = new ChannelStore(options.bufferBytes, options.totalBufferBytes)
   }
 
   connect() {
@@ -254,7 +255,18 @@ export class RunnerClient extends EventEmitter {
       this.emit('protocol-error', { message: 'frame before welcome', frame: frame.type })
       return false
     }
-    if (frame.type === 'ping') this.sendRaw({ type: 'pong', id: frame.id })
+    // hello and open only travel runner → control plane in version 1.
+    if (frame.type === 'hello' || frame.type === 'open') {
+      this.emit('protocol-error', { message: 'direction-invalid frame', frame: frame.type })
+      return false
+    }
+    if (frame.type === 'ping') {
+      // Pong replies respect backpressure too: a peer that pings without reading
+      // must not grow the outbound queue without bound.
+      if ((this.ws?.bufferedAmount ?? 0) <= (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) {
+        this.sendRaw({ type: 'pong', id: frame.id })
+      }
+    }
     else if (frame.type === 'data') this.handleData(frame.channel, frame.seq, frame.payload)
     else if (frame.type === 'reset') this.handleReset(frame.channel, frame.seq)
     else if (frame.type === 'close') this.handleChannelClose(frame.channel, frame.reason)

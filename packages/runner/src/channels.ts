@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { MAX_FRAME_BYTES, type ChannelKind, type ChannelResumeState, type DataFrame, type Payload, type ResetFrame } from '@modulastack/runner-protocol'
 
 const DEFAULT_BUFFER_BYTES = 512 * 1024
+const DEFAULT_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024
 // Bounds total replay memory and keeps the resume hello far under the frame cap
 // (a full roster serializes to roughly 150 KiB).
 const MAX_CHANNELS = 1024
@@ -27,14 +28,20 @@ export type NextOutbound = { reset?: ResetFrame; frame?: DataFrame }
 export class ChannelStore {
   private readonly channels = new Map<string, ChannelState>()
   private readonly bufferLimit: number
+  private readonly totalLimit: number
+  private totalBytes = 0
 
-  constructor(bufferBytes = DEFAULT_BUFFER_BYTES) {
-    // NaN or Infinity would make the eviction comparison permanently false and
+  constructor(bufferBytes = DEFAULT_BUFFER_BYTES, totalBufferBytes = DEFAULT_TOTAL_BUFFER_BYTES) {
+    // NaN or Infinity would make the eviction comparisons permanently false and
     // retain every frame ever recorded.
     if (!Number.isSafeInteger(bufferBytes) || bufferBytes < 1) {
       throw new Error('bufferBytes must be a positive integer')
     }
+    if (!Number.isSafeInteger(totalBufferBytes) || totalBufferBytes < bufferBytes) {
+      throw new Error('totalBufferBytes must be a positive integer >= bufferBytes')
+    }
     this.bufferLimit = bufferBytes
+    this.totalLimit = totalBufferBytes
   }
 
   open(kind: ChannelKind): ChannelState {
@@ -62,6 +69,8 @@ export class ChannelStore {
   }
 
   drop(id: string) {
+    const state = this.channels.get(id)
+    if (state) this.totalBytes -= state.bufferBytes
     this.channels.delete(id)
   }
 
@@ -79,11 +88,24 @@ export class ChannelStore {
     state.sentSeq = frame.seq
     state.buffer.push(frame)
     state.bufferBytes += bytes
-    while (state.bufferBytes > this.bufferLimit && state.buffer.length > 1) {
-      const evicted = state.buffer.shift()
-      if (evicted) state.bufferBytes -= Buffer.byteLength(JSON.stringify(evicted), 'utf8')
+    this.totalBytes += bytes
+    while (state.bufferBytes > this.bufferLimit && state.buffer.length > 1) this.evictOldest(state)
+    // The aggregate budget may empty other channels entirely; an emptied channel's
+    // next flush announces a full reset rather than stalling (see nextOutbound).
+    while (this.totalBytes > this.totalLimit) {
+      const fullest = [...this.channels.values()].reduce((a, b) => (b.bufferBytes > a.bufferBytes ? b : a))
+      if (fullest.buffer.length === 0) break
+      this.evictOldest(fullest)
     }
     return frame
+  }
+
+  private evictOldest(state: ChannelState) {
+    const evicted = state.buffer.shift()
+    if (!evicted) return
+    const bytes = Buffer.byteLength(JSON.stringify(evicted), 'utf8')
+    state.bufferBytes -= bytes
+    this.totalBytes -= bytes
   }
 
   // Only the next contiguous sequence advances the high-water mark: anything at or
@@ -123,7 +145,9 @@ export class ChannelStore {
     const state = this.require(id)
     if (flushedSeq >= state.sentSeq) return {}
     const oldest = state.buffer[0]
-    if (!oldest) return {}
+    // A buffer emptied by the aggregate budget resets past everything recorded:
+    // the stream restarts after sentSeq instead of stalling on unreachable frames.
+    if (!oldest) return { reset: { type: 'reset', channel: id, seq: state.sentSeq + 1 } }
     if (oldest.seq > flushedSeq + 1) return { reset: { type: 'reset', channel: id, seq: oldest.seq } }
     const frame = state.buffer[flushedSeq + 1 - oldest.seq]
     return frame ? { frame } : {}
