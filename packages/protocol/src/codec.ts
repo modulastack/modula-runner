@@ -18,8 +18,10 @@ export function decodeFrame(raw: string): Frame | null {
 
 function normalize(value: unknown): Frame | null {
   if (!isRecord(value) || typeof value.type !== 'string') return null
-  const frame = frameParsers[value.type]
-  return frame ? frame(value) : null
+  // Own-property lookup only: a type like "constructor" must not resolve through
+  // Object.prototype and smuggle an unvalidated object past the closed frame set.
+  if (!Object.hasOwn(frameParsers, value.type)) return null
+  return frameParsers[value.type]!(value)
 }
 
 const frameParsers: Record<string, (value: Record<string, unknown>) => Frame | null> = {
@@ -77,7 +79,7 @@ function reset(value: Record<string, unknown>): Frame | null {
 
 function close(value: Record<string, unknown>): Frame | null {
   if (!isSafeIdentifier(value.channel)) return null
-  if (value.reason !== undefined && typeof value.reason !== 'string') return null
+  if (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 500)) return null
   return { type: 'close', channel: value.channel, ...(typeof value.reason === 'string' ? { reason: value.reason } : {}) }
 }
 

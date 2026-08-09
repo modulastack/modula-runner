@@ -191,6 +191,62 @@ describe('misbehaving control plane', () => {
     expect(stub.opens.filter(id => id === sideChannel!.id)).toHaveLength(1)
   })
 
+  it('rejects an acknowledgment that covers frames recorded mid-handshake', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const errors: { message: string }[] = []
+    runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    await until(() => stub!.received.length === 1)
+
+    stub.options.delayWelcomeMs = 250
+    stub.options.resumeSeqOverride = 2
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await until(() => stub!.hellos.length === 2)
+    channel.send(text('two'))
+    await reconnected
+    await until(() => stub!.received.length === 2)
+
+    expect(errors.map(entry => entry.message)).toContain('resume beyond sent sequence')
+    expect(stub.received.map(entry => entry.seq)).toEqual([1, 2])
+  })
+
+  it('clamps close reasons to the schema bound', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    await until(() => stub!.channels.has(channel.id))
+    channel.close('x'.repeat(2_000))
+    await until(() => stub!.closes.length === 1)
+    expect(stub.closes[0]?.reason).toHaveLength(500)
+  })
+
+  it('drains multiplexed channels fairly under backpressure', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { highWaterBytes: 1 })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const first = runner.openChannel('terminal')
+    const second = runner.openChannel('terminal')
+    for (let i = 1; i <= 3; i++) {
+      first.send(text(`a${i}`))
+      second.send(text(`b${i}`))
+    }
+    await until(() => stub!.received.length === 6)
+    const byChannel = (id: string) => stub!.received.filter(entry => entry.channel === id).map(entry => entry.seq)
+    expect(byChannel(first.id)).toEqual([1, 2, 3])
+    expect(byChannel(second.id)).toEqual([1, 2, 3])
+  })
+
   it('does not count malformed spam as liveness', async () => {
     stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     const runner = makeClient(stub.url)

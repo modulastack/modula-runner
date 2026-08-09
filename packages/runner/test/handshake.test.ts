@@ -65,6 +65,7 @@ describe('handshake', () => {
     expect(() => new RunnerClient({ url: 'ws://control.example.com', token: 't', runner: testRunnerInfo })).toThrow(/loopback/)
     expect(() => new RunnerClient({ url: 'ws://127.0.0.1:9', token: 't', runner: testRunnerInfo })).not.toThrow()
     expect(() => new RunnerClient({ url: 'wss://control.example.com', token: 't', runner: testRunnerInfo })).not.toThrow()
+    expect(() => new RunnerClient({ url: 'wss://control.example.com/#frag', token: 't', runner: testRunnerInfo })).toThrow(/fragment/)
   })
 
   it('refuses a configured protocol range this build does not implement', () => {

@@ -51,7 +51,8 @@ export class RunnerClient extends EventEmitter {
   private readonly options: RunnerClientOptions
   private readonly store: ChannelStore
   private readonly closing = new Map<string, ClosingEntry>()
-  private presented = new Set<string>()
+  private presented = new Map<string, number>()
+  private flushCursor = 0
   private ws?: WebSocket
   private phase: Phase = 'idle'
   private connected = false
@@ -122,7 +123,10 @@ export class RunnerClient extends EventEmitter {
   // so neither a disconnect nor backpressure can orphan it or drop its tail.
   private closeChannel(id: string, reason?: string) {
     if (!this.store.get(id) || this.closing.has(id)) return
-    this.closing.set(id, { sent: false, ...(reason === undefined ? {} : { reason }) })
+    // Clamped to the schema's bound: an unbounded reason would make the close frame
+    // itself undecodable and take the whole connection down with it.
+    const bounded = reason === undefined ? undefined : reason.slice(0, 500)
+    this.closing.set(id, { sent: false, ...(bounded === undefined ? {} : { reason: bounded }) })
     if (this.connected) this.finishClose(id)
   }
 
@@ -169,8 +173,11 @@ export class RunnerClient extends EventEmitter {
 
   private startHandshake() {
     const protocol = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
-    this.presented = new Set(this.store.ids())
-    this.sendRaw({ type: 'hello', protocol, runner: this.options.runner, channels: this.store.resumeStates() })
+    const states = this.store.resumeStates()
+    // The snapshot keeps each channel's sentSeq as presented: an acknowledgment may
+    // never exceed it, even if sends during the handshake advance the live counter.
+    this.presented = new Map(states.map(state => [state.id, state.sentSeq]))
+    this.sendRaw({ type: 'hello', protocol, runner: this.options.runner, channels: states })
     const timeoutMs = this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
     this.handshakeTimer = setTimeout(() => this.ws?.terminate(), timeoutMs)
   }
@@ -267,7 +274,7 @@ export class RunnerClient extends EventEmitter {
     // channel opened from a synchronous event handler below announces itself once,
     // and must not be announced a second time by this loop.
     const announceIds = this.store.ids().filter(id => !this.presented.has(id))
-    const unanswered = new Set(this.presented)
+    const unanswered = new Set(this.presented.keys())
     for (const result of results) {
       if (!this.presented.has(result.id)) {
         this.emit('protocol-error', { message: 'resume result for unknown channel', channel: result.id })
@@ -289,11 +296,12 @@ export class RunnerClient extends EventEmitter {
       if (!this.closing.delete(result.id)) this.emit('channel-expired', { channel: result.id })
       return
     }
-    // A peer cannot have received more than was sent. Its claim is discarded — and
-    // so is the stale local watermark: replaying the whole retained buffer is the
-    // only position that cannot silently lose the frames a dying socket never
-    // delivered, and the receiver's contiguity rule discards the duplicates.
-    if (result.receivedSeq > state.sentSeq) {
+    // A peer cannot have received more than the hello presented — frames recorded
+    // while the welcome was in flight were never on the wire, so an acknowledgment
+    // covering them is a lie. Such a claim is discarded along with the stale local
+    // watermark: replaying the whole retained buffer is the only position that
+    // cannot silently lose frames, and the contiguity rule discards the duplicates.
+    if (result.receivedSeq > (this.presented.get(result.id) ?? 0)) {
       this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
       state.flushedSeq = 0
     } else {
@@ -352,7 +360,12 @@ export class RunnerClient extends EventEmitter {
     if (this.flushTimer) return
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined
-      for (const id of this.store.ids()) {
+      // Each pass starts at a rotating position so a permanently backlogged channel
+      // cannot hold the head of the line and starve the others.
+      const ids = this.store.ids()
+      if (ids.length === 0) return
+      this.flushCursor = (this.flushCursor + 1) % ids.length
+      for (const id of [...ids.slice(this.flushCursor), ...ids.slice(0, this.flushCursor)]) {
         this.pump(id)
         if (this.closing.has(id)) this.finishClose(id)
       }

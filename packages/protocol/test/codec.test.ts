@@ -35,6 +35,17 @@ describe('codec', () => {
     expect(decodeFrame('[]')).toBeNull()
   })
 
+  it('does not resolve frame types through the object prototype', () => {
+    expect(decodeFrame('{"type":"constructor"}')).toBeNull()
+    expect(decodeFrame('{"type":"toString"}')).toBeNull()
+    expect(decodeFrame('{"type":"hasOwnProperty"}')).toBeNull()
+  })
+
+  it('bounds close reasons', () => {
+    expect(decodeFrame(JSON.stringify({ type: 'close', channel: 'ch1', reason: 'x'.repeat(501) }))).toBeNull()
+    expect(decodeFrame(JSON.stringify({ type: 'close', channel: 'ch1', reason: 'x'.repeat(500) }))).not.toBeNull()
+  })
+
   it('rejects unsafe channel identifiers', () => {
     expect(decodeFrame(JSON.stringify({ type: 'reset', channel: '../etc', seq: 1 }))).toBeNull()
     expect(decodeFrame(JSON.stringify({ type: 'reset', channel: 'a/b', seq: 1 }))).toBeNull()
