@@ -22,3 +22,15 @@ export {
   type WelcomeFrame,
 } from './frames.js'
 export { MAX_FRAME_BYTES, decodeFrame, encodeFrame } from './codec.js'
+export {
+  MAX_ACK_BYTES,
+  MAX_TERMINAL_DIMENSION,
+  decodeTerminalClientMessage,
+  isTerminalProfile,
+  decodeTerminalServerMessage,
+  parseTerminalClientMessage,
+  parseTerminalServerMessage,
+  terminalPayload,
+  type TerminalClientMessage,
+  type TerminalServerMessage,
+} from './terminal.js'

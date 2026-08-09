@@ -4,13 +4,17 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import {
   PROTOCOL_VERSION,
   decodeFrame,
+  decodeTerminalServerMessage,
   encodeFrame,
   negotiate,
+  terminalPayload,
   type ChannelResumeResult,
   type Frame,
   type HeartbeatPolicy,
   type HelloFrame,
   type Payload,
+  type TerminalClientMessage,
+  type TerminalServerMessage,
 } from '@modulastack/runner-protocol'
 
 export type StubOptions = {
@@ -27,6 +31,10 @@ export type StubOptions = {
   resumeSeqOverride?: number
   dropAfterWelcomeMs?: number
   delayPongMs?: number
+  holdExitedChannels?: boolean
+  closeOnOpen?: boolean
+  terminalOnOpen?: TerminalClientMessage
+  terminalBurstOnOpen?: TerminalClientMessage[]
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -86,6 +94,29 @@ export class StubControlPlane {
     for (const socket of this.sockets) socket.send(encodeFrame(frame))
   }
 
+  sendTerminal(channel: string, message: TerminalClientMessage) {
+    this.sendToRunner(channel, terminalPayload(message))
+  }
+
+  closeToRunner(channel: string, reason?: string) {
+    for (const socket of this.sockets) socket.send(encodeFrame({ type: 'close', channel, ...(reason ? { reason } : {}) }))
+    this.channels.delete(channel)
+  }
+
+  terminalMessages(channel: string): TerminalServerMessage[] {
+    return this.received
+      .filter(item => item.channel === channel)
+      .map(item => decodeTerminalServerMessage(item.payload))
+      .filter((message): message is TerminalServerMessage => message !== null)
+  }
+
+  terminalOutput(channel: string, replay: boolean) {
+    return this.terminalMessages(channel)
+      .filter(message => message.type === 'OUTPUT' && Boolean(message.replay) === replay)
+      .map(message => (message.type === 'OUTPUT' ? message.data : ''))
+      .join('')
+  }
+
   pingRunner(id: string) {
     for (const socket of this.sockets) socket.send(encodeFrame({ type: 'ping', id }))
   }
@@ -117,7 +148,11 @@ export class StubControlPlane {
     if (frame.type === 'hello') return this.handleHello(ws, frame)
     if (frame.type === 'open') {
       this.opens.push(frame.channel)
-      return void this.channels.set(frame.channel, { kind: frame.kind, attachToken: frame.attachToken, receivedSeq: 0, sentSeq: 0 })
+      this.channels.set(frame.channel, { kind: frame.kind, attachToken: frame.attachToken, receivedSeq: 0, sentSeq: 0 })
+      if (this.options.terminalOnOpen) this.sendTerminal(frame.channel, this.options.terminalOnOpen)
+      for (const message of this.options.terminalBurstOnOpen ?? []) this.sendTerminal(frame.channel, message)
+      if (this.options.closeOnOpen) this.closeToRunner(frame.channel, 'closed on open')
+      return
     }
     if (frame.type === 'data') return this.handleData(ws, frame.channel, frame.seq, frame.payload)
     if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
@@ -183,6 +218,11 @@ export class StubControlPlane {
     state.receivedSeq = seq
     this.received.push({ channel, seq, payload })
     if (this.options.echo) ws.send(encodeFrame({ type: 'data', channel, seq: ++state.sentSeq, payload }))
+    // The consumer closes exited channels once EXIT is in hand — the reference
+    // control-plane behavior the runner relies on.
+    if (!this.options.holdExitedChannels && decodeTerminalServerMessage(payload)?.type === 'EXIT') {
+      this.closeToRunner(channel, 'exited')
+    }
   }
 
   private handleReset(channel: string, seq: number) {

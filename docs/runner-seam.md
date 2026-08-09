@@ -38,10 +38,10 @@ works in only one topology is a bug in this document.
 | Duty | Notes |
 |---|---|
 | Pty spawn and hosting | Agent CLIs run in ptys under tmux: scrollback, resize, attach/reattach. The terminal a browser renders is a relayed runner pty. |
-| Worktree provisioning | Deterministic worktree + branch creation against local repos. |
+| Worktree provisioning | Deterministic worktree + branch creation against local repos. One runner owns the checkouts it provisions: lanes are serialized within the runner, and a failed attempt rolls back only what it still owns, so a contender can never delete a registered lane. Two runner processes sharing one checkout is outside this contract. |
 | Git and forge operations | All mutations (clone, branch, push, PR, merge) and the default read path, under local credentials — GitHub or a self-hosted forge, including one on a private network. |
 | Forge detect, wire, health | Detects an existing local forge, wires it via the runner's localhost setup flow, health-checks it. Guides new installs; never executes them, holds no install privileges. Config stays local; only opaque health crosses the seam. |
-| Model access resolution | Tri-modal, resolved entirely locally: subscription CLIs (their own login), API keys (encrypted local store, injected env-only), local models (any OpenAI-compatible endpoint). |
+| Model access resolution | Tri-modal, resolved entirely locally: subscription CLIs (their own login), API keys (encrypted local store, injected env-only), local models (any OpenAI-compatible endpoint). The pty host injects only non-secret orchestration variables into a session's environment; secret injection (API keys) is the key store's job (FR-11), delivered through a non-argv mechanism so nothing sensitive is visible in process arguments. |
 | Advisory review execution | Review rounds run here; the code under review never leaves the machine. |
 | Coms pools | Agent-to-agent coms transport: unix sockets, registries, and standing-peer attach points live beside the worktrees they serve. |
 | Preview servers and browser-QA targets | Bind to the runner's localhost; the operator's browser is on the same machine (split) or same host (co-resident), so no tunneling. |

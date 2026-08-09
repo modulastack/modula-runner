@@ -96,9 +96,10 @@ range — so a welcome cannot dictate a busy-loop ping rate or an overflowed tim
 | `close` | both | `channel` · `reason?` |
 | `error` | both | `message` · `channel?` |
 
-Channel kinds in version 1: `terminal` is defined; `coms`, `forge-event`, and
-`job-control` are **reserved** — structurally valid on the wire, semantics specified in
-later revisions (see the seam reconciliation note for why they exist now).
+Channel kinds in version 1: `terminal` is defined, with payload semantics specified
+in "Terminal channel payloads" below; `coms`, `forge-event`, and `job-control` are
+**reserved** — structurally valid on the wire, semantics specified in later revisions
+(see the seam reconciliation note for why they exist now).
 
 ## Channel model
 
@@ -137,10 +138,119 @@ later revisions (see the seam reconciliation note for why they exist now).
 - Close is best-effort after drain in version 1: buffered frames and the close are
   written before the channel drops, but a link that dies mid-flight can still lose
   the final frames along with the close — the roster rule guarantees the channel
-  closes, not that its tail was delivered. Acknowledged end-of-stream needs an ack
-  frame and is deferred to the revision that defines terminal payload semantics.
+  closes, not that its tail was delivered. A generic frame-level acknowledged close
+  remains deferred; terminal channels do not need it, because their `EXIT` message
+  rides a sequenced `data` frame and therefore replays across reconnects like any
+  other payload ("Terminal channel payloads" below).
 - Until `welcome` arrives, the only valid inbound frames are `welcome` and `reject`;
   session frames on an unnegotiated connection are discarded and surfaced as errors.
+
+## Terminal channel payloads
+
+The `terminal` kind carries the same message set the localhost terminal UI speaks
+today, so a pty behaves identically whether its viewer is co-resident or across the
+seam. Messages ride as `json` payloads inside ordinary `data` frames — no new frame
+types, no change to any existing field, and therefore no version bump under the
+versioning rules above: the set of wire-valid frames is unchanged, and these
+validators (`parseTerminalClientMessage` / `parseTerminalServerMessage`) run at the
+endpoints, never at the relay, which stays payload-blind. An endpoint that receives
+a structurally invalid terminal message ignores it and may answer with a terminal
+`ERROR` message; the frame layer is not involved.
+
+A terminal channel is bound to exactly one pty session when it is opened, for its
+whole life. That binding replaces the localhost `INIT` fields that select a session
+(`sessionId`, `attachToken`): across the seam the channel *is* the session handle,
+and its attach token — carried in the `open` frame — is the resume credential.
+Credentials never ride payloads, so `READY` carries no attach token either.
+
+Control plane → runner (the operator's side of the wire):
+
+| Message | Fields | Meaning |
+|---|---|---|
+| `INIT` | `cols` · `rows` · `profile?` | A viewer attached: size the pty and replay scrollback. `profile`, when present, must match the bound session's. |
+| `INPUT` | `data` | Keystrokes for the pty, verbatim. |
+| `RESIZE` | `cols` · `rows` | Resize the pty. |
+| `ACK` | `bytes` | Flow control: the viewer has consumed this many output bytes. |
+| `KILL` | — | Kill the session and its process. |
+| `SCROLL_RESET` | — | Leave scrollback hold (tmux copy-mode) and snap to the live tail. |
+
+Runner → control plane:
+
+| Message | Fields | Meaning |
+|---|---|---|
+| `READY` | `sessionId` · `profile` · `cwd` · `shell` · `pid` | The pty is attached and streaming. |
+| `OUTPUT` | `data` · `replay?` | Pty output. `replay: true` marks scrollback re-emission. |
+| `EXIT` | `exitCode` · `signal` | The process ended, with exactly one of `exitCode` or `signal` set. Sequenced end-of-stream: it replays across reconnects, unlike a bare `close`. |
+| `ERROR` | `message` | A session-scoped failure (bad init, spawn failure, invalid message). |
+| `SCROLL_STATE` | `held` · `newOutput` | Scrollback hold state, so the viewer can show "output held" honestly. |
+
+Field bounds: dimensions are integers 1–1000; `ACK.bytes` is an integer 0–10,000,000;
+`profile` is an opaque bounded label (safe identifier, ≤128 chars) — control-plane
+vocabulary the protocol does not enumerate, so the public package never has to chase
+product role lists; `cwd` and `shell` are non-empty strings ≤1024; `pid` is a
+positive integer; `EXIT` populates exactly one of `exitCode` / `signal` (the other is `null`), both non-negative integers; a command killed by signal N is reported as `signal: N`, decoded from the shell's `128 + N` convention — so an explicit exit code above 128 is reported as a signal, the one ambiguity a `$?`-based exit capture cannot resolve; `ERROR.message`
+is bounded at 500 like a close reason.
+
+Flow control is end-to-end between viewer and pty, independent of socket
+backpressure: the runner counts unacknowledged **live** `OUTPUT` bytes and pauses
+the pty above a high-water mark, resuming below a low-water mark once `ACK`s catch
+up. The watermark values are host policy, not protocol. A repeated `INIT`
+re-requests replay but does not reset the window: acknowledgment debt belongs to
+the channel peer, which outlives viewer attach cycles, so only an announced
+continuity loss restarts the window at zero. Replayed output
+(`replay: true`) is not flow-counted and must not be acknowledged — replay answers
+an attach or an announced continuity loss, and counting it would double-charge the
+window for bytes the pty already paid for.
+
+`EXIT` is emitted only after output the flow window is still holding has
+drained, so the sequenced end-of-stream never overtakes the stream; `ACK`s
+therefore stay meaningful after the process is gone, and a `KILL` during the
+wait forces `EXIT` out and abandons the undelivered tail. Output a viewer misses
+while its window is closed is recoverable through replay rather than the live
+path: a terminal multiplexer coalesces output for a client that is not reading,
+so scrollback — not the live stream — is what makes a paused viewer whole.
+
+The channel outlives its session: after `EXIT` the runner keeps the channel open
+and replayable, and the control plane — the consumer — closes it once `EXIT` is
+in hand. A runner-side close racing a dying link could lose the very
+end-of-stream the sequenced `EXIT` exists to guarantee.
+
+These are two layers, and they do not wait on each other. The channel layer moves
+sequenced frames and is payload-blind; it never suspends its pump for an
+application-level recovery, because doing so would make routing depend on
+payload semantics the relay is specified not to read. Ordering between a
+recovered snapshot and the live stream is carried by the `replay` flag, which is
+what a viewer renders on: recovered history redraws scrollback, live output
+appends. An endpoint that needs the snapshot to precede its own newer bytes
+holds *its own* output, as the pty host does behind its replay barrier.
+
+Replay composes with the channel model in two layers: the channel's replay buffer
+heals exact gaps after a reconnect (the sequence machinery above), and the pty
+host's scrollback answers anything larger — after a channel `reset` announces that
+buffered continuity was lost, the runner re-emits scrollback as `OUTPUT` with
+`replay: true`, in bounded chunks so no single replay frame can outgrow a replay
+budget. Recovery favours a redundant redraw over a lost byte: output produced while a
+capture is being taken may appear both in the snapshot and in the live stream
+that follows, and that is deliberate — the snapshot is a full repaint the viewer
+renders over, so a duplicate corrects itself, whereas suppressing more to avoid
+it would risk discarding output the snapshot did not actually contain. A replay
+large enough to outrun that budget itself provokes a `reset`;
+that reset does **not** trigger another replay, because the next one would
+overflow the same way — the loss stays announced, and a viewer that wants the
+scrollback asks again with `INIT`. Replays are bounded per `INIT` for the same
+reason: a stream that keeps outrunning the budget converges only if the runner
+stops answering it. Continuity loss stays announced, and the viewer still ends up current. A
+viewer that observes a mid-stream `reset` on an established connection can send
+`INIT` again: `INIT` is always a request for fresh scrollback replay, not only the
+first attach.
+
+Recovery is bounded by the session's lifetime. Once `EXIT` is emitted the runner
+releases the pane that held the scrollback, so a `reset` arriving after the
+end-of-stream is answered with the reset alone. Retaining dead panes until every
+channel closed would trade a certain, unbounded resource cost for a narrow
+recovery: the case that matters — a viewer whose flow window was closed, so the
+multiplexer coalesced output away — is recovered *before* `EXIT`, while the pane
+is still alive.
 
 ## End-to-end capability
 

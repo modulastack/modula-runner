@@ -1,18 +1,12 @@
 import { EventEmitter } from 'node:events'
-import { randomUUID } from 'node:crypto'
 import { validateHeaderValue } from 'node:http'
-import WebSocket from 'ws'
 import {
-  MAX_FRAME_BYTES,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   decodeFrame,
-  encodeFrame,
   isValidRange,
   type ChannelKind,
-  type ChannelResumeResult,
   type Frame,
-  type HeartbeatPolicy,
   type Payload,
   type RunnerInfo,
   type VersionRange,
@@ -20,11 +14,12 @@ import {
 } from '@modulastack/runner-protocol'
 import { backoffDelay, type BackoffOptions } from './backoff.js'
 import { ChannelStore } from './channels.js'
+import { Heartbeat } from './liveness.js'
+import { ChannelReconciler } from './reconciliation.js'
+import { Transport } from './transport.js'
 import { assertSecureUrl } from './secureUrl.js'
 
 const DEFAULT_HIGH_WATER_BYTES = 4 * 1024 * 1024
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
-const FLUSH_INTERVAL_MS = 20
 // Node's 32-bit setTimeout ceiling: anything above coerces to 1 ms.
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -48,27 +43,16 @@ export type ChannelHandle = {
 }
 
 type Phase = 'idle' | 'running' | 'stopped' | 'failed'
-type ClosingEntry = { reason?: string; sent: boolean }
 
 export class RunnerClient extends EventEmitter {
   private readonly options: RunnerClientOptions
   private readonly store: ChannelStore
-  private readonly closing = new Map<string, ClosingEntry>()
-  private presented = new Map<string, number>()
-  private flushCursor = 0
-  private ws?: WebSocket
+  private readonly transport: Transport
+  private readonly heartbeat: Heartbeat
+  private readonly reconciler: ChannelReconciler
   private phase: Phase = 'idle'
   private connected = false
-  private attempt = 0
   private pendingBackoffReset = false
-  private lastSeen = 0
-  private pingOrder: string[] = []
-  private readonly pingSet = new Set<string>()
-  private maxOutstandingPings = 16
-  private heartbeatTimer: NodeJS.Timeout | undefined
-  private reconnectTimer: NodeJS.Timeout | undefined
-  private handshakeTimer: NodeJS.Timeout | undefined
-  private flushTimer: NodeJS.Timeout | undefined
 
   constructor(options: RunnerClientOptions) {
     super()
@@ -95,19 +79,47 @@ export class RunnerClient extends EventEmitter {
       ...(options.backoff ? { backoff: { ...options.backoff } } : {}),
     }
     this.store = new ChannelStore(options.bufferBytes, options.totalBufferBytes)
+    this.transport = new Transport(this.options, {
+      active: () => this.phase === 'running',
+      onOpen: () => this.startHandshake(),
+      onMessage: raw => this.handleRaw(raw),
+      onClosed: () => this.handleClose(),
+      onUpgradeFailed: statusCode => this.handleUpgradeFailure(statusCode),
+      onReconnecting: detail => this.emit('reconnecting', detail),
+    })
+    this.heartbeat = new Heartbeat({
+      onExpired: () => this.transport.terminate(),
+      // Backoff resets only after the connection survives a heartbeat interval: a
+      // welcome-then-drop control plane must not keep a fleet churning at base delay.
+      onHealthyInterval: () => {
+        if (!this.pendingBackoffReset) return
+        this.transport.resetBackoff()
+        this.pendingBackoffReset = false
+      },
+      canSend: () => this.transport.bufferedBytes() <= this.highWaterBytes(),
+      send: id => this.sendRaw({ type: 'ping', id }),
+    })
+    this.reconciler = new ChannelReconciler({
+      store: this.store,
+      transport: this.transport,
+      isConnected: () => this.connected,
+      highWaterBytes: () => this.highWaterBytes(),
+      sendFrame: frame => this.sendRaw(frame),
+      onOutboundReset: channel => this.emit('channel-outbound-reset', { channel }),
+    })
   }
 
   connect() {
     if (this.phase !== 'idle') throw new Error(`client already ${this.phase}`)
     this.phase = 'running'
-    this.dial()
+    this.transport.dial()
   }
 
   stop() {
     this.phase = 'stopped'
     this.connected = false
     this.clearTimers()
-    this.ws?.close()
+    this.transport.close()
     this.emit('stopped')
   }
 
@@ -128,11 +140,11 @@ export class RunnerClient extends EventEmitter {
       kind,
       send: payload => {
         this.assertUsable()
-        if (this.closing.has(state.id)) throw new Error(`channel closing: ${state.id}`)
+        if (this.reconciler.isClosing(state.id)) throw new Error(`channel closing: ${state.id}`)
         this.store.record(state.id, payload)
-        this.pump(state.id)
+        this.reconciler.pump(state.id)
       },
-      close: reason => this.closeChannel(state.id, reason),
+      close: reason => this.reconciler.close(state.id, reason),
     }
   }
 
@@ -142,68 +154,11 @@ export class RunnerClient extends EventEmitter {
     if (this.phase === 'stopped' || this.phase === 'failed') throw new Error(`client is ${this.phase}`)
   }
 
-  // Close is drain-then-close: the channel stays in the store (and in resume
-  // snapshots) until its buffered frames and the close frame are actually written,
-  // so neither a disconnect nor backpressure can orphan it or drop its tail.
-  private closeChannel(id: string, reason?: string) {
-    if (!this.store.get(id) || this.closing.has(id)) return
-    // Clamped to the schema's bound: an unbounded reason would make the close frame
-    // itself undecodable and take the whole connection down with it.
-    const bounded = reason === undefined ? undefined : reason.slice(0, 500)
-    this.closing.set(id, { sent: false, ...(bounded === undefined ? {} : { reason: bounded }) })
-    if (this.connected) this.finishClose(id)
-  }
-
-  private finishClose(id: string) {
-    const entry = this.closing.get(id)
-    if (!entry || entry.sent || !this.connected) return
-    const state = this.store.get(id)
-    if (!state) {
-      this.closing.delete(id)
-      return
-    }
-    this.pump(id)
-    if (state.flushedSeq === state.sentSeq) this.sendClose(id, entry)
-    else this.scheduleFlush()
-  }
-
-  private sendClose(id: string, entry: ClosingEntry) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return
-    entry.sent = true
-    const frame: Frame = { type: 'close', channel: id, ...(entry.reason === undefined ? {} : { reason: entry.reason }) }
-    this.ws.send(encodeFrame(frame), error => {
-      if (error) {
-        entry.sent = false
-        return
-      }
-      this.store.drop(id)
-      this.closing.delete(id)
-    })
-  }
-
-  private dial() {
-    const ws = new WebSocket(this.options.url, {
-      headers: { authorization: `Bearer ${this.options.token}` },
-      maxPayload: MAX_FRAME_BYTES,
-      handshakeTimeout: this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
-    })
-    this.ws = ws
-    ws.on('open', () => this.startHandshake())
-    ws.on('message', raw => this.handleRaw(String(raw)))
-    ws.on('unexpected-response', (_request, response) => this.handleUpgradeFailure(response.statusCode))
-    ws.on('error', () => undefined)
-    ws.on('close', () => this.handleClose())
-  }
-
   private startHandshake() {
     const protocol = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
-    const states = this.store.resumeStates()
-    // The snapshot keeps each channel's sentSeq as presented: an acknowledgment may
-    // never exceed it, even if sends during the handshake advance the live counter.
-    this.presented = new Map(states.map(state => [state.id, state.sentSeq]))
+    const states = this.reconciler.snapshotForHello()
     this.sendRaw({ type: 'hello', protocol, runner: this.options.runner, channels: states })
-    const timeoutMs = this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
-    this.handshakeTimer = setTimeout(() => this.ws?.terminate(), timeoutMs)
+    this.transport.startHandshakeTimer()
   }
 
   private handleUpgradeFailure(statusCode?: number) {
@@ -211,29 +166,19 @@ export class RunnerClient extends EventEmitter {
       this.fail('auth-failed', { statusCode })
       return
     }
-    this.ws?.terminate()
+    this.transport.terminate()
   }
 
   private handleClose() {
     if (this.phase !== 'running') return
     this.clearTimers()
-    for (const entry of this.closing.values()) entry.sent = false
+    this.reconciler.markClosesUnsent()
     if (this.connected) {
       this.connected = false
       this.emit('offline')
     }
     // An offline listener may have called stop() synchronously just above.
-    if (this.phase === 'running') this.scheduleReconnect()
-  }
-
-  private scheduleReconnect() {
-    const delayMs = backoffDelay(this.attempt++, this.options.backoff)
-    this.emit('reconnecting', { attempt: this.attempt, delayMs })
-    // A reconnecting listener may have stopped the client during the emit.
-    if (this.phase !== 'running') return
-    this.reconnectTimer = setTimeout(() => {
-      if (this.phase === 'running') this.dial()
-    }, delayMs)
+    if (this.phase === 'running') this.transport.scheduleReconnect()
   }
 
   private handleRaw(raw: string) {
@@ -246,7 +191,7 @@ export class RunnerClient extends EventEmitter {
     }
     // The same rule for state-invalid frames: a stream of late welcomes must not
     // hold a dead session open, so only accepted frames count as liveness.
-    if (this.handleFrame(frame)) this.lastSeen = Date.now()
+    if (this.handleFrame(frame)) this.heartbeat.sawTraffic()
   }
 
   private handleFrame(frame: Frame): boolean {
@@ -274,14 +219,14 @@ export class RunnerClient extends EventEmitter {
     if (frame.type === 'ping') {
       // Pong replies respect backpressure too: a peer that pings without reading
       // must not grow the outbound queue without bound.
-      if ((this.ws?.bufferedAmount ?? 0) <= (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) {
+      if (this.transport.bufferedBytes() <= this.highWaterBytes()) {
         this.sendRaw({ type: 'pong', id: frame.id })
       }
     }
     else if (frame.type === 'pong') {
       // Only a pong answering one of this connection's own pings proves liveness;
       // fabricated or stale pongs must not hold a dead session open.
-      if (!this.pingSet.delete(frame.id)) return false
+      if (!this.heartbeat.matchPong(frame.id)) return false
     }
     else if (frame.type === 'data') return this.handleData(frame.channel, frame.seq, frame.payload)
     else if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
@@ -291,126 +236,19 @@ export class RunnerClient extends EventEmitter {
   }
 
   private handleWelcome(frame: WelcomeFrame) {
-    this.clearHandshakeTimer()
+    this.transport.clearHandshakeTimer()
     const offered = this.options.protocol ?? { min: MIN_PROTOCOL_VERSION, max: PROTOCOL_VERSION }
     if (frame.protocol < offered.min || frame.protocol > offered.max) {
       this.fail('protocol-error', { message: 'welcome selected an unsupported protocol version', protocol: frame.protocol })
       return
     }
-    // Backoff resets only after the connection survives a heartbeat interval: a
-    // welcome-then-drop control plane must not keep a fleet churning at base delay.
     this.pendingBackoffReset = true
     this.connected = true
-    this.startHeartbeat(frame.heartbeat)
-    this.reconcileChannels(frame.channels)
+    this.heartbeat.start(frame.heartbeat)
+    for (const event of this.reconciler.reconcile(frame.channels)) this.emit(event.name, event.detail)
     // Reconciliation runs user listeners synchronously; one may have stopped the client.
     if (this.phase !== 'running' || !this.connected) return
     this.emit('connected', { protocol: frame.protocol })
-  }
-
-  // The welcome is reconciled against the exact hello snapshot: results for channels
-  // never presented are misbehavior to surface, presented channels the welcome omits
-  // are re-announced from sequence zero (never trusted to a stale flush position),
-  // and channels created mid-handshake are announced now. Recovery is two-phase —
-  // every channel is restored and replayed before any event reaches a listener, so
-  // a handler for one channel can never act on another's half-recovered state.
-  private reconcileChannels(results: ChannelResumeResult[]) {
-    const events: { name: string; detail: unknown }[] = []
-    const announceIds = this.store.ids().filter(id => !this.presented.has(id))
-    const unanswered = new Set(this.presented.keys())
-    for (const result of results) {
-      if (!this.presented.has(result.id)) {
-        events.push({ name: 'protocol-error', detail: { message: 'resume result for unknown channel', channel: result.id } })
-        continue
-      }
-      unanswered.delete(result.id)
-      this.resumeChannel(result, events)
-    }
-    for (const id of unanswered) this.reannounce(id, events)
-    for (const id of announceIds) this.announceChannel(id)
-    for (const id of [...this.closing.keys()]) this.finishClose(id)
-    for (const event of events) this.emit(event.name, event.detail)
-  }
-
-  private resumeChannel(result: ChannelResumeResult, events: { name: string; detail: unknown }[]) {
-    const state = this.store.get(result.id)
-    if (!state) return
-    if (result.status === 'expired') {
-      this.store.drop(result.id)
-      if (!this.closing.delete(result.id)) events.push({ name: 'channel-expired', detail: { channel: result.id } })
-      return
-    }
-    // A peer cannot have received more than the hello presented — frames recorded
-    // while the welcome was in flight were never on the wire, so an acknowledgment
-    // covering them is a lie. Such a claim is discarded along with the stale local
-    // watermark: replaying the whole retained buffer is the only position that
-    // cannot silently lose frames, and the contiguity rule discards the duplicates.
-    const impossibleAck = result.receivedSeq > (this.presented.get(result.id) ?? 0)
-    state.flushedSeq = impossibleAck ? 0 : result.receivedSeq
-    const outcome = this.pump(result.id)
-    if (impossibleAck) events.push({ name: 'protocol-error', detail: { message: 'resume beyond sent sequence', channel: result.id } })
-    if (!this.closing.has(result.id)) events.push({ name: 'channel-resumed', detail: { channel: result.id, replayed: outcome.sent, reset: outcome.reset } })
-  }
-
-  private reannounce(id: string, events: { name: string; detail: unknown }[]) {
-    const state = this.store.get(id)
-    if (!state) return
-    // The replacement open starts both directions over: the control plane's fresh
-    // stream begins at sequence one, which a stale inbound watermark would swallow.
-    state.flushedSeq = 0
-    state.receivedSeq = 0
-    this.announceChannel(id)
-    events.push({ name: 'protocol-error', detail: { message: 'welcome omitted a presented channel', channel: id } })
-  }
-
-  private announceChannel(id: string) {
-    const state = this.store.get(id)
-    if (!state) return
-    this.sendRaw({ type: 'open', channel: id, kind: state.kind, attachToken: state.attachToken })
-    this.pump(id)
-  }
-
-  // All data transmission funnels through here: frames flow only while the socket
-  // buffer is under the high-water mark, and everything else waits in the replay
-  // buffer — backpressure never breaks sequence continuity, it only delays it.
-  private pump(id: string): { sent: number; reset: boolean } {
-    const outcome = { sent: 0, reset: false }
-    const state = this.store.get(id)
-    if (!state) return outcome
-    while (this.connected && state.flushedSeq < state.sentSeq) {
-      if ((this.ws?.bufferedAmount ?? 0) > (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) {
-        this.scheduleFlush()
-        break
-      }
-      const next = this.store.nextOutbound(id, state.flushedSeq)
-      if (next.reset) {
-        this.sendRaw(next.reset)
-        state.flushedSeq = next.reset.seq - 1
-        outcome.reset = true
-        continue
-      }
-      if (!next.frame) break
-      this.sendRaw(next.frame)
-      state.flushedSeq = next.frame.seq
-      outcome.sent++
-    }
-    return outcome
-  }
-
-  private scheduleFlush() {
-    if (this.flushTimer) return
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = undefined
-      // Each pass starts at a rotating position so a permanently backlogged channel
-      // cannot hold the head of the line and starve the others.
-      const ids = this.store.ids()
-      if (ids.length === 0) return
-      this.flushCursor = (this.flushCursor + 1) % ids.length
-      for (const id of [...ids.slice(this.flushCursor), ...ids.slice(0, this.flushCursor)]) {
-        this.pump(id)
-        if (this.closing.has(id)) this.finishClose(id)
-      }
-    }, FLUSH_INTERVAL_MS)
   }
 
   // Frames addressed to channels this runner does not hold are not liveness and
@@ -432,51 +270,11 @@ export class RunnerClient extends EventEmitter {
   }
 
   private handleChannelClose(channel: string, reason?: string): boolean {
-    if (!this.store.get(channel) && !this.closing.has(channel)) return false
+    if (!this.store.get(channel) && !this.reconciler.isClosing(channel)) return false
     this.store.drop(channel)
-    this.closing.delete(channel)
+    this.reconciler.dropClosing(channel)
     this.emit('channel-closed', { channel, ...(reason ? { reason } : {}) })
     return true
-  }
-
-  private startHeartbeat(policy: HeartbeatPolicy) {
-    this.lastSeen = Date.now()
-    this.pingOrder = []
-    this.pingSet.clear()
-    // Every ping that could still be legitimately answered inside the timeout
-    // window stays outstanding — a shorter memory would reject honest late pongs —
-    // but capped, so an extreme policy cannot grow an unbounded id set: a peer
-    // lagging more than the cap's worth of intervals is not meaningfully alive.
-    this.maxOutstandingPings = Math.min(Math.ceil(policy.timeoutMs / policy.intervalMs) + 1, 4096)
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    this.heartbeatTimer = setInterval(() => this.heartbeatTick(policy), policy.intervalMs)
-  }
-
-  private heartbeatTick(policy: HeartbeatPolicy) {
-    if (Date.now() - this.lastSeen > policy.timeoutMs) {
-      this.ws?.terminate()
-      return
-    }
-    if (this.pendingBackoffReset) {
-      this.attempt = 0
-      this.pendingBackoffReset = false
-    }
-    // Pings respect backpressure like every other outbound frame: a peer that
-    // writes but never reads must not grow the queue one ping per interval.
-    if ((this.ws?.bufferedAmount ?? 0) > (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) return
-    const id = randomUUID()
-    this.pingOrder.push(id)
-    this.pingSet.add(id)
-    while (this.pingSet.size > this.maxOutstandingPings) {
-      const oldest = this.pingOrder.shift()
-      if (oldest === undefined) break
-      this.pingSet.delete(oldest)
-    }
-    // Answered ids linger in the order queue until shifted; compact occasionally.
-    if (this.pingOrder.length > this.maxOutstandingPings * 2 + 64) {
-      this.pingOrder = this.pingOrder.filter(pending => this.pingSet.has(pending))
-    }
-    this.sendRaw({ type: 'ping', id })
   }
 
   private fail(event: string, detail: unknown) {
@@ -484,34 +282,25 @@ export class RunnerClient extends EventEmitter {
     this.connected = false
     this.clearTimers()
     this.emit(event, detail)
-    this.ws?.close()
+    this.transport.close()
   }
 
   private sendRaw(frame: Frame) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return
-    const encoded = encodeFrame(frame)
-    if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) {
-      // An oversized hello can never handshake — retrying would loop forever.
-      if (frame.type === 'hello') return this.fail('protocol-error', { message: 'outbound hello exceeds MAX_FRAME_BYTES' })
-      this.emit('protocol-error', { message: 'outbound frame exceeds MAX_FRAME_BYTES', frame: frame.type })
-      return
-    }
-    this.ws.send(encoded)
+    const result = this.transport.send(frame)
+    if (result !== 'oversized') return
+    // An oversized hello can never handshake — retrying would loop forever.
+    if (frame.type === 'hello') return this.fail('protocol-error', { message: 'outbound hello exceeds MAX_FRAME_BYTES' })
+    this.emit('protocol-error', { message: 'outbound frame exceeds MAX_FRAME_BYTES', frame: frame.type })
   }
 
-  private clearHandshakeTimer() {
-    if (this.handshakeTimer) clearTimeout(this.handshakeTimer)
-    this.handshakeTimer = undefined
+  private highWaterBytes() {
+    return this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES
   }
 
   private clearTimers() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-    if (this.flushTimer) clearTimeout(this.flushTimer)
-    this.heartbeatTimer = undefined
-    this.reconnectTimer = undefined
-    this.flushTimer = undefined
-    this.clearHandshakeTimer()
+    this.heartbeat.stop()
+    this.reconciler.clearTimer()
+    this.transport.clearTimers()
   }
 }
 

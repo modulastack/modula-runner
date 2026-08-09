@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@modulastack/runner-protocol": "0.1.0",
+    "node-pty": "^1.0.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

@@ -6,22 +6,26 @@ commit, and so is this plan.
 
 ## Now
 
-- **Pty host + worktree provisioning** — the next slice: terminals spawn and stream
-  behind the wire contract, identically co-resident or split. *Not started.*
+- **Pairing, presence, preview adjacency** — the next slice: device-code pairing with
+  revocable per-runner tokens; online/offline visible, never silent. *Not started.*
 
 Landed so far: the seam contract ([`docs/runner-seam.md`](docs/runner-seam.md), reconciled
-in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)), the versioned protocol
-schema ([`packages/protocol`](packages/protocol/SCHEMA.md)), and the outbound-only
-WebSocket client with reconnect continuity, tested against a stub control plane
+in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)); the versioned protocol
+schema ([`packages/protocol`](packages/protocol/SCHEMA.md)) including terminal channel
+payload semantics; the outbound-only WebSocket client with reconnect continuity; and the
+pty host — agent commands in per-worktree tmux sessions bound to terminal channels, with
+scrollback replay, resize, reattach, an acknowledged flow-control window, and
+deterministic worktree provisioning — all tested against a stub control plane
 ([`packages/runner`](packages/runner)).
 
 ## The split
 
 The path to a runner that executes real jobs against a hosted control plane:
 
-- [x] **Seam contract, protocol schema, outbound WSS** — see *Now* for what landed
-- [ ] **Pty host + worktree provisioning** behind the wire contract — terminals spawn and
-      stream identically whether co-resident or split
+- [x] **Seam contract, protocol schema, outbound WSS** — the contract documents, the
+      versioned frames, and the reconnect-continuity client
+- [x] **Pty host + worktree provisioning** behind the wire contract — terminals spawn and
+      stream identically whether co-resident or split; see *Now* for what landed
 - [ ] **Pairing, presence, preview adjacency** — device-code pairing with revocable
       per-runner tokens; online/offline visible, never silent; previews bind to your
       localhost

@@ -1,0 +1,771 @@
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import * as pty from 'node-pty'
+import { isTerminalProfile, type TerminalClientMessage, type TerminalServerMessage } from '@modulastack/runner-protocol'
+import {
+  captureTmuxScrollback,
+  exitTmuxCopyMode,
+  hasTmuxSession,
+  killTmuxSession,
+  tmuxSessionPresence,
+  startTmuxSession,
+  watchPane,
+  tmuxAttachArgs,
+  tmuxSessionName,
+  worktreeSocket,
+  type PaneStatus,
+  type TmuxRef,
+} from './tmux.js'
+
+export type FlowPolicy = { highWaterBytes: number; lowWaterBytes: number; flushMs: number }
+
+// The same watermarks the localhost terminal stack runs today.
+export const DEFAULT_FLOW: FlowPolicy = { highWaterBytes: 512 * 1024, lowWaterBytes: 128 * 1024, flushMs: 12 }
+export const DEFAULT_REPLAY_LINES = 200
+export const DEFAULT_POLL_MS = 1_000
+const OUTPUT_CHUNK_CHARS = 16 * 1024
+// The same bound the localhost stack keeps per session for detached output.
+const PRE_INIT_BUFFER_BYTES = 256 * 1024
+// Scrollback captures are rationed by a refilling budget rather than reset per
+// INIT. Resetting the allowance on every INIT let a peer mint captures by
+// repeating INIT, monopolising the runner-wide capture slots; a budget bounds
+// both that and the reset-provoked replay loop with one mechanism.
+const REPLAY_BURST = 3
+const REPLAY_REFILL_MS = 2_000
+
+const EXIT_FILE_ENV = 'MODULA_RUNNER_EXIT_FILE'
+// The wrapper writes the wrapped command's exit code before the tmux session can
+// die: the attach client's own exit code is tmux's, never the CLI's.
+const EXIT_WRAPPER = `"$0" "$@"; code=$?; printf %s "$code" > "$${EXIT_FILE_ENV}"; exit "$code"`
+
+export type TerminalLaunchSpec = {
+  command: string
+  args?: string[]
+  cwd: string
+  profile?: string
+  env?: Record<string, string>
+  socket?: string
+}
+
+export type TerminalAdoptSpec = {
+  cwd: string
+  command: string
+  profile?: string
+}
+
+export type TerminalSessionEvents = {
+  send: (message: TerminalServerMessage) => void
+  onExited: () => void
+}
+
+export type SessionPolicy = {
+  flow: FlowPolicy
+  replayLines: number
+  pollMs: number
+}
+
+// One lifecycle, one field. These states were five independent booleans, and
+// every ordering defect this file has seen was an illegal combination of them
+// (finished while exiting, killing while streaming, exiting after disposal).
+// A phase makes those combinations unrepresentable instead of guarded.
+type Phase = 'starting' | 'streaming' | 'killing' | 'exiting' | 'finished' | 'disposed'
+
+type SessionInit = {
+  id?: string
+  spec: { command: string; cwd: string; profile: string }
+  ref: TmuxRef
+  exitDir?: string
+  policy: SessionPolicy
+  events: TerminalSessionEvents
+}
+
+const MAX_METADATA_LENGTH = 1024
+
+function assertSessionMetadata(spec: { command: string; cwd: string; profile: string }) {
+  if (!isTerminalProfile(spec.profile)) throw new Error(`profile is not a valid terminal label: ${spec.profile}`)
+  for (const [field, value] of [['cwd', spec.cwd], ['command', spec.command]] as const) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > MAX_METADATA_LENGTH) {
+      throw new Error(`${field} must be a non-empty string of at most ${MAX_METADATA_LENGTH} characters`)
+    }
+  }
+}
+
+// Carries the session that outlived a failed launch, so the host can keep it
+// on the retry list instead of losing the only handle to a running command.
+export class UnkillableSessionError extends Error {
+  constructor(readonly ref: TmuxRef) {
+    super(`lane session survived a failed launch and could not be killed: ${ref.sessionName}`)
+  }
+}
+
+export class TerminalSession {
+  readonly id: string
+  readonly profile: string
+  readonly cwd: string
+  readonly command: string
+  readonly ref: TmuxRef
+  private readonly policy: SessionPolicy
+  private readonly events: TerminalSessionEvents
+  private readonly exitDir: string | undefined
+  private attachPty: pty.IPty | undefined
+  private phase: Phase = 'starting'
+  private pendingBytes = 0
+  private flowPaused = false
+  private outputQueue: string[] = []
+  private flushTimer: NodeJS.Timeout | undefined
+  private cols = 80
+  private rows = 24
+  private unwatchPane: (() => void) | undefined
+  private replayTokens = REPLAY_BURST
+  private replayRefilledAt = Date.now()
+  private deadPaneKillPending = false
+  private scrollHeld = false
+  private scrollNewOutput = false
+  private replaying = false
+  private replayQueued = false
+  private replayBarrier = false
+  private preInitBuffer: string[] = []
+  private preInitBytes = 0
+  private queuedBytes = 0
+  private scrollResetting = false
+  // Set whenever the pty is paused: a multiplexer coalesces output for a client
+  // that is not reading, so a paused stretch is exactly when the viewer's live
+  // stream has a hole that only scrollback can fill.
+  private missedWhilePaused = false
+
+  // Whether a viewer ever attached is orthogonal to the lifecycle: it stays true
+  // through `exiting`, because a dying session still owes its viewer the tail
+  // of the stream and the scrollback behind it.
+  private viewerAttached = false
+
+  // A kill that could not be confirmed: the command may still be running, so
+  // this session must keep its watcher even when its channel goes away.
+  private killUnconfirmed = false
+
+  private get streaming() {
+    return this.viewerAttached
+  }
+
+  private get exitPending() {
+    return this.phase === 'exiting'
+  }
+
+  private get killPending() {
+    return this.phase === 'killing'
+  }
+
+  private get finished() {
+    return this.phase === 'finished' || this.phase === 'disposed'
+  }
+
+  private get disposed() {
+    return this.phase === 'disposed'
+  }
+
+  private get live() {
+    return this.phase === 'starting' || this.phase === 'streaming' || this.phase === 'killing'
+  }
+
+  static async launch(spec: TerminalLaunchSpec, policy: SessionPolicy, events: TerminalSessionEvents) {
+    // Validated before anything runs: a launch this runner would reject must
+    // not leave the command's side effects behind on its way to being refused.
+    const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
+    assertSessionMetadata(normalized)
+    const exitDir = mkdtempSync(path.join(tmpdir(), 'modula-runner-'))
+    const id = randomUUID()
+    const ref = { socket: spec.socket ?? worktreeSocket(spec.cwd), sessionName: tmuxSessionName(spec.cwd, id) }
+    // A half-launched session is torn down whole: a failed attach must not
+    // leave a command running unobserved or a temp directory behind.
+    try {
+      await startTmuxSession({
+        ...ref,
+        cwd: spec.cwd,
+        file: '/bin/sh',
+        args: ['-c', EXIT_WRAPPER, spec.command, ...(spec.args ?? [])],
+        env: { ...spec.env, [EXIT_FILE_ENV]: path.join(exitDir, 'exit-code') },
+      })
+      const session = new TerminalSession({ id, spec: normalized, ref, exitDir, policy, events })
+      session.attach()
+      return session
+    } catch (error) {
+      // A session that cannot be confirmed dead keeps its tmux session and its
+      // exit file: deleting state a live command still writes to, and reporting
+      // the original failure alone, would hide a running process nobody owns.
+      const killed = (await killTmuxSession(ref)) || (await killTmuxSession(ref))
+      if (!killed) throw new UnkillableSessionError(ref)
+      try {
+        rmSync(exitDir, { recursive: true, force: true })
+      } catch {}
+      throw error
+    }
+  }
+
+  // Reattach to a tmux session that outlived its host process. The original exit
+  // file is gone with the old host, so an adopted session reports a null exit code.
+  static async adopt(ref: TmuxRef, spec: TerminalAdoptSpec, policy: SessionPolicy, events: TerminalSessionEvents) {
+    const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
+    assertSessionMetadata(normalized)
+    if (!(await hasTmuxSession(ref))) throw new Error(`no tmux session to adopt: ${ref.sessionName}`)
+    const session = new TerminalSession({ spec: normalized, ref, policy, events })
+    session.attach()
+    return session
+  }
+
+  private constructor(init: SessionInit) {
+    // Metadata is checked against the wire's own rules at construction: a READY
+    // the peer's validator would drop leaves a viewer waiting forever.
+    assertSessionMetadata(init.spec)
+    this.id = init.id ?? randomUUID()
+    this.command = init.spec.command
+    this.cwd = init.spec.cwd
+    this.profile = init.spec.profile
+    this.ref = init.ref
+    this.exitDir = init.exitDir
+    this.policy = init.policy
+    this.events = init.events
+  }
+
+  isFinished() {
+    return this.finished
+  }
+
+  // True while a kill is in flight or after one that could not be confirmed:
+  // the command may still be running, so something must keep watching it.
+  needsSupervision() {
+    return !this.disposed && (this.killPending || this.killUnconfirmed)
+  }
+
+  handle(message: TerminalClientMessage) {
+    // Acknowledgments outlive streaming: a session waiting to emit EXIT is
+    // still draining its tail, and that drain runs on ACKs.
+    if (message.type === 'ACK') return this.handleAck(message.bytes)
+    // A kill has been asked for and is in flight: nothing may reach the command
+    // in the window before it dies, least of all input the operator is trying
+    // to stop.
+    if (this.killPending) {
+      if (message.type === 'KILL') return
+      return this.events.send({ type: 'ERROR', message: 'session kill is pending' })
+    }
+    if (message.type === 'INIT') return this.handleInit(message)
+    if (this.finished || this.exitPending) {
+      // Killing a session that is already dying discards the undelivered tail
+      // deliberately — the operator asked for the end, not for the bytes.
+      if (message.type === 'KILL') return this.completeExit(true)
+      return this.events.send({ type: 'ERROR', message: 'session already exited' })
+    }
+    // KILL answers to the operator, not to the viewer lifecycle: a command
+    // launched before anyone attached must still be stoppable.
+    if (message.type === 'KILL') return this.kill()
+    if (!this.streaming) return this.events.send({ type: 'ERROR', message: 'session not initialized' })
+    if (message.type === 'INPUT') return this.ptyCall(proc => proc.write(message.data))
+    if (message.type === 'RESIZE') return this.resize(message.cols, message.rows)
+    this.resetScroll()
+  }
+
+  // One kill at a time: a burst of KILL frames must cost one tmux call, not one
+  // per frame.
+  kill() {
+    if (!this.live || this.killPending) return
+    const resume = this.phase
+    this.phase = 'killing'
+    void killTmuxSession(this.ref).then(killed => {
+      if (this.disposed) return
+      this.killUnconfirmed = !killed
+      if (!killed) {
+        // The command is still running: hand the session back to the phase the
+        // kill interrupted rather than stranding it, and keep watching it.
+        if (this.phase === 'killing') this.phase = resume
+        return this.events.send({ type: 'ERROR', message: 'failed to kill session' })
+      }
+      // Confirmed dead: stay in 'killing' so no INIT or INPUT is accepted for a
+      // corpse — restoring 'streaming' here would send READY for a dead
+      // attachment. If nothing is attached, drive the exit now; otherwise the
+      // attach client's own exit (its session is gone) carries us there.
+      if (!this.attachPty) this.beginExit()
+    })
+  }
+
+  // Continuity loss was announced (a reset in either direction): un-acknowledged
+  // bytes may be gone along with the acknowledgments for them, so the window
+  // restarts at zero instead of leaking permanently shut.
+  recoverWindow() {
+    this.pendingBytes = 0
+    this.applyBackpressure()
+    this.drainRetained()
+    this.completeExit()
+  }
+
+  // A reset raised *by* a replay is the replay outrunning the channel's replay
+  // budget: replaying again would reset again, forever. The loss stays
+  // announced by the reset, and a viewer that wants the scrollback asks for it
+  // with a fresh INIT.
+  replayAfterReset() {
+    this.pendingBytes = 0
+    this.applyBackpressure()
+    // The barrier goes up before any drain or exit: recovered history must
+    // reach the viewer ahead of newer bytes, and an EXIT here would tear the
+    // pane down with the scrollback still uncaptured.
+    // Bounded per INIT epoch: a replay that keeps outrunning the replay budget
+    // provokes the very reset that would restart it, and the loop converges
+    // only if the runner stops answering.
+    const replayable = this.streaming && !this.replaying && !this.replayBarrier && this.takeReplayToken()
+    if (replayable) return this.replay()
+    this.drainRetained()
+    this.completeExit()
+  }
+
+  // Returns false when a requested kill could not be confirmed: the session
+  // then keeps its poller and attachment, because tearing them down would
+  // leave the command running with nothing watching it.
+  async dispose(killSession: boolean): Promise<boolean> {
+    // The phase advertises the in-flight kill for the whole await: without it,
+    // a channel closing mid-kill sees a session that needs no supervision and
+    // disposes the watcher off a command that may still be running.
+    const previous = this.phase
+    if (killSession) {
+      this.phase = 'killing'
+      if (!(await killTmuxSession(this.ref))) {
+        this.killUnconfirmed = true
+        if (this.phase === 'killing') this.phase = previous
+        return false
+      }
+    }
+    this.killUnconfirmed = false
+    this.phase = 'disposed'
+    if (this.flushTimer) clearTimeout(this.flushTimer)
+    this.flushTimer = undefined
+    this.stopPoll()
+    // The reference is dropped before the kill so a throwing attachment cannot
+    // strand cleanup behind it, or reject out of a shutdown that then never
+    // reopens the host.
+    const proc = this.attachPty
+    this.attachPty = undefined
+    try {
+      proc?.kill()
+    } catch {}
+    this.removeExitDir()
+    return true
+  }
+
+  private handleInit(message: { cols: number; rows: number; profile?: string }) {
+    if (message.profile !== undefined && message.profile !== this.profile) {
+      return this.events.send({ type: 'ERROR', message: 'profile does not match the bound session' })
+    }
+    if (this.finished || this.exitPending) return this.events.send({ type: 'ERROR', message: 'session already exited' })
+    if (!this.attachPty) {
+      try {
+        this.attach()
+      } catch {}
+    }
+    const attached = this.attachPty
+    if (!attached) return this.events.send({ type: 'ERROR', message: 'session is not attachable' })
+    this.resize(message.cols, message.rows)
+    this.phase = 'streaming'
+    this.viewerAttached = true
+    // The window survives re-INIT on purpose: acknowledgment debt belongs to
+    // the channel peer, which outlives viewer attach cycles, so a repeated INIT
+    // cannot bypass flow control — only announced continuity loss resets it.
+    this.events.send({ type: 'READY', sessionId: this.id, profile: this.profile, cwd: this.cwd, shell: this.command, pid: attached.pid })
+    this.requestReplay()
+  }
+
+  private attach() {
+    const proc = pty.spawn('tmux', tmuxAttachArgs(this.ref), {
+      name: 'xterm-256color',
+      cols: this.cols,
+      rows: this.rows,
+      cwd: this.cwd,
+      env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
+    })
+    this.attachPty = proc
+    // Callbacks answer only for the process that owns the attachment: a stale
+    // client losing a race must not feed or retire the live one.
+    proc.onData(data => {
+      if (this.attachPty === proc) this.queueOutput(data)
+    })
+    proc.onExit(() => {
+      if (this.attachPty === proc) this.handleAttachExit()
+    })
+    this.startPoll()
+  }
+
+  private handleAttachExit() {
+    this.attachPty = undefined
+    // Nothing is left to read from a gone attachment, so held-back output can
+    // no longer arrive: the window stops gating the exit.
+    this.flowPaused = false
+    if (this.disposed || this.finished) return
+    if (this.exitPending) return this.completeExit()
+    void tmuxSessionPresence(this.ref).then(presence => {
+      if (this.disposed || this.finished || this.exitPending) return
+      // An INIT may have re-attached while the question was in flight; a second
+      // client would duplicate every byte the first one delivers.
+      if (this.attachPty) return
+      if (presence === 'present') {
+        // The attach client died but the session lives: reattach immediately,
+        // so exit monitoring never lapses while nobody watches across the seam.
+        try {
+          this.attach()
+        } catch {
+          this.events.send({ type: 'ERROR', message: 'lost attachment to a live session' })
+        }
+        return
+      }
+      // Only a confirmed absence retires the session; an unanswered question
+      // leaves it to the pane watcher rather than fabricating an exit.
+      if (presence === 'absent') this.beginExit()
+    })
+  }
+
+  private beginExit() {
+    if (!this.live) return
+    this.phase = 'exiting'
+    this.deadPaneKillPending = true
+    this.stopPoll()
+    // A capture already in flight owns the ordering from here: its completion
+    // drains and completes the exit, so nothing may be emitted ahead of the
+    // snapshot it is about to deliver.
+    if (this.replaying || this.replayBarrier) return
+    // Recovery goes first: flushOutput ends by completing the exit, and a queue
+    // that drains there would finalize the session and abort the replay below,
+    // losing the scrollback a paused viewer never saw. Output a paused viewer
+    // missed lives solely in tmux history; a stream never paused already
+    // delivered everything, so it needs no replay.
+    if (this.streaming && this.missedWhilePaused && this.takeReplayToken()) return this.replay()
+    this.flushOutput()
+    this.completeExit()
+  }
+
+  // EXIT is the sequenced end-of-stream, so it may not overtake output the flow
+  // window is still holding — neither bytes queued here nor bytes still unread
+  // in a paused pty. It waits for both, driven by ACKs; a KILL forces it out
+  // and discards the undelivered tail deliberately.
+  private completeExit(force = false) {
+    if (this.phase !== 'exiting') return
+    if (!force && (this.outputQueue.length > 0 || this.flowPaused || this.replaying || this.replayBarrier)) return
+    if (force) {
+      // A forced exit abandons the undelivered tail deliberately — a KILL asked
+      // for the end, not the bytes — and clears it so no later ACK can drain
+      // OUTPUT out after the sequenced end-of-stream.
+      if (this.flushTimer) clearTimeout(this.flushTimer)
+      this.flushTimer = undefined
+      this.outputQueue = []
+      this.queuedBytes = 0
+      this.preInitBuffer = []
+      this.preInitBytes = 0
+      this.flowPaused = false
+    }
+    this.phase = 'finished'
+    this.stopPoll()
+    // The ring is emitted exactly once, here: every exit path passes through
+    // this point, and it clears itself once delivered.
+    this.emitPreInitTail()
+    this.events.send({ type: 'EXIT', ...this.readExit() })
+    // The end-of-stream is out and the scrollback has been replayed: the dead
+    // pane kept alive to carry it can go now.
+    if (this.deadPaneKillPending) {
+      this.deadPaneKillPending = false
+      void killTmuxSession(this.ref)
+    }
+    this.removeExitDir()
+    this.events.onExited()
+  }
+
+  // A foreground command killed by signal N reports `$? = 128 + N`, which is the
+  // only signal information a `$?`-based exit capture preserves: an explicit
+  // exit code above 128 is conventionally indistinguishable from a signal, the
+  // same ambiguity every shell carries. Exactly one field is populated.
+  private readExit(): { exitCode: number | null; signal: number | null } {
+    const raw = this.readRawExit()
+    if (raw === null) return { exitCode: null, signal: null }
+    if (raw > 128 && raw <= 128 + 64) return { exitCode: null, signal: raw - 128 }
+    return { exitCode: raw, signal: null }
+  }
+
+  private readRawExit(): number | null {
+    if (!this.exitDir) return null
+    try {
+      const raw = readFileSync(path.join(this.exitDir, 'exit-code'), 'utf8').trim()
+      const code = Number(raw)
+      return Number.isInteger(code) && code >= 0 ? code : null
+    } catch {
+      return null
+    }
+  }
+
+  private removeExitDir() {
+    if (!this.exitDir) return
+    try {
+      rmSync(this.exitDir, { recursive: true, force: true })
+    } catch {}
+  }
+
+  private queueOutput(data: string) {
+    if (this.finished) return
+    // Until a viewer attaches, tmux history holds the scrollback — but a ring
+    // survives the session too, because a command can die before any viewer
+    // attaches and take its history with it.
+    if (!this.streaming) return this.retainPreInit(data)
+    this.outputQueue.push(data)
+    this.queuedBytes += Buffer.byteLength(data)
+    // Queued bytes count against the same bound as unacknowledged ones: while a
+    // replay barrier or a closed window holds output back, the pty pauses
+    // instead of letting the queue grow without limit.
+    this.applyBackpressure()
+    if (!this.replayBarrier) this.flushTimer ??= setTimeout(() => this.flushOutput(), this.policy.flow.flushMs)
+  }
+
+  private applyBackpressure() {
+    const { highWaterBytes, lowWaterBytes } = this.policy.flow
+    if (this.pendingBytes >= highWaterBytes || this.queuedBytes >= highWaterBytes) {
+      if (this.flowPaused) return
+      this.flowPaused = true
+      this.missedWhilePaused = true
+      return this.ptyCall(proc => proc.pause())
+    }
+    if (this.pendingBytes < lowWaterBytes && this.queuedBytes < lowWaterBytes) this.resumeFlow()
+  }
+
+  private retainPreInit(data: string) {
+    this.preInitBuffer.push(data)
+    this.preInitBytes += Buffer.byteLength(data)
+    while (this.preInitBytes > PRE_INIT_BUFFER_BYTES && this.preInitBuffer.length > 1) {
+      this.preInitBytes -= Buffer.byteLength(this.preInitBuffer.shift() ?? '')
+    }
+  }
+
+  // Live output ships in the same bounded chunks as replay, and only while the
+  // window is open: the remainder stays queued, so one fast burst can neither
+  // assemble a frame past the wire cap nor blow past the watermark into the
+  // replay buffer.
+  private flushOutput() {
+    if (this.flushTimer) clearTimeout(this.flushTimer)
+    this.flushTimer = undefined
+    if (this.replayBarrier || !this.streaming || this.finished) return
+    const data = this.outputQueue.join('')
+    this.outputQueue = []
+    this.queuedBytes = 0
+    if (!data) return
+    let offset = 0
+    while (offset < data.length && this.pendingBytes < this.policy.flow.highWaterBytes) {
+      const chunk = data.slice(offset, offset + OUTPUT_CHUNK_CHARS)
+      this.events.send({ type: 'OUTPUT', data: chunk })
+      this.pendingBytes += Buffer.byteLength(chunk)
+      offset += chunk.length
+    }
+    if (offset < data.length) {
+      const tail = data.slice(offset)
+      this.outputQueue.unshift(tail)
+      this.queuedBytes += Buffer.byteLength(tail)
+    }
+    this.applyBackpressure()
+    this.noteOutputWhileHeld()
+    this.completeExit()
+  }
+
+  private handleAck(bytes: number) {
+    if (!this.streaming && !this.exitPending) return this.events.send({ type: 'ERROR', message: 'session not initialized' })
+    this.acknowledge(bytes)
+  }
+
+  private acknowledge(bytes: number) {
+    // Replayed bytes are not charged to the window, so acknowledging them —
+    // which the schema forbids — would credit debt the live stream never
+    // incurred. Clamping hides that; saying so does not.
+    if (bytes > this.pendingBytes) {
+      // Reported *and refused*: crediting it anyway would let a peer open the
+      // window at will by acknowledging output it never received.
+      this.events.send({ type: 'ERROR', message: 'acknowledgment exceeds outstanding live output' })
+      return
+    }
+    this.pendingBytes -= bytes
+    this.applyBackpressure()
+    this.drainRetained()
+    this.completeExit()
+  }
+
+  private drainRetained() {
+    if (this.finished) return
+    if (this.outputQueue.length && !this.flushTimer && !this.replayBarrier) this.flushOutput()
+  }
+
+  private resumeFlow() {
+    if (!this.flowPaused) return
+    this.flowPaused = false
+    this.ptyCall(proc => proc.resume())
+  }
+
+  private resize(cols: number, rows: number) {
+    this.cols = cols
+    this.rows = rows
+    this.ptyCall(proc => proc.resize(cols, rows))
+  }
+
+  // Replay ships in bounded chunks: a single frame holding a whole scrollback
+  // could exceed a small replay budget and be evicted before it ever flushed.
+  // Capture is asynchronous, so a slow tmux delays this replay and nothing else,
+  // and requests coalesce — one capture in flight, at most one queued — so a
+  // peer repeating INIT cannot multiply tmux processes.
+  // Live output waits behind a barrier while the capture runs, so a viewer
+  // always renders the snapshot first and the live stream after it.
+  // The INIT path: a viewer asking for scrollback gets it, or is told the
+  // request was rationed rather than silently receiving nothing.
+  private requestReplay() {
+    if (this.takeReplayToken()) return this.replay()
+    this.events.send({ type: 'ERROR', message: 'scrollback replay rate limited' })
+  }
+
+  private takeReplayToken() {
+    const now = Date.now()
+    const refill = Math.floor((now - this.replayRefilledAt) / REPLAY_REFILL_MS)
+    if (refill > 0) {
+      this.replayTokens = Math.min(REPLAY_BURST, this.replayTokens + refill)
+      this.replayRefilledAt = now
+    }
+    if (this.replayTokens < 1) return false
+    this.replayTokens -= 1
+    return true
+  }
+
+  private replay() {
+    this.replayBarrier = true
+    if (this.replaying) {
+      this.replayQueued = true
+      return
+    }
+    this.replaying = true
+    // Output already queued is, by construction, part of the snapshot the
+    // capture is about to take — the snapshot happens later — so it is set
+    // aside rather than re-sent after it. A capture that fails hands it back:
+    // duplication is cosmetic, loss is not.
+    const superseded = this.outputQueue
+    this.outputQueue = []
+    this.queuedBytes = 0
+    void captureTmuxScrollback(this.ref, this.policy.replayLines, () => !this.disposed && !this.finished)
+      .then(data => this.emitReplay(data, superseded))
+      .then(() => {
+        this.replaying = false
+        if (this.disposed || this.finished) return
+        if (this.replayQueued) {
+          this.replayQueued = false
+          this.replay()
+          return
+        }
+        this.replayBarrier = false
+        this.drainRetained()
+        this.completeExit()
+      })
+  }
+
+  // Chunks are paced across ticks: a large capture would otherwise record and
+  // send thousands of frames in one turn, evicting its own replay buffer and
+  // holding the loop that every other session's heartbeat shares.
+  private async emitReplay(data: string | null, superseded: string[]) {
+    if (this.disposed || this.finished || !this.streaming) return this.restoreSuperseded(superseded)
+    if (data === null) {
+      this.restoreSuperseded(superseded)
+      return this.events.send({ type: 'ERROR', message: 'scrollback capture failed' })
+    }
+    for (let offset = 0; offset < data.length; offset += OUTPUT_CHUNK_CHARS) {
+      if (this.disposed || this.finished || !this.streaming) return
+      this.events.send({ type: 'OUTPUT', data: data.slice(offset, offset + OUTPUT_CHUNK_CHARS), replay: true })
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    // Only a capture that actually reached the viewer supersedes the ring:
+    // a failed capture, or an exit that wins the race, still has it.
+    this.preInitBuffer = []
+    this.preInitBytes = 0
+    this.missedWhilePaused = false
+  }
+
+  private restoreSuperseded(superseded: string[]) {
+    if (superseded.length === 0) return
+    this.outputQueue.unshift(...superseded)
+    this.queuedBytes += superseded.reduce((total, chunk) => total + Buffer.byteLength(chunk), 0)
+  }
+
+  private emitPreInitTail() {
+    // The ring is the only witness to output whose tmux history died with the
+    // session — whether no viewer ever attached, or the capture that would
+    // have replaced it failed or lost the race with the exit.
+    if (this.preInitBuffer.length === 0) return
+    const data = this.preInitBuffer.join('')
+    this.preInitBuffer = []
+    this.preInitBytes = 0
+    for (let offset = 0; offset < data.length; offset += OUTPUT_CHUNK_CHARS) {
+      this.events.send({ type: 'OUTPUT', data: data.slice(offset, offset + OUTPUT_CHUNK_CHARS), replay: true })
+    }
+  }
+
+  // Async because it runs on the message path, and suppressed while in flight:
+  // repeated resets against a wedged tmux must cost one late answer, not a
+  // process per message.
+  private resetScroll() {
+    if (this.scrollResetting) return
+    this.scrollResetting = true
+    void exitTmuxCopyMode(this.ref).then(ok => {
+      this.scrollResetting = false
+      if (this.disposed) return
+      if (!ok) return this.events.send({ type: 'ERROR', message: 'scroll reset failed' })
+      this.scrollHeld = false
+      this.scrollNewOutput = false
+      this.events.send({ type: 'SCROLL_STATE', held: false, newOutput: false })
+    })
+  }
+
+  // The pane is watched from attach onward through the shared per-server
+  // watcher: it reports copy-mode transitions and output arriving while held,
+  // and it is how a dead pane — kept by remain-on-exit — turns into EXIT,
+  // however fast the command died.
+  private startPoll() {
+    this.unwatchPane ??= watchPane(this.ref, this.policy.pollMs, status => this.observePane(status))
+  }
+
+  private stopPoll() {
+    this.unwatchPane?.()
+    this.unwatchPane = undefined
+  }
+
+  private observePane(status: PaneStatus) {
+    if (this.disposed || this.finished) return
+    if (status.dead) return this.beginExit()
+    // A presence check that went unanswered leaves the session attached to
+    // nothing; the watcher is what notices the pane is in fact alive.
+    if (!this.attachPty && !this.exitPending) {
+      try {
+        this.attach()
+      } catch {
+        this.events.send({ type: 'ERROR', message: 'lost attachment to a live session' })
+        return
+      }
+    }
+    if (!this.streaming || status.held === this.scrollHeld) return
+    this.scrollHeld = status.held
+    if (!status.held) this.scrollNewOutput = false
+    this.events.send({ type: 'SCROLL_STATE', held: status.held, newOutput: this.scrollNewOutput })
+  }
+
+  private noteOutputWhileHeld() {
+    if (!this.scrollHeld || this.scrollNewOutput) return
+    this.scrollNewOutput = true
+    this.events.send({ type: 'SCROLL_STATE', held: true, newOutput: true })
+  }
+
+  // A failed write or resize means this attachment is gone: kill it and take
+  // the ordinary exit path, so presence is checked and a live session gets a
+  // fresh client instead of being left permanently detached.
+  private ptyCall(operation: (proc: pty.IPty) => void) {
+    const proc = this.attachPty
+    if (!proc) return
+    try {
+      operation(proc)
+    } catch {
+      try {
+        proc.kill()
+      } catch {}
+      if (this.attachPty === proc) this.handleAttachExit()
+    }
+  }
+}
