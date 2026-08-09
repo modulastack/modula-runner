@@ -6,16 +6,20 @@ commit, and so is this plan.
 
 ## Now
 
-- **Seam contract & transport** — `docs/runner-seam.md` defining what executes on your
-  machine vs. what stays hosted; a versioned protocol schema (control plane supports
-  N and N−1); the outbound-only WebSocket client with reconnect and session continuity.
-  *In progress.*
+- **Pty host + worktree provisioning** — the next slice: terminals spawn and stream
+  behind the wire contract, identically co-resident or split. *Not started.*
+
+Landed so far: the seam contract ([`docs/runner-seam.md`](docs/runner-seam.md), reconciled
+in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)), the versioned protocol
+schema ([`packages/protocol`](packages/protocol/SCHEMA.md)), and the outbound-only
+WebSocket client with reconnect continuity, tested against a stub control plane
+([`packages/runner`](packages/runner)).
 
 ## The split
 
 The path to a runner that executes real jobs against a hosted control plane:
 
-- [ ] **Seam contract, protocol schema, outbound WSS** — see *Now*
+- [x] **Seam contract, protocol schema, outbound WSS** — see *Now* for what landed
 - [ ] **Pty host + worktree provisioning** behind the wire contract — terminals spawn and
       stream identically whether co-resident or split
 - [ ] **Pairing, presence, preview adjacency** — device-code pairing with revocable

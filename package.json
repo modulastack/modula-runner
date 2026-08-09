@@ -1,0 +1,23 @@
+{
+  "name": "modula-runner-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "packages/runner"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w packages/protocol",
+    "typecheck": "npm run build && npm run typecheck -w packages/runner",
+    "test": "npm run build && vitest run",
+    "gate": "npm run typecheck && vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
