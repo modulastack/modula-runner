@@ -127,6 +127,26 @@ describe('misbehaving control plane', () => {
     })).toThrow(/200 characters/)
   })
 
+  it('rejects invalid numeric options at construction', () => {
+    const base = { url: 'wss://control.example.com', token: 't', runner: testRunnerInfo }
+    expect(() => new RunnerClient({ ...base, backoff: { baseMs: Number.NaN } })).toThrow(/positive integers/)
+    expect(() => new RunnerClient({ ...base, highWaterBytes: Number.POSITIVE_INFINITY })).toThrow(/highWaterBytes/)
+    expect(() => new RunnerClient({ ...base, handshakeTimeoutMs: 0 })).toThrow(/handshakeTimeoutMs/)
+    expect(() => new RunnerClient({ ...base, bufferBytes: Number.NaN })).toThrow(/positive integer/)
+  })
+
+  it('refuses channel operations once the client is terminal', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    runner.stop()
+    expect(() => runner.openChannel('terminal')).toThrow(/client is stopped/)
+    expect(() => channel.send(text('too late'))).toThrow(/client is stopped/)
+  })
+
   it('rejects header-unsafe tokens at construction', () => {
     expect(() => new RunnerClient({ url: 'wss://control.example.com', token: 'abc\n', runner: testRunnerInfo })).toThrow(/HTTP header/)
     expect(() => new RunnerClient({ url: 'wss://control.example.com', token: 'abc\rdef', runner: testRunnerInfo })).toThrow(/HTTP header/)

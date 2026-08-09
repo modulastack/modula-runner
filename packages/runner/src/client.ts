@@ -70,6 +70,10 @@ export class RunnerClient extends EventEmitter {
     assertImplementedRange(options.protocol)
     assertRunnerInfo(options.runner)
     assertHeaderSafeToken(options.token)
+    // Numeric options fail here, not at the moment a reconnect or flush needs them.
+    if (options.backoff) backoffDelay(0, options.backoff)
+    assertBoundedInt('highWaterBytes', options.highWaterBytes, 0)
+    assertBoundedInt('handshakeTimeoutMs', options.handshakeTimeoutMs, 1)
     // A private snapshot: later mutation of the caller's object must not smuggle a
     // different URL or protocol range past the checks that just ran.
     this.options = {
@@ -104,18 +108,26 @@ export class RunnerClient extends EventEmitter {
   }
 
   openChannel(kind: ChannelKind): ChannelHandle {
+    this.assertUsable()
     const state = this.store.open(kind)
     if (this.connected) this.sendRaw({ type: 'open', channel: state.id, kind, attachToken: state.attachToken })
     return {
       id: state.id,
       kind,
       send: payload => {
+        this.assertUsable()
         if (this.closing.has(state.id)) throw new Error(`channel closing: ${state.id}`)
         this.store.record(state.id, payload)
         this.pump(state.id)
       },
       close: reason => this.closeChannel(state.id, reason),
     }
+  }
+
+  // A terminal client has no reconnect path: accepting a payload it can never
+  // deliver would report success for data that stays buffered forever.
+  private assertUsable() {
+    if (this.phase === 'stopped' || this.phase === 'failed') throw new Error(`client is ${this.phase}`)
   }
 
   // Close is drain-then-close: the channel stays in the store (and in resume
@@ -443,6 +455,11 @@ export class RunnerClient extends EventEmitter {
     this.flushTimer = undefined
     this.clearHandshakeTimer()
   }
+}
+
+function assertBoundedInt(name: string, value: number | undefined, min: number) {
+  if (value === undefined) return
+  if (!Number.isSafeInteger(value) || value < min) throw new Error(`${name} must be an integer >= ${min}`)
 }
 
 // A token with header-unsafe characters (a pasted trailing newline is the classic)
