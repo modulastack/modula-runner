@@ -55,6 +55,7 @@ export class RunnerClient extends EventEmitter {
   private phase: Phase = 'idle'
   private connected = false
   private attempt = 0
+  private pendingBackoffReset = false
   private lastSeen = 0
   private heartbeatTimer: NodeJS.Timeout | undefined
   private reconnectTimer: NodeJS.Timeout | undefined
@@ -65,7 +66,15 @@ export class RunnerClient extends EventEmitter {
     super()
     assertSecureUrl(options.url)
     assertImplementedRange(options.protocol)
-    this.options = options
+    assertRunnerInfo(options.runner)
+    // A private snapshot: later mutation of the caller's object must not smuggle a
+    // different URL or protocol range past the checks that just ran.
+    this.options = {
+      ...options,
+      runner: { ...options.runner },
+      ...(options.protocol ? { protocol: { ...options.protocol } } : {}),
+      ...(options.backoff ? { backoff: { ...options.backoff } } : {}),
+    }
     this.store = new ChannelStore(options.bufferBytes)
   }
 
@@ -187,7 +196,11 @@ export class RunnerClient extends EventEmitter {
   private scheduleReconnect() {
     const delayMs = backoffDelay(this.attempt++, this.options.backoff)
     this.emit('reconnecting', { attempt: this.attempt, delayMs })
-    this.reconnectTimer = setTimeout(() => this.dial(), delayMs)
+    // A reconnecting listener may have stopped the client during the emit.
+    if (this.phase !== 'running') return
+    this.reconnectTimer = setTimeout(() => {
+      if (this.phase === 'running') this.dial()
+    }, delayMs)
   }
 
   private handleRaw(raw: string) {
@@ -230,7 +243,9 @@ export class RunnerClient extends EventEmitter {
       this.fail('protocol-error', { message: 'welcome selected an unsupported protocol version', protocol: frame.protocol })
       return
     }
-    this.attempt = 0
+    // Backoff resets only after the connection survives a heartbeat interval: a
+    // welcome-then-drop control plane must not keep a fleet churning at base delay.
+    this.pendingBackoffReset = true
     this.connected = true
     this.startHeartbeat(frame.heartbeat)
     this.reconcileChannels(frame.channels)
@@ -242,6 +257,10 @@ export class RunnerClient extends EventEmitter {
   // are re-announced from sequence zero (never trusted to a stale flush position),
   // and channels created mid-handshake are announced now.
   private reconcileChannels(results: ChannelResumeResult[]) {
+    // The mid-handshake announce set is snapshotted before any listener can run: a
+    // channel opened from a synchronous event handler below announces itself once,
+    // and must not be announced a second time by this loop.
+    const announceIds = this.store.ids().filter(id => !this.presented.has(id))
     const unanswered = new Set(this.presented)
     for (const result of results) {
       if (!this.presented.has(result.id)) {
@@ -252,7 +271,7 @@ export class RunnerClient extends EventEmitter {
       this.resumeChannel(result)
     }
     for (const id of unanswered) this.reannounce(id)
-    for (const id of this.store.ids()) if (!this.presented.has(id)) this.announceChannel(id)
+    for (const id of announceIds) this.announceChannel(id)
     for (const id of [...this.closing.keys()]) this.finishClose(id)
   }
 
@@ -264,13 +283,16 @@ export class RunnerClient extends EventEmitter {
       if (!this.closing.delete(result.id)) this.emit('channel-expired', { channel: result.id })
       return
     }
-    // A peer cannot have received more than was sent; clamping such a claim would
-    // silently skip replaying frames it never saw. Reject it and keep prior state.
+    // A peer cannot have received more than was sent. Its claim is discarded — and
+    // so is the stale local watermark: replaying the whole retained buffer is the
+    // only position that cannot silently lose the frames a dying socket never
+    // delivered, and the receiver's contiguity rule discards the duplicates.
     if (result.receivedSeq > state.sentSeq) {
       this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
-      return
+      state.flushedSeq = 0
+    } else {
+      state.flushedSeq = result.receivedSeq
     }
-    state.flushedSeq = result.receivedSeq
     const outcome = this.pump(result.id)
     if (!this.closing.has(result.id)) this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
   }
@@ -358,6 +380,10 @@ export class RunnerClient extends EventEmitter {
       this.ws?.terminate()
       return
     }
+    if (this.pendingBackoffReset) {
+      this.attempt = 0
+      this.pendingBackoffReset = false
+    }
     this.sendRaw({ type: 'ping', id: randomUUID() })
   }
 
@@ -394,6 +420,15 @@ export class RunnerClient extends EventEmitter {
     this.reconnectTimer = undefined
     this.flushTimer = undefined
     this.clearHandshakeTimer()
+  }
+}
+
+// Mirrors the codec's bound so a misconfigured runner fails at construction instead
+// of emitting hellos every compliant decoder drops.
+function assertRunnerInfo(runner: RunnerInfo) {
+  const fields = [runner.name, runner.version, runner.os, runner.arch]
+  if (!fields.every(field => typeof field === 'string' && field.length <= 200)) {
+    throw new Error('runner metadata fields must be strings of at most 200 characters')
   }
 }
 

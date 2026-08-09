@@ -25,6 +25,7 @@ export type StubOptions = {
   delayWelcomeMs?: number
   omitResume?: boolean
   resumeSeqOverride?: number
+  dropAfterWelcomeMs?: number
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -35,6 +36,7 @@ export class StubControlPlane {
   readonly received: ReceivedData[] = []
   readonly resets: { channel: string; seq: number }[] = []
   readonly closes: { channel: string; reason?: string }[] = []
+  readonly opens: string[] = []
   readonly hellos: HelloFrame[] = []
   readonly runnerPings: string[] = []
   readonly runnerPongs: string[] = []
@@ -112,7 +114,10 @@ export class StubControlPlane {
     const frame = decodeFrame(raw)
     if (!frame) return
     if (frame.type === 'hello') return this.handleHello(ws, frame)
-    if (frame.type === 'open') return void this.channels.set(frame.channel, { kind: frame.kind, attachToken: frame.attachToken, receivedSeq: 0, sentSeq: 0 })
+    if (frame.type === 'open') {
+      this.opens.push(frame.channel)
+      return void this.channels.set(frame.channel, { kind: frame.kind, attachToken: frame.attachToken, receivedSeq: 0, sentSeq: 0 })
+    }
     if (frame.type === 'data') return this.handleData(ws, frame.channel, frame.seq, frame.payload)
     if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
     if (frame.type === 'ping') return this.handlePing(ws, frame.id)
@@ -149,6 +154,8 @@ export class StubControlPlane {
     const delay = this.options.delayWelcomeMs ?? 0
     if (delay > 0) setTimeout(() => { if (ws.readyState === ws.OPEN) ws.send(welcome) }, delay)
     else ws.send(welcome)
+    const dropAfter = this.options.dropAfterWelcomeMs
+    if (dropAfter !== undefined) setTimeout(() => ws.terminate(), delay + dropAfter)
   }
 
   // Unknown channels are adopted: a channel opened while the control plane was away

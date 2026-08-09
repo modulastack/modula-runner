@@ -80,7 +80,7 @@ describe('misbehaving control plane', () => {
     expect(runner.isConnected()).toBe(true)
   })
 
-  it('rejects a resume acknowledgment beyond what was sent', async () => {
+  it('recovers from an impossible resume acknowledgment by replaying the buffer', async () => {
     stub = await new StubControlPlane().start()
     const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
     const errors: { message: string }[] = []
@@ -90,23 +90,26 @@ describe('misbehaving control plane', () => {
     await connected
     const channel = runner.openChannel('terminal')
     channel.send(text('one'))
-    channel.send(text('two'))
-    await until(() => stub!.received.length === 2)
+    await until(() => stub!.received.length === 1)
 
+    const offline = once(runner, 'offline')
+    stub.dropConnections()
+    await offline
+    channel.send(text('two'))
     stub.options.resumeSeqOverride = 100
     const reconnected = once(runner, 'connected')
-    stub.dropConnections()
     await reconnected
+    await until(() => stub!.received.length === 2)
 
-    await until(() => errors.some(entry => entry.message === 'resume beyond sent sequence'))
+    expect(errors.map(entry => entry.message)).toContain('resume beyond sent sequence')
+    expect(stub.received.map(entry => entry.seq)).toEqual([1, 2])
     expect(runner.channelIds()).toContain(channel.id)
   })
 
   it('fails terminally on a hello that cannot fit the wire', async () => {
     stub = await new StubControlPlane().start()
-    const runner = makeClient(stub.url, {
-      runner: { name: 'x'.repeat(MAX_FRAME_BYTES), version: '0.0.0', os: 'linux', arch: 'x64' },
-    })
+    const runner = makeClient(stub.url)
+    for (let i = 0; i < 8_000; i++) runner.openChannel('terminal')
     const failed = once(runner, 'protocol-error')
     runner.connect()
     const [detail] = await failed
@@ -114,6 +117,73 @@ describe('misbehaving control plane', () => {
     await sleep(200)
     expect(stub.hellos).toHaveLength(0)
     expect(runner.isConnected()).toBe(false)
+  })
+
+  it('rejects oversized runner metadata at construction', () => {
+    expect(() => new RunnerClient({
+      url: 'wss://control.example.com',
+      token: 't',
+      runner: { name: 'x'.repeat(201), version: '0.0.0', os: 'linux', arch: 'x64' },
+    })).toThrow(/200 characters/)
+  })
+
+  it('uses a snapshot of its options, immune to later caller mutation', async () => {
+    stub = await new StubControlPlane().start()
+    const options = { url: stub.url, token: 'stub-token', runner: { ...testRunnerInfo }, backoff: { baseMs: 20, capMs: 40 } }
+    client = new RunnerClient(options)
+    options.url = 'ws://control.example.com'
+    options.token = 'tampered'
+    const connected = once(client, 'connected')
+    client.connect()
+    await connected
+    expect(client.isConnected()).toBe(true)
+  })
+
+  it('does not reconnect when stop() is called from the reconnecting handler', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 20, capMs: 40 } })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    runner.on('reconnecting', () => runner.stop())
+    stub.dropConnections()
+    await sleep(300)
+    expect(stub.connectionCount).toBe(1)
+  })
+
+  it('keeps growing backoff against a welcome-then-drop control plane', async () => {
+    stub = await new StubControlPlane({ dropAfterWelcomeMs: 10 }).start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 20, capMs: 5_000 } })
+    const attempts: number[] = []
+    runner.on('reconnecting', detail => attempts.push((detail as { attempt: number }).attempt))
+    runner.connect()
+    await until(() => attempts.length >= 3, 10_000)
+    runner.stop()
+    expect(attempts[0]).toBe(1)
+    expect(attempts[2]).toBe(3)
+  })
+
+  it('announces a channel opened from a reconciliation listener exactly once', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const first = runner.openChannel('terminal')
+    first.send(text('one'))
+    await until(() => stub!.received.length === 1)
+
+    let sideChannel: { id: string } | undefined
+    runner.once('channel-resumed', () => {
+      sideChannel = runner.openChannel('terminal')
+    })
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await reconnected
+    await until(() => sideChannel !== undefined && stub!.opens.filter(id => id === sideChannel!.id).length >= 1)
+    await sleep(150)
+
+    expect(stub.opens.filter(id => id === sideChannel!.id)).toHaveLength(1)
   })
 
   it('gives up on a handshake the control plane never answers', async () => {
