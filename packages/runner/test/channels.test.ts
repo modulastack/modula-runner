@@ -66,6 +66,14 @@ describe('channel store', () => {
     expect((next.frame?.payload as { body: { value: number } }).body.value).toBe(1)
   })
 
+  it('rejects buffer limits that would disable eviction', () => {
+    expect(() => new ChannelStore(Number.NaN)).toThrow(/positive integer/)
+    expect(() => new ChannelStore(Number.POSITIVE_INFINITY)).toThrow(/positive integer/)
+    expect(() => new ChannelStore(0)).toThrow(/positive integer/)
+    expect(() => new ChannelStore(-5)).toThrow(/positive integer/)
+    expect(() => new ChannelStore(1)).not.toThrow()
+  })
+
   it('offers a reset when eviction has outrun the flush position', () => {
     const store = new ChannelStore(1)
     const { id } = store.open('terminal')

@@ -26,6 +26,11 @@ export class ChannelStore {
   private readonly bufferLimit: number
 
   constructor(bufferBytes = DEFAULT_BUFFER_BYTES) {
+    // NaN or Infinity would make the eviction comparison permanently false and
+    // retain every frame ever recorded.
+    if (!Number.isSafeInteger(bufferBytes) || bufferBytes < 1) {
+      throw new Error('bufferBytes must be a positive integer')
+    }
     this.bufferLimit = bufferBytes
   }
 

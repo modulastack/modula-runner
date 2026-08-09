@@ -301,25 +301,25 @@ export class RunnerClient extends EventEmitter {
     // covering them is a lie. Such a claim is discarded along with the stale local
     // watermark: replaying the whole retained buffer is the only position that
     // cannot silently lose frames, and the contiguity rule discards the duplicates.
-    if (result.receivedSeq > (this.presented.get(result.id) ?? 0)) {
-      this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
-      state.flushedSeq = 0
-    } else {
-      state.flushedSeq = result.receivedSeq
-    }
+    // Recovery completes before the error is surfaced, so a listener reacting to
+    // it acts on a fully replayed channel, not a half-recovered one.
+    const impossibleAck = result.receivedSeq > (this.presented.get(result.id) ?? 0)
+    state.flushedSeq = impossibleAck ? 0 : result.receivedSeq
     const outcome = this.pump(result.id)
+    if (impossibleAck) this.emit('protocol-error', { message: 'resume beyond sent sequence', channel: result.id })
     if (!this.closing.has(result.id)) this.emit('channel-resumed', { channel: result.id, replayed: outcome.sent, reset: outcome.reset })
   }
 
   private reannounce(id: string) {
     const state = this.store.get(id)
     if (!state) return
-    this.emit('protocol-error', { message: 'welcome omitted a presented channel', channel: id })
     // The replacement open starts both directions over: the control plane's fresh
     // stream begins at sequence one, which a stale inbound watermark would swallow.
+    // Announce and replay first — the error listener must see a recovered channel.
     state.flushedSeq = 0
     state.receivedSeq = 0
     this.announceChannel(id)
+    this.emit('protocol-error', { message: 'welcome omitted a presented channel', channel: id })
   }
 
   private announceChannel(id: string) {

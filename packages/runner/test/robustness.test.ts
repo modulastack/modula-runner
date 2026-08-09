@@ -216,6 +216,31 @@ describe('misbehaving control plane', () => {
     expect(stub.received.map(entry => entry.seq)).toEqual([1, 2])
   })
 
+  it('completes recovery before surfacing a resume error to listeners', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    channel.send(text('two'))
+    await until(() => stub!.received.length === 2)
+
+    runner.on('protocol-error', detail => {
+      if ((detail as { message: string }).message === 'resume beyond sent sequence') channel.close('bail')
+    })
+    stub.options.resumeSeqOverride = 100
+    const reconnected = once(runner, 'connected')
+    stub.dropConnections()
+    await reconnected
+    await until(() => stub!.closes.length === 1)
+
+    expect(stub.closes).toEqual([{ channel: channel.id, reason: 'bail' }])
+    expect(stub.channels.has(channel.id)).toBe(false)
+    await until(() => runner.channelIds().length === 0)
+  })
+
   it('clamps close reasons to the schema bound', async () => {
     stub = await new StubControlPlane().start()
     const runner = makeClient(stub.url)
