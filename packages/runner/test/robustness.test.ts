@@ -191,6 +191,41 @@ describe('misbehaving control plane', () => {
     expect(stub.opens.filter(id => id === sideChannel!.id)).toHaveLength(1)
   })
 
+  it('does not count malformed spam as liveness', async () => {
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const spam = setInterval(() => stub?.sendTextToAll('this is not a frame'), 100)
+    try {
+      await until(() => stub!.connectionCount >= 2, 5_000)
+    } finally {
+      clearInterval(spam)
+    }
+  })
+
+  it('suppresses the connected event when a reconciliation listener stops the client', async () => {
+    stub = await new StubControlPlane().start()
+    const runner = makeClient(stub.url, { backoff: { baseMs: 100, capMs: 200 } })
+    let connectedEvents = 0
+    runner.on('connected', () => { connectedEvents += 1 })
+    const firstConnect = once(runner, 'connected')
+    runner.connect()
+    await firstConnect
+    const channel = runner.openChannel('terminal')
+    channel.send(text('one'))
+    await until(() => stub!.received.length === 1)
+
+    runner.once('channel-resumed', () => runner.stop())
+    stub.dropConnections()
+    await once(runner, 'stopped')
+    await sleep(300)
+
+    expect(connectedEvents).toBe(1)
+    expect(runner.isConnected()).toBe(false)
+  })
+
   it('gives up on a handshake the control plane never answers', async () => {
     stub = await new StubControlPlane({ muteWelcome: true }).start()
     const runner = makeClient(stub.url, { handshakeTimeoutMs: 150 })

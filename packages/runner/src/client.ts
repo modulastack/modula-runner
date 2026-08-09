@@ -207,11 +207,13 @@ export class RunnerClient extends EventEmitter {
 
   private handleRaw(raw: string) {
     const frame = decodeFrame(raw)
-    this.lastSeen = Date.now()
     if (!frame) {
+      // Garbage is not liveness: only valid protocol traffic refreshes the deadline,
+      // or malformed spam could keep a dead session looking healthy forever.
       this.emit('protocol-error', { message: 'undecodable frame' })
       return
     }
+    this.lastSeen = Date.now()
     this.handleFrame(frame)
   }
 
@@ -251,6 +253,8 @@ export class RunnerClient extends EventEmitter {
     this.connected = true
     this.startHeartbeat(frame.heartbeat)
     this.reconcileChannels(frame.channels)
+    // Reconciliation runs user listeners synchronously; one may have stopped the client.
+    if (this.phase !== 'running' || !this.connected) return
     this.emit('connected', { protocol: frame.protocol })
   }
 
