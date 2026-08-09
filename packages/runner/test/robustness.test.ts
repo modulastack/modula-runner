@@ -127,6 +127,11 @@ describe('misbehaving control plane', () => {
     })).toThrow(/200 characters/)
   })
 
+  it('rejects header-unsafe tokens at construction', () => {
+    expect(() => new RunnerClient({ url: 'wss://control.example.com', token: 'abc\n', runner: testRunnerInfo })).toThrow(/HTTP header/)
+    expect(() => new RunnerClient({ url: 'wss://control.example.com', token: 'abc\rdef', runner: testRunnerInfo })).toThrow(/HTTP header/)
+  })
+
   it('uses a snapshot of its options, immune to later caller mutation', async () => {
     stub = await new StubControlPlane().start()
     const options = { url: stub.url, token: 'stub-token', runner: { ...testRunnerInfo }, backoff: { baseMs: 20, capMs: 40 } }
@@ -242,7 +247,9 @@ describe('channel lifecycle under pressure', () => {
     stub = await new StubControlPlane({ omitResume: true }).start()
     const runner = makeClient(stub.url, { backoff: { baseMs: 150, capMs: 300 } })
     const errors: { message: string }[] = []
+    const inbound: unknown[] = []
     runner.on('protocol-error', detail => errors.push(detail as { message: string }))
+    runner.on('data', detail => inbound.push(detail))
     const connected = once(runner, 'connected')
     runner.connect()
     await connected
@@ -250,6 +257,8 @@ describe('channel lifecycle under pressure', () => {
     channel.send(text('one'))
     channel.send(text('two'))
     await until(() => stub!.received.length === 2)
+    stub.sendToRunner(channel.id, text('downstream-before'))
+    await until(() => inbound.length === 1)
 
     const reconnected = once(runner, 'connected')
     stub.dropConnections()
@@ -258,6 +267,12 @@ describe('channel lifecycle under pressure', () => {
 
     expect(errors.map(entry => entry.message)).toContain('welcome omitted a presented channel')
     expect(stub.received.slice(-2).map(entry => entry.seq)).toEqual([1, 2])
+
+    // The replacement open restarted both directions: the control plane's fresh
+    // stream begins at sequence one and must not be swallowed as a duplicate.
+    stub.sendToRunner(channel.id, text('downstream-after'))
+    await until(() => inbound.length === 2)
+    expect((inbound[1] as { seq: number }).seq).toBe(1)
   })
 
   it('reports disconnected immediately after stop', async () => {

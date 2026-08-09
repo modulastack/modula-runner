@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
+import { validateHeaderValue } from 'node:http'
 import WebSocket from 'ws'
 import {
   MAX_FRAME_BYTES,
@@ -67,6 +68,7 @@ export class RunnerClient extends EventEmitter {
     assertSecureUrl(options.url)
     assertImplementedRange(options.protocol)
     assertRunnerInfo(options.runner)
+    assertHeaderSafeToken(options.token)
     // A private snapshot: later mutation of the caller's object must not smuggle a
     // different URL or protocol range past the checks that just ran.
     this.options = {
@@ -301,7 +303,10 @@ export class RunnerClient extends EventEmitter {
     const state = this.store.get(id)
     if (!state) return
     this.emit('protocol-error', { message: 'welcome omitted a presented channel', channel: id })
+    // The replacement open starts both directions over: the control plane's fresh
+    // stream begins at sequence one, which a stale inbound watermark would swallow.
     state.flushedSeq = 0
+    state.receivedSeq = 0
     this.announceChannel(id)
   }
 
@@ -420,6 +425,16 @@ export class RunnerClient extends EventEmitter {
     this.reconnectTimer = undefined
     this.flushTimer = undefined
     this.clearHandshakeTimer()
+  }
+}
+
+// A token with header-unsafe characters (a pasted trailing newline is the classic)
+// would otherwise throw synchronously mid-dial, after the phase already advanced.
+function assertHeaderSafeToken(token: string) {
+  try {
+    validateHeaderValue('authorization', `Bearer ${token}`)
+  } catch {
+    throw new Error('token contains characters that are not valid in an HTTP header')
   }
 }
 
