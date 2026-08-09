@@ -6,6 +6,9 @@ const DEFAULT_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024
 // Bounds total replay memory and keeps the resume hello far under the frame cap
 // (a full roster serializes to roughly 150 KiB).
 const MAX_CHANNELS = 1024
+const COMPACT_THRESHOLD = 256
+
+type BufferedFrame = { frame: DataFrame; bytes: number }
 
 export type ChannelState = {
   id: string
@@ -14,7 +17,8 @@ export type ChannelState = {
   sentSeq: number
   receivedSeq: number
   flushedSeq: number
-  buffer: DataFrame[]
+  buffer: BufferedFrame[]
+  head: number
   bufferBytes: number
 }
 
@@ -54,6 +58,7 @@ export class ChannelStore {
       receivedSeq: 0,
       flushedSeq: 0,
       buffer: [],
+      head: 0,
       bufferBytes: 0,
     }
     this.channels.set(state.id, state)
@@ -78,6 +83,7 @@ export class ChannelStore {
   // before any state mutates: an unencodable or oversized body must fail the caller
   // without leaving a hole, and a caller mutating its payload afterwards must not be
   // able to change what a replay retransmits under the same sequence number.
+  // Byte sizes are computed once at record time; eviction never re-serializes.
   record(id: string, payload: Payload): DataFrame {
     const state = this.require(id)
     const candidate: DataFrame = { type: 'data', channel: id, seq: state.sentSeq + 1, payload }
@@ -86,26 +92,18 @@ export class ChannelStore {
     if (bytes > MAX_FRAME_BYTES) throw new RangeError('frame exceeds MAX_FRAME_BYTES')
     const frame = JSON.parse(serialized) as DataFrame
     state.sentSeq = frame.seq
-    state.buffer.push(frame)
+    state.buffer.push({ frame, bytes })
     state.bufferBytes += bytes
     this.totalBytes += bytes
-    while (state.bufferBytes > this.bufferLimit && state.buffer.length > 1) this.evictOldest(state)
+    while (state.bufferBytes > this.bufferLimit && this.retained(state) > 1) this.evictOldest(state)
     // The aggregate budget may empty other channels entirely; an emptied channel's
     // next flush announces a full reset rather than stalling (see nextOutbound).
     while (this.totalBytes > this.totalLimit) {
       const fullest = [...this.channels.values()].reduce((a, b) => (b.bufferBytes > a.bufferBytes ? b : a))
-      if (fullest.buffer.length === 0) break
+      if (this.retained(fullest) === 0) break
       this.evictOldest(fullest)
     }
     return frame
-  }
-
-  private evictOldest(state: ChannelState) {
-    const evicted = state.buffer.shift()
-    if (!evicted) return
-    const bytes = Buffer.byteLength(JSON.stringify(evicted), 'utf8')
-    state.bufferBytes -= bytes
-    this.totalBytes -= bytes
   }
 
   // Only the next contiguous sequence advances the high-water mark: anything at or
@@ -144,13 +142,31 @@ export class ChannelStore {
   nextOutbound(id: string, flushedSeq: number): NextOutbound {
     const state = this.require(id)
     if (flushedSeq >= state.sentSeq) return {}
-    const oldest = state.buffer[0]
+    const oldest = state.buffer[state.head]?.frame
     // A buffer emptied by the aggregate budget resets past everything recorded:
     // the stream restarts after sentSeq instead of stalling on unreachable frames.
     if (!oldest) return { reset: { type: 'reset', channel: id, seq: state.sentSeq + 1 } }
     if (oldest.seq > flushedSeq + 1) return { reset: { type: 'reset', channel: id, seq: oldest.seq } }
-    const frame = state.buffer[flushedSeq + 1 - oldest.seq]
-    return frame ? { frame } : {}
+    const entry = state.buffer[state.head + flushedSeq + 1 - oldest.seq]
+    return entry ? { frame: entry.frame } : {}
+  }
+
+  private retained(state: ChannelState) {
+    return state.buffer.length - state.head
+  }
+
+  // Head-index eviction keeps the hot path O(1): no shifting, no re-serialization.
+  // The array compacts once the dead prefix dominates.
+  private evictOldest(state: ChannelState) {
+    const entry = state.buffer[state.head]
+    if (!entry) return
+    state.head++
+    state.bufferBytes -= entry.bytes
+    this.totalBytes -= entry.bytes
+    if (state.head >= COMPACT_THRESHOLD && state.head * 2 >= state.buffer.length) {
+      state.buffer.splice(0, state.head)
+      state.head = 0
+    }
   }
 
   private require(id: string): ChannelState {

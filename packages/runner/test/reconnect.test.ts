@@ -114,10 +114,14 @@ describe('reconnect continuity', () => {
     stub = await new StubControlPlane().start()
     const port = stub.port
     const runner = await connectedClient(stub.url, { backoff: { baseMs: 50, capMs: 100 } })
+    const inbound: { seq: number }[] = []
+    runner.on('data', detail => inbound.push(detail as { seq: number }))
     const channel = runner.openChannel('terminal')
     channel.send(text('one'))
     channel.send(text('two'))
     await until(() => stub!.received.length === 2)
+    stub.sendToRunner(channel.id, text('down-before'))
+    await until(() => inbound.length === 1)
 
     const reconnected = once(runner, 'connected')
     await stub.stop()
@@ -127,5 +131,11 @@ describe('reconnect continuity', () => {
 
     expect(stub.received.map(entry => entry.seq)).toEqual([1, 2])
     expect(stub.received.map(entry => (entry.payload as { body: string }).body)).toEqual(['one', 'two'])
+
+    // Adoption seeded the fresh control plane's downstream stream after the
+    // sequence the runner already consumed; the next frame must not be swallowed.
+    stub.sendToRunner(channel.id, text('down-after'))
+    await until(() => inbound.length === 2)
+    expect(inbound.map(entry => entry.seq)).toEqual([1, 2])
   })
 })

@@ -125,6 +125,9 @@ later revisions (see the seam reconciliation note for why they exist now).
 - `status: 'expired'` in the resume result (attach-token mismatch or a channel the
   control plane refuses to adopt) ends the channel; reopening is an application-level
   decision.
+- A control plane adopting a channel presented at reconnect seeds its own downstream
+  sequence at the presented `receivedSeq`, so its next frame extends the runner's
+  inbound stream contiguously instead of reusing already-consumed numbers.
 - Resets only move forward: a `reset` whose `seq` does not exceed the receiver's
   high-water mark is rejected, because rewinding would make already-consumed frames
   deliverable again.

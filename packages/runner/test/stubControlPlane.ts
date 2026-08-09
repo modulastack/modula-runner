@@ -153,7 +153,7 @@ export class StubControlPlane {
       return
     }
     const heartbeat = this.options.heartbeat ?? { intervalMs: 200, timeoutMs: 1_000 }
-    const channels = this.options.omitResume ? [] : hello.channels.map(state => this.resume(state.id, state.kind, state.attachToken))
+    const channels = this.options.omitResume ? [] : hello.channels.map(state => this.resume(state.id, state.kind, state.attachToken, state.receivedSeq))
     for (const ghost of this.options.extraResumeIds ?? []) channels.push({ id: ghost, status: 'resumed', receivedSeq: 0 })
     const welcome = encodeFrame({ type: 'welcome', protocol: this.options.welcomeVersionOverride ?? version, heartbeat, channels })
     const delay = this.options.delayWelcomeMs ?? 0
@@ -164,11 +164,13 @@ export class StubControlPlane {
   }
 
   // Unknown channels are adopted: a channel opened while the control plane was away
-  // heals through resume, exactly like one it has seen before.
-  private resume(id: string, kind: string, attachToken: string): ChannelResumeResult {
+  // heals through resume, exactly like one it has seen before. Adoption seeds the
+  // downstream sequence at the presented receivedSeq so the next frame extends the
+  // runner's inbound stream contiguously instead of reusing consumed numbers.
+  private resume(id: string, kind: string, attachToken: string, presentedReceivedSeq: number): ChannelResumeResult {
     const known = this.channels.get(id)
     if (!known) {
-      this.channels.set(id, { kind, attachToken, receivedSeq: 0, sentSeq: 0 })
+      this.channels.set(id, { kind, attachToken, receivedSeq: 0, sentSeq: presentedReceivedSeq })
       return { id, status: 'resumed', receivedSeq: 0 }
     }
     if (known.attachToken !== attachToken) return { id, status: 'expired' }

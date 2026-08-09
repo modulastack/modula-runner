@@ -62,7 +62,8 @@ export class RunnerClient extends EventEmitter {
   private attempt = 0
   private pendingBackoffReset = false
   private lastSeen = 0
-  private readonly outstandingPings: string[] = []
+  private pingOrder: string[] = []
+  private readonly pingSet = new Set<string>()
   private maxOutstandingPings = 16
   private heartbeatTimer: NodeJS.Timeout | undefined
   private reconnectTimer: NodeJS.Timeout | undefined
@@ -274,9 +275,7 @@ export class RunnerClient extends EventEmitter {
     else if (frame.type === 'pong') {
       // Only a pong answering one of this connection's own pings proves liveness;
       // fabricated or stale pongs must not hold a dead session open.
-      const index = this.outstandingPings.indexOf(frame.id)
-      if (index < 0) return false
-      this.outstandingPings.splice(index, 1)
+      if (!this.pingSet.delete(frame.id)) return false
     }
     else if (frame.type === 'data') return this.handleData(frame.channel, frame.seq, frame.payload)
     else if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
@@ -436,10 +435,13 @@ export class RunnerClient extends EventEmitter {
 
   private startHeartbeat(policy: HeartbeatPolicy) {
     this.lastSeen = Date.now()
-    this.outstandingPings.length = 0
+    this.pingOrder = []
+    this.pingSet.clear()
     // Every ping that could still be legitimately answered inside the timeout
-    // window stays outstanding; a shorter memory would reject honest late pongs.
-    this.maxOutstandingPings = Math.ceil(policy.timeoutMs / policy.intervalMs) + 1
+    // window stays outstanding — a shorter memory would reject honest late pongs —
+    // but capped, so an extreme policy cannot grow an unbounded id set: a peer
+    // lagging more than the cap's worth of intervals is not meaningfully alive.
+    this.maxOutstandingPings = Math.min(Math.ceil(policy.timeoutMs / policy.intervalMs) + 1, 4096)
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(policy), policy.intervalMs)
   }
@@ -457,8 +459,17 @@ export class RunnerClient extends EventEmitter {
     // writes but never reads must not grow the queue one ping per interval.
     if ((this.ws?.bufferedAmount ?? 0) > (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) return
     const id = randomUUID()
-    this.outstandingPings.push(id)
-    while (this.outstandingPings.length > this.maxOutstandingPings) this.outstandingPings.shift()
+    this.pingOrder.push(id)
+    this.pingSet.add(id)
+    while (this.pingSet.size > this.maxOutstandingPings) {
+      const oldest = this.pingOrder.shift()
+      if (oldest === undefined) break
+      this.pingSet.delete(oldest)
+    }
+    // Answered ids linger in the order queue until shifted; compact occasionally.
+    if (this.pingOrder.length > this.maxOutstandingPings * 2 + 64) {
+      this.pingOrder = this.pingOrder.filter(pending => this.pingSet.has(pending))
+    }
     this.sendRaw({ type: 'ping', id })
   }
 
