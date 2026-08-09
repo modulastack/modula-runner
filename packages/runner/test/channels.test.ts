@@ -36,6 +36,14 @@ describe('channel store', () => {
     expect(store.receive({ type: 'data', channel: id, seq: 2, payload: text('again') }).status).toBe('duplicate')
   })
 
+  it('rejects structurally invalid payloads from untyped callers', () => {
+    const store = new ChannelStore()
+    const { id } = store.open('terminal')
+    expect(() => store.record(id, { codec: 'zip', body: 'x' } as never)).toThrow(/valid protocol payload/)
+    expect(() => store.record(id, { codec: 'sealed', body: 'x' } as never)).toThrow(/valid protocol payload/)
+    expect(store.record(id, text('fine')).seq).toBe(1)
+  })
+
   it('leaves channel state untouched when a payload cannot be serialized', () => {
     const store = new ChannelStore()
     const { id } = store.open('terminal')

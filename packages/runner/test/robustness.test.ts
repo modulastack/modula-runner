@@ -260,6 +260,23 @@ describe('misbehaving control plane', () => {
     expect(client.isConnected()).toBe(true)
   })
 
+  it('canonicalizes a toString-shifting URL before validation and dialing', async () => {
+    stub = await new StubControlPlane().start()
+    const target = stub.url
+    let calls = 0
+    const shifty = { toString: () => (calls++ === 0 ? target : 'ws://control.example.com') }
+    client = new RunnerClient({
+      url: shifty as unknown as string,
+      token: 'stub-token',
+      runner: testRunnerInfo,
+      backoff: { baseMs: 20, capMs: 40 },
+    })
+    const connected = once(client, 'connected')
+    client.connect()
+    await connected
+    expect(client.isConnected()).toBe(true)
+  })
+
   it('does not reconnect when stop() is called from the reconnecting handler', async () => {
     stub = await new StubControlPlane().start()
     const runner = makeClient(stub.url, { backoff: { baseMs: 20, capMs: 40 } })

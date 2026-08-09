@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { MAX_FRAME_BYTES, type ChannelKind, type ChannelResumeState, type DataFrame, type Payload, type ResetFrame } from '@modulastack/runner-protocol'
+import { MAX_FRAME_BYTES, decodeFrame, type ChannelKind, type ChannelResumeState, type DataFrame, type Payload, type ResetFrame } from '@modulastack/runner-protocol'
 
 const DEFAULT_BUFFER_BYTES = 512 * 1024
 const DEFAULT_TOTAL_BUFFER_BYTES = 64 * 1024 * 1024
@@ -90,7 +90,10 @@ export class ChannelStore {
     const serialized = JSON.stringify(candidate)
     const bytes = Buffer.byteLength(serialized, 'utf8')
     if (bytes > MAX_FRAME_BYTES) throw new RangeError('frame exceeds MAX_FRAME_BYTES')
-    const frame = JSON.parse(serialized) as DataFrame
+    // The snapshot parse runs through the codec: a structurally invalid payload from
+    // an untyped caller must fail here, not advance the sequence and die at the peer.
+    const frame = decodeFrame(serialized)
+    if (frame === null || frame.type !== 'data') throw new TypeError('payload is not a valid protocol payload')
     state.sentSeq = frame.seq
     state.buffer.push({ frame, bytes })
     state.bufferBytes += bytes

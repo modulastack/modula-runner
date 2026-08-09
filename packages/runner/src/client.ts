@@ -72,10 +72,14 @@ export class RunnerClient extends EventEmitter {
 
   constructor(options: RunnerClientOptions) {
     super()
-    assertSecureUrl(options.url)
+    // Canonicalized to primitives before validation: an object with a shifting
+    // toString must not pass the checks as one URL and dial as another.
+    const url = String(options.url)
+    const token = String(options.token)
+    assertSecureUrl(url)
     assertImplementedRange(options.protocol)
     assertRunnerInfo(options.runner)
-    assertHeaderSafeToken(options.token)
+    assertHeaderSafeToken(token)
     // Numeric options fail here, not at the moment a reconnect or flush needs them.
     if (options.backoff) backoffDelay(0, options.backoff)
     assertBoundedInt('highWaterBytes', options.highWaterBytes, 0)
@@ -84,6 +88,8 @@ export class RunnerClient extends EventEmitter {
     // different URL or protocol range past the checks that just ran.
     this.options = {
       ...options,
+      url,
+      token,
       runner: { ...options.runner },
       ...(options.protocol ? { protocol: { ...options.protocol } } : {}),
       ...(options.backoff ? { backoff: { ...options.backoff } } : {}),
