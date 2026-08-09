@@ -215,7 +215,20 @@ describe('misbehaving control plane', () => {
     expect(() => new RunnerClient({ ...base, backoff: { baseMs: Number.NaN } })).toThrow(/positive integers/)
     expect(() => new RunnerClient({ ...base, highWaterBytes: Number.POSITIVE_INFINITY })).toThrow(/highWaterBytes/)
     expect(() => new RunnerClient({ ...base, handshakeTimeoutMs: 0 })).toThrow(/handshakeTimeoutMs/)
+    expect(() => new RunnerClient({ ...base, handshakeTimeoutMs: 2_147_483_648 })).toThrow(/handshakeTimeoutMs/)
+    expect(() => new RunnerClient({ ...base, backoff: { capMs: 2_147_483_648 } })).toThrow(/2147483647/)
     expect(() => new RunnerClient({ ...base, bufferBytes: Number.NaN })).toThrow(/positive integer/)
+  })
+
+  it('honors pongs delayed up to the negotiated timeout window', async () => {
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 4_000 }, delayPongMs: 3_500 }).start()
+    const runner = makeClient(stub.url)
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    await sleep(5_000)
+    expect(stub.connectionCount).toBe(1)
+    expect(runner.isConnected()).toBe(true)
   })
 
   it('refuses channel operations once the client is terminal', async () => {

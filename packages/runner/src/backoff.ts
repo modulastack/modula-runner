@@ -7,8 +7,9 @@ export type BackoffOptions = { baseMs?: number; capMs?: number; random?: () => n
 export function backoffDelay(attempt: number, options: BackoffOptions = {}): number {
   const base = options.baseMs ?? 500
   const cap = options.capMs ?? 30_000
-  if (!Number.isSafeInteger(base) || base < 1 || !Number.isSafeInteger(cap) || cap < base) {
-    throw new Error('backoff bounds must be positive integers with capMs >= baseMs')
+  // The upper bound is Node's 32-bit timer ceiling: larger delays coerce to 1 ms.
+  if (!Number.isSafeInteger(base) || base < 1 || !Number.isSafeInteger(cap) || cap < base || cap > 2_147_483_647) {
+    throw new Error('backoff bounds must be positive integers with capMs >= baseMs, at most 2147483647')
   }
   const random = options.random ?? Math.random
   const ceiling = Math.min(cap, base * 2 ** Math.min(attempt, 20))

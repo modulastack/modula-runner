@@ -26,6 +26,7 @@ export type StubOptions = {
   omitResume?: boolean
   resumeSeqOverride?: number
   dropAfterWelcomeMs?: number
+  delayPongMs?: number
 }
 
 type StubChannel = { kind: string; attachToken: string; receivedSeq: number; sentSeq: number }
@@ -130,7 +131,11 @@ export class StubControlPlane {
 
   private handlePing(ws: WebSocket, id: string) {
     this.runnerPings.push(id)
-    if (!this.options.mutePings) ws.send(encodeFrame({ type: 'pong', id }))
+    if (this.options.mutePings) return
+    const pong = encodeFrame({ type: 'pong', id })
+    const delay = this.options.delayPongMs ?? 0
+    if (delay > 0) setTimeout(() => { if (ws.readyState === ws.OPEN) ws.send(pong) }, delay)
+    else ws.send(pong)
   }
 
   private handleHello(ws: WebSocket, hello: HelloFrame) {

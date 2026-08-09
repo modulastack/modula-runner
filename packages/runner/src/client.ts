@@ -25,6 +25,8 @@ import { assertSecureUrl } from './secureUrl.js'
 const DEFAULT_HIGH_WATER_BYTES = 4 * 1024 * 1024
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 const FLUSH_INTERVAL_MS = 20
+// Node's 32-bit setTimeout ceiling: anything above coerces to 1 ms.
+const MAX_TIMER_MS = 2_147_483_647
 
 export type RunnerClientOptions = {
   url: string
@@ -61,6 +63,7 @@ export class RunnerClient extends EventEmitter {
   private pendingBackoffReset = false
   private lastSeen = 0
   private readonly outstandingPings: string[] = []
+  private maxOutstandingPings = 16
   private heartbeatTimer: NodeJS.Timeout | undefined
   private reconnectTimer: NodeJS.Timeout | undefined
   private handshakeTimer: NodeJS.Timeout | undefined
@@ -75,7 +78,7 @@ export class RunnerClient extends EventEmitter {
     // Numeric options fail here, not at the moment a reconnect or flush needs them.
     if (options.backoff) backoffDelay(0, options.backoff)
     assertBoundedInt('highWaterBytes', options.highWaterBytes, 0)
-    assertBoundedInt('handshakeTimeoutMs', options.handshakeTimeoutMs, 1)
+    assertBoundedInt('handshakeTimeoutMs', options.handshakeTimeoutMs, 1, MAX_TIMER_MS)
     // A private snapshot: later mutation of the caller's object must not smuggle a
     // different URL or protocol range past the checks that just ran.
     this.options = {
@@ -434,6 +437,9 @@ export class RunnerClient extends EventEmitter {
   private startHeartbeat(policy: HeartbeatPolicy) {
     this.lastSeen = Date.now()
     this.outstandingPings.length = 0
+    // Every ping that could still be legitimately answered inside the timeout
+    // window stays outstanding; a shorter memory would reject honest late pongs.
+    this.maxOutstandingPings = Math.ceil(policy.timeoutMs / policy.intervalMs) + 1
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(policy), policy.intervalMs)
   }
@@ -447,9 +453,12 @@ export class RunnerClient extends EventEmitter {
       this.attempt = 0
       this.pendingBackoffReset = false
     }
+    // Pings respect backpressure like every other outbound frame: a peer that
+    // writes but never reads must not grow the queue one ping per interval.
+    if ((this.ws?.bufferedAmount ?? 0) > (this.options.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES)) return
     const id = randomUUID()
     this.outstandingPings.push(id)
-    while (this.outstandingPings.length > 16) this.outstandingPings.shift()
+    while (this.outstandingPings.length > this.maxOutstandingPings) this.outstandingPings.shift()
     this.sendRaw({ type: 'ping', id })
   }
 
@@ -489,9 +498,11 @@ export class RunnerClient extends EventEmitter {
   }
 }
 
-function assertBoundedInt(name: string, value: number | undefined, min: number) {
+function assertBoundedInt(name: string, value: number | undefined, min: number, max = Number.MAX_SAFE_INTEGER) {
   if (value === undefined) return
-  if (!Number.isSafeInteger(value) || value < min) throw new Error(`${name} must be an integer >= ${min}`)
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`)
+  }
 }
 
 // A token with header-unsafe characters (a pasted trailing newline is the classic)
