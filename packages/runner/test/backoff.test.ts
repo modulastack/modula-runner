@@ -17,6 +17,13 @@ describe('backoff', () => {
     expect(() => backoffDelay(0, { baseMs: 100, capMs: 50 })).toThrow(/positive integers/)
   })
 
+  it('clamps a misbehaving random source instead of storming', () => {
+    const bounds = { baseMs: 100, capMs: 1_000 }
+    expect(backoffDelay(0, { ...bounds, random: () => Number.NaN })).toBe(100)
+    expect(backoffDelay(0, { ...bounds, random: () => 5 })).toBe(100)
+    expect(backoffDelay(0, { ...bounds, random: () => -3 })).toBe(50)
+  })
+
   it('never exceeds the cap and always jitters within the upper half', () => {
     const ceiling = { baseMs: 100, capMs: 1_000, random: () => 1 }
     expect(backoffDelay(20, ceiling)).toBe(1_000)

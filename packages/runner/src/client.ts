@@ -275,9 +275,9 @@ export class RunnerClient extends EventEmitter {
       if (index < 0) return false
       this.outstandingPings.splice(index, 1)
     }
-    else if (frame.type === 'data') this.handleData(frame.channel, frame.seq, frame.payload)
-    else if (frame.type === 'reset') this.handleReset(frame.channel, frame.seq)
-    else if (frame.type === 'close') this.handleChannelClose(frame.channel, frame.reason)
+    else if (frame.type === 'data') return this.handleData(frame.channel, frame.seq, frame.payload)
+    else if (frame.type === 'reset') return this.handleReset(frame.channel, frame.seq)
+    else if (frame.type === 'close') return this.handleChannelClose(frame.channel, frame.reason)
     else if (frame.type === 'error') this.emit('protocol-error', { message: frame.message, channel: frame.channel })
     return true
   }
@@ -405,23 +405,30 @@ export class RunnerClient extends EventEmitter {
     }, FLUSH_INTERVAL_MS)
   }
 
-  private handleData(channel: string, seq: number, payload: Payload) {
-    if (!this.store.get(channel)) return
+  // Frames addressed to channels this runner does not hold are not liveness and
+  // must not fabricate lifecycle events; each handler reports whether it was
+  // addressed to real state.
+  private handleData(channel: string, seq: number, payload: Payload): boolean {
+    if (!this.store.get(channel)) return false
     const result = this.store.receive({ type: 'data', channel, seq, payload })
     if (result.status === 'accepted') this.emit('data', { channel, seq, payload: result.payload })
     else if (result.status === 'gap') this.emit('protocol-error', { message: 'sequence gap', channel, seq })
+    return true
   }
 
-  private handleReset(channel: string, seq: number) {
-    if (!this.store.get(channel)) return
+  private handleReset(channel: string, seq: number): boolean {
+    if (!this.store.get(channel)) return false
     if (this.store.receiveReset(channel, seq)) this.emit('channel-reset', { channel, seq })
     else this.emit('protocol-error', { message: 'reset would rewind the stream', channel, seq })
+    return true
   }
 
-  private handleChannelClose(channel: string, reason?: string) {
+  private handleChannelClose(channel: string, reason?: string): boolean {
+    if (!this.store.get(channel) && !this.closing.has(channel)) return false
     this.store.drop(channel)
     this.closing.delete(channel)
     this.emit('channel-closed', { channel, ...(reason ? { reason } : {}) })
+    return true
   }
 
   private startHeartbeat(policy: HeartbeatPolicy) {

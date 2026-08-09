@@ -126,6 +126,25 @@ describe('misbehaving control plane', () => {
     expect(runner.isConnected()).toBe(true)
   })
 
+  it('does not count unknown-channel frames as liveness or fabricate closes', async () => {
+    stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
+    const runner = makeClient(stub.url)
+    let closedEvents = 0
+    runner.on('channel-closed', () => { closedEvents += 1 })
+    const connected = once(runner, 'connected')
+    runner.connect()
+    await connected
+    const unknownData = encodeFrame({ type: 'data', channel: 'ghost-chan-03', seq: 1, payload: { codec: 'text', body: 'x' } })
+    const unknownClose = encodeFrame({ type: 'close', channel: 'ghost-chan-03' })
+    const spam = setInterval(() => { stub?.sendTextToAll(unknownData); stub?.sendTextToAll(unknownClose) }, 100)
+    try {
+      await until(() => stub!.connectionCount >= 2, 5_000)
+    } finally {
+      clearInterval(spam)
+    }
+    expect(closedEvents).toBe(0)
+  })
+
   it('does not count fabricated pongs as liveness', async () => {
     stub = await new StubControlPlane({ heartbeat: { intervalMs: 200, timeoutMs: 400 }, mutePings: true }).start()
     const runner = makeClient(stub.url)
