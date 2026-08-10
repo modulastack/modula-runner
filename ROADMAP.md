@@ -6,17 +6,24 @@ commit, and so is this plan.
 
 ## Now
 
-- **Pairing, presence, preview adjacency** — the next slice: device-code pairing with
-  revocable per-runner tokens; online/offline visible, never silent. *Not started.*
+- **Tri-modal model access** — the next slice: your CLI subscriptions, your API keys in an
+  encrypted local store, or local models on your own hardware, with a capability handshake
+  so the interface only offers what your machine actually has. *Not started.*
 
 Landed so far: the seam contract ([`docs/runner-seam.md`](docs/runner-seam.md), reconciled
 in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)); the versioned protocol
-schema ([`packages/protocol`](packages/protocol/SCHEMA.md)) including terminal channel
-payload semantics; the outbound-only WebSocket client with reconnect continuity; and the
-pty host — agent commands in per-worktree tmux sessions bound to terminal channels, with
-scrollback replay, resize, reattach, an acknowledged flow-control window, and
-deterministic worktree provisioning — all tested against a stub control plane
-([`packages/runner`](packages/runner)).
+schema ([`packages/protocol`](packages/protocol/SCHEMA.md)) including terminal and
+job-control channel payload semantics; the outbound-only WebSocket client with reconnect
+continuity; the pty host — agent commands in per-worktree tmux sessions bound to terminal
+channels, with scrollback replay, resize, reattach, an acknowledged flow-control window,
+and deterministic worktree provisioning; and pairing, presence and preview adjacency —
+`modula-runner pair <code>` binding a machine and minting a per-runner token into an
+encrypted local store, that token authenticating the socket and nothing else, revocation
+ending the binding rather than being retried, presence riding the negotiated heartbeat so
+offline is visible within the timeout window, and preview servers whose real listening
+sockets are checked before their port is reported and for as long as they run, so one that
+strays off loopback is stopped rather than served — all tested against a stub control
+plane ([`packages/runner`](packages/runner)).
 
 ## The split
 
@@ -26,15 +33,17 @@ The path to a runner that executes real jobs against a hosted control plane:
       versioned frames, and the reconnect-continuity client
 - [x] **Pty host + worktree provisioning** behind the wire contract — terminals spawn and
       stream identically whether co-resident or split; see *Now* for what landed
-- [ ] **Pairing, presence, preview adjacency** — device-code pairing with revocable
-      per-runner tokens; online/offline visible, never silent; previews bind to your
-      localhost
+- [x] **Pairing, presence, preview adjacency** — device-code pairing with revocable
+      per-runner tokens; online/offline visible, never silent; previews that stray off
+      your loopback are detected and stopped; see *Now* for what landed
 - [ ] **Tri-modal model access** — your CLI subscriptions, your API keys (encrypted local
       store, env-injected only), or local models via any OpenAI-compatible endpoint;
       capability handshake so the UI only offers what your machine actually has
 - [ ] **Security invariants, tested** — command allowlist (signed, locally editable,
       never remotely extendable), per-directory consent, kill switch, append-only local
-      audit log, and the test asserting the binary never opens CLI auth paths
+      audit log, and the test asserting the binary never opens CLI auth paths. Also where
+      preview containment lands: today a preview that binds off your loopback is found and
+      stopped, and an OS containment unit is what would stop it happening at all
 - [ ] **Release engineering** — signed binaries (Sigstore), SBOM per release,
       reproducible builds as a stated goal
 

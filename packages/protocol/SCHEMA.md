@@ -23,6 +23,29 @@ bug to fix.
 - The per-runner token travels as an `Authorization: Bearer` header on the upgrade
   request. It authenticates this connection and nothing else. It never appears inside a
   frame.
+- The token is minted by pairing, which is **not part of this protocol**: it is an
+  outbound HTTP redemption the runner performs before it ever opens a socket, and the
+  pairing code that buys it enters the runner through its local command line only. There
+  is no frame type for pairing and there will not be one — an inbound path for a code
+  would contradict the outbound-only rule the transport is built on. A control plane
+  answering the redemption returns a runner id and a token; that request and response
+  shape is currently this runner's **proposal**, since no control-plane implementation of
+  it exists yet, and it is expected to be settled by the slice that builds one.
+- **Redemption must be two-phase.** A pairing code is single-use, so a runner that
+  redeems successfully but then fails to persist the token locally leaves an active
+  binding nobody holds and a code that cannot be retried. The runner cannot repair that
+  from its side — there is nothing to call — so the hosted contract carries the
+  obligation: mint a *pending* binding, let the runner persist it, have the runner confirm
+  activation, and expire any binding that is never confirmed. A crash between persistence
+  and confirmation must be recoverable rather than fatal, which requires **confirmation to
+  be idempotent**: a runner that confirmed successfully but failed to record the result
+  locally will confirm the same binding again, and that repeat must succeed rather than
+  being read as a second activation. This is a requirement on the
+  control-plane slice, not a suggestion; an idempotency key was considered and rejected,
+  because a key that can retrieve an already-minted token is itself a credential.
+- Revocation is expressed as refusing the upgrade. A `401` or `403` is terminal for the
+  binding, not a transient error to back off from: a runner whose access was withdrawn
+  stops, says so locally, and does not retry into the same wall.
 - Every frame is one WebSocket text message containing one JSON object with a `type`
   field. Maximum encoded size: **1 MiB** (`MAX_FRAME_BYTES`). Oversized or structurally
   invalid frames are dropped by the codec (`decodeFrame` returns `null`); a peer may
@@ -86,6 +109,13 @@ the interval dies to ordinary timer jitter), and both stay within the 32-bit tim
 range — so a welcome cannot dictate a busy-loop ping rate or an overflowed timer. The runner reconnects; the control plane marks the runner offline
 — visibly, within one heartbeat window.
 
+**The window is `timeoutMs`, not `intervalMs`.** Death is observable no later than
+`timeoutMs` after the last accepted traffic, and an implementation must not settle for
+noticing it on the next ping tick: polling at `intervalMs` would let a dead connection
+look alive for `timeoutMs + intervalMs`, which is a bound neither side agreed to. The
+deadline is therefore its own timer. Only accepted protocol traffic refreshes it —
+garbage and state-invalid frames are not liveness.
+
 ### Channels
 
 | Frame | Direction | Fields |
@@ -96,10 +126,11 @@ range — so a welcome cannot dictate a busy-loop ping rate or an overflowed tim
 | `close` | both | `channel` · `reason?` |
 | `error` | both | `message` · `channel?` |
 
-Channel kinds in version 1: `terminal` is defined, with payload semantics specified
-in "Terminal channel payloads" below; `coms`, `forge-event`, and `job-control` are
-**reserved** — structurally valid on the wire, semantics specified in later revisions
-(see the seam reconciliation note for why they exist now).
+Channel kinds in version 1: `terminal` and `job-control` are defined, with payload
+semantics specified in "Terminal channel payloads" and "Job-control channel payloads"
+below; `coms` and `forge-event` are **reserved** — structurally valid on the wire,
+semantics specified in later revisions (see the seam reconciliation note for why they
+exist now).
 
 ## Channel model
 
@@ -251,6 +282,81 @@ channel closed would trade a certain, unbounded resource cost for a narrow
 recovery: the case that matters — a viewer whose flow window was closed, so the
 multiplexer coalesced output away — is recovered *before* `EXIT`, while the pane
 is still alive.
+
+## Job-control channel payloads
+
+The `job-control` kind carries preview-server lifecycle. Messages ride as `json` payloads
+inside ordinary `data` frames — no new frame types, no change to any existing field, and
+therefore no version bump: the set of wire-valid frames is unchanged, exactly as with the
+terminal payloads above. `job-control` has been a wire-valid kind since version 1 with its
+semantics deferred, and this section is that deferral being paid.
+
+Control plane → runner:
+
+| Message | Fields | Meaning |
+|---|---|---|
+| `PREVIEW_START` | `previewId` · `recipe` · `cwd` | Start a locally-defined preview recipe in a granted directory. |
+| `PREVIEW_STOP` | `previewId` | Stop a preview this runner holds. |
+
+Runner → control plane:
+
+| Message | Fields | Meaning |
+|---|---|---|
+| `PREVIEW_READY` | `previewId` · `port` | The preview is listening on the runner's loopback at this port. |
+| `PREVIEW_EXIT` | `previewId` · `exitCode` · `signal` | The preview process ended. |
+| `REFUSED` | `requestId` · `reason` | The runner declined a request, and why. |
+
+**The control plane names what to run, never how.** `recipe` is an identifier for a
+command line the runner holds locally; no command and no argument vector crosses this
+wire. Allowlisting an executable while accepting its arguments from a peer is not an
+allowlist — an approved interpreter plus a caller-supplied argv is arbitrary execution
+under the runner's user, and no argument policy survives contact with an interpreter. An
+unknown recipe is refused with `not-allowlisted`. This is the wire form of FR-13: the
+allowlist ships with the runner, is editable only locally, and the control plane cannot
+extend it.
+
+**The port is discovered, not assigned.** A preview command chooses its own port — that is
+what dev servers do — so the runner reports the port the process actually bound rather
+than dictating one and assuming obedience. `cwd` is bounded at 1024 characters and `port`
+is 1–65535: a sentinel like 0 is not a port a browser can open, so it is not a port this
+protocol carries.
+
+**A port is not an endpoint.** `PREVIEW_READY` carries a port and deliberately carries no
+host, no URL, and no scheme. The operator's browser is on the runner's machine, in both
+the split and co-resident deployments, so the number is all it needs; a host or URL field
+would be exactly the endpoint the seam contract says never crosses.
+
+**Loopback binding is verified, not declared, and verification does not stop at
+readiness.** The runner inspects the listening sockets of the spawned process and its
+descendants, lets the tree settle before judging it — a wrapper binds before its server
+does — and reports readiness only when every listener is on a loopback address and exactly
+one port is in play. It keeps checking for the preview's life: a tree can bind a new socket
+long after it started, so a check performed once certifies an instant rather than the
+promise. Losing loopback ends the preview, and so does losing every listener, since a
+process that closed its server without exiting would otherwise leave a port advertised that
+nothing answers. Refusal means the tree is no longer reachable, not that a signal was
+sent.
+
+**This is detection and response, not prevention, and the difference is load-bearing.** A
+preview is spawned into the host's network namespace, so an off-loopback listener *can*
+exist — briefly during startup, or for as long as one sweep interval afterwards — before
+the runner finds it and ends the tree. Ownership is tracked by ancestry and process group
+and re-established by start time, which a descendant that calls `setsid` after a double
+fork escapes entirely. Closing that requires an OS containment unit whose membership
+survives reparenting and session changes: a network namespace or cgroup on Linux, with no
+clean equivalent on macOS.
+
+Nothing in this schema should be read as a guarantee that an off-loopback listener cannot
+exist. What is guaranteed is that one which appears in a tree the runner can still see is
+found and terminated, and that readiness is never reported over it. A conformance suite
+that passes against this section is evidence of detection; it is not evidence of
+containment.
+
+**Refusals are answers.** Every request the runner declines produces a `REFUSED` naming
+its reason — `not-allowlisted`, `path-not-granted`, `runner-paused`, `non-loopback-bind`,
+`already-running`, `unknown-preview`, `spawn-failed`, `ambiguous-listener`, `at-capacity`. Nothing is held for a later attempt.
+This is the wire form of the seam's fourth principle: an offline or unwilling runner is
+visible, and a request that will not be served never looks like one still in progress.
 
 ## End-to-end capability
 

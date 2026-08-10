@@ -248,7 +248,9 @@ export class RunnerClient extends EventEmitter {
     for (const event of this.reconciler.reconcile(frame.channels)) this.emit(event.name, event.detail)
     // Reconciliation runs user listeners synchronously; one may have stopped the client.
     if (this.phase !== 'running' || !this.connected) return
-    this.emit('connected', { protocol: frame.protocol })
+    // The negotiated heartbeat travels with the event: it is the window inside which a
+    // peer must see this runner go offline, so presence should not have to re-derive it.
+    this.emit('connected', { protocol: frame.protocol, heartbeat: frame.heartbeat })
   }
 
   // Frames addressed to channels this runner does not hold are not liveness and
@@ -282,6 +284,10 @@ export class RunnerClient extends EventEmitter {
     this.connected = false
     this.clearTimers()
     this.emit(event, detail)
+    // One event every terminal failure shares, whatever its cause. Consumers that must
+    // react to "this client will never carry traffic again" should not have to enumerate
+    // the reasons, and an enumeration is a list that goes stale silently.
+    this.emit('failed', { reason: event, detail })
     this.transport.close()
   }
 

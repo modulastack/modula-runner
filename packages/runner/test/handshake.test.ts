@@ -26,7 +26,7 @@ describe('handshake', () => {
     const connected = once(makeClient(stub.url), 'connected')
     client!.connect()
     const [detail] = await connected
-    expect(detail).toEqual({ protocol: 1 })
+    expect(detail).toEqual({ protocol: 1, heartbeat: { intervalMs: 200, timeoutMs: 1_000 } })
     expect(stub.hellos[0]?.protocol).toEqual({ min: 1, max: 1 })
     expect(stub.hellos[0]?.runner).toEqual(testRunnerInfo)
   })
@@ -36,7 +36,9 @@ describe('handshake', () => {
     const connected = once(makeClient(stub.url), 'connected')
     client!.connect()
     const [detail] = await connected
-    expect(detail).toEqual({ protocol: 1 })
+    // The negotiated heartbeat rides the connected event: it is the window a peer must
+    // see this runner go offline within, so presence reads it rather than re-deriving it.
+    expect(detail).toEqual({ protocol: 1, heartbeat: { intervalMs: 200, timeoutMs: 1_000 } })
   })
 
   it('is rejected by a control plane that dropped its versions, and does not retry', async () => {

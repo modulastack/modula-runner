@@ -13,6 +13,7 @@ export type HeartbeatEvents = {
 // fabricated or stale pongs cannot hold a dead session open.
 export class Heartbeat {
   private timer: NodeJS.Timeout | undefined
+  private deadlineTimer: NodeJS.Timeout | undefined
   private lastSeen = 0
   private pingOrder: string[] = []
   private readonly pingSet = new Set<string>()
@@ -31,11 +32,14 @@ export class Heartbeat {
     this.maxOutstandingPings = Math.min(Math.ceil(policy.timeoutMs / policy.intervalMs) + 1, 4096)
     if (this.timer) clearInterval(this.timer)
     this.timer = setInterval(() => this.tick(policy), policy.intervalMs)
+    this.armDeadline(policy)
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer)
+    if (this.deadlineTimer) clearTimeout(this.deadlineTimer)
     this.timer = undefined
+    this.deadlineTimer = undefined
   }
 
   sawTraffic() {
@@ -46,8 +50,23 @@ export class Heartbeat {
     return this.pingSet.delete(id)
   }
 
+  // The deadline is its own timer rather than a check on the ping interval: polling can
+  // only notice death at the next tick, which would let a dead connection look alive for
+  // a whole interval past the timeout the two sides negotiated. Re-arming happens when
+  // the timer fires rather than on every frame, so traffic volume costs nothing.
+  private armDeadline(policy: HeartbeatPolicy) {
+    if (this.deadlineTimer) clearTimeout(this.deadlineTimer)
+    const remaining = this.lastSeen + policy.timeoutMs - Date.now()
+    this.deadlineTimer = setTimeout(() => this.checkDeadline(policy), Math.max(remaining, 1))
+  }
+
+  private checkDeadline(policy: HeartbeatPolicy) {
+    if (Date.now() - this.lastSeen >= policy.timeoutMs) return this.events.onExpired()
+    this.armDeadline(policy)
+  }
+
   private tick(policy: HeartbeatPolicy) {
-    if (Date.now() - this.lastSeen > policy.timeoutMs) {
+    if (Date.now() - this.lastSeen >= policy.timeoutMs) {
       this.events.onExpired()
       return
     }

@@ -98,7 +98,8 @@ export class TerminalHost {
     if (!this.shutdown) {
       const running = this.runShutdown()
       this.shutdown = running
-      void running.catch(() => undefined).then(() => {
+      // Tracking only; the launch's own caller receives its rejection.
+    void running.catch(() => undefined).then(() => {
         if (this.shutdown === running) this.shutdown = undefined
       })
     }

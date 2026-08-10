@@ -23,6 +23,20 @@ export {
 } from './frames.js'
 export { MAX_FRAME_BYTES, decodeFrame, encodeFrame } from './codec.js'
 export {
+  MAX_PORT,
+  REFUSAL_REASONS,
+  decodeJobControlClientMessage,
+  decodeJobControlServerMessage,
+  hasControlCharacter,
+  isRefusalReason,
+  jobControlPayload,
+  parseJobControlClientMessage,
+  parseJobControlServerMessage,
+  type JobControlClientMessage,
+  type JobControlServerMessage,
+  type RefusalReason,
+} from './jobControl.js'
+export {
   MAX_ACK_BYTES,
   MAX_TERMINAL_DIMENSION,
   decodeTerminalClientMessage,
