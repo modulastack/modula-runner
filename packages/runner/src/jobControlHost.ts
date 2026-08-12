@@ -4,6 +4,7 @@ import {
   type JobControlServerMessage,
   type Payload,
   type RefusalReason,
+  type RunnerCapabilities,
 } from '@modulastack/runner-protocol'
 import type { ChannelHandle, RunnerClient } from './client.js'
 import type { PresenceTracker } from './presence.js'
@@ -17,12 +18,18 @@ export type JobControlHostOptions = {
   client: RunnerClient
   preview: PreviewHost
   presence?: PresenceTracker
+  // Where the connect-time advertisement comes from. FR-10's "at connect" is satisfied by
+  // publishing on channel open, and this host owns that channel — including the reopen
+  // after an expiry, which nothing outside ever sees. A caller holding the monitor could
+  // not answer for a channel it did not know had been replaced.
+  capabilities?: () => RunnerCapabilities | null
 }
 
 export class JobControlHost {
   private readonly client: RunnerClient
   private readonly preview: PreviewHost
   private readonly presence: PresenceTracker | undefined
+  private readonly capabilities: (() => RunnerCapabilities | null) | undefined
   private channel: ChannelHandle | undefined
   private generation = 0
   private readonly startedUnder = new Map<string, number>()
@@ -33,6 +40,7 @@ export class JobControlHost {
     this.client = options.client
     this.preview = options.preview
     this.presence = options.presence
+    this.capabilities = options.capabilities
     this.client.on('data', detail => this.handleData(detail as { channel: string; payload: Payload }))
     // Each preview remembers the generation it was STARTED under, and its exit is reported
     // only if that is still the current one. Capturing a generation on the listener itself
@@ -97,9 +105,43 @@ export class JobControlHost {
     this.preview.stopAll().catch(() => undefined)
   }
 
+  // The advertisement goes out the moment the channel exists, which is what makes FR-10's
+  // "at connect" true now that capability state rides this channel instead of `hello`. The
+  // reopen after an expiry comes through here as well, and that is the path that would
+  // otherwise be silent: the monitor speaks only when something changes, so a reconnect
+  // that changed nothing would leave the peer holding no snapshot at all.
+  //
+  // An already-open channel is returned untouched. Advertising again on a call that opened
+  // nothing would send a duplicate for every caller that asks for the handle.
   open() {
-    if (!this.channel) this.channel = this.client.openChannel('job-control')
+    if (this.channel) return this.channel
+    this.channel = this.client.openChannel('job-control')
+    this.advertise()
     return this.channel
+  }
+
+  private advertise() {
+    try {
+      const snapshot = this.capabilities?.()
+      // Null is not an empty snapshot. A runner whose first probe has not landed has said
+      // nothing yet, and answering "nothing installed" on its behalf is a different claim;
+      // the monitor's first change carries the real one.
+      if (snapshot) this.publishCapabilities(snapshot)
+    } catch {
+      // The source is a caller's callback and the send can race a channel already going
+      // away. Previews depend on this channel, so an advertisement that cannot be made must
+      // not be able to take it down — and the next refresh publishes anyway.
+    }
+  }
+
+  // Capability snapshots ride the one job-control channel this host owns rather than a
+  // second channel of the same kind: two would leave the control plane guessing which one
+  // to send PREVIEW_START on. A snapshot with no channel to ride is dropped, not queued: a
+  // queued one would arrive behind whatever the next channel advertises on open, which is
+  // to say it would deliver a stale answer after the current one. `hello` carries no
+  // capability payload — that is the whole reason open() advertises.
+  publishCapabilities(capabilities: RunnerCapabilities): void {
+    this.send({ type: 'CAPABILITIES', capabilities })
   }
 
   close(reason?: string) {

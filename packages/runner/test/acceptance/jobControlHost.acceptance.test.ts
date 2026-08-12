@@ -87,6 +87,9 @@ async function request(value: Harness, requestMessage: JobControlClientMessage) 
 
 function answers(message: JobControlServerMessage, requestMessage: JobControlClientMessage) {
   if (message.type === 'REFUSED') return message.requestId === requestMessage.previewId
+  // A capability snapshot shares this channel but answers nobody's request; it is not a
+  // reply to a preview call and must not be counted as one.
+  if (message.type === 'CAPABILITIES') return false
   return message.previewId === requestMessage.previewId
 }
 

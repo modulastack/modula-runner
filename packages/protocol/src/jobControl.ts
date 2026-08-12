@@ -1,4 +1,5 @@
-import { isSafeIdentifier, type Payload } from './frames.js'
+import { parseRunnerCapabilities, type RunnerCapabilities } from './capability.js'
+import { hasControlCharacter, isSafeIdentifier, type Payload } from './frames.js'
 
 // Job-control channel payload semantics. `job-control` has been a wire-valid channel
 // kind since version 1 with its semantics deferred, so specifying them here adds no
@@ -32,6 +33,10 @@ export type JobControlServerMessage =
   | { type: 'PREVIEW_READY'; previewId: string; port: number }
   | { type: 'PREVIEW_EXIT'; previewId: string; exitCode: number | null; signal: number | null }
   | { type: 'REFUSED'; requestId: string; reason: RefusalReason }
+  // The whole current snapshot, not a delta. A capability set is small and a peer that
+  // missed one update must not be left reconstructing state from a partial history; the
+  // latest snapshot is always the answer, which also makes a replayed duplicate harmless.
+  | { type: 'CAPABILITIES'; capabilities: RunnerCapabilities }
 
 export function jobControlPayload(message: JobControlClientMessage | JobControlServerMessage): Payload {
   return { codec: 'json', body: message }
@@ -57,7 +62,13 @@ export function parseJobControlServerMessage(value: unknown): JobControlServerMe
   if (value.type === 'PREVIEW_READY') return previewReady(value)
   if (value.type === 'PREVIEW_EXIT') return previewExit(value)
   if (value.type === 'REFUSED') return refused(value)
+  if (value.type === 'CAPABILITIES') return capabilities(value)
   return null
+}
+
+function capabilities(value: Record<string, unknown>): JobControlServerMessage | null {
+  const parsed = parseRunnerCapabilities(value.capabilities)
+  return parsed ? { type: 'CAPABILITIES', capabilities: parsed } : null
 }
 
 // The control plane names WHAT to run, never HOW. An argument vector crossing the seam
@@ -97,21 +108,9 @@ function isPort(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_PORT
 }
 
-// Control characters are rejected at the wire, not at the process boundary. A NUL in a
-// command or path reaches spawn as a synchronous throw rather than a refusal value, and
-// CR and LF are header-injection shapes; none of them are anything a real command line
-// contains, so the protocol has no reason to carry them.
 function isBoundedString(value: unknown, max: number): value is string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) return false
   return !hasControlCharacter(value)
-}
-
-export function hasControlCharacter(value: string) {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code < 0x20 || code === 0x7f) return true
-  }
-  return false
 }
 
 function isExitValue(value: unknown): value is number | null {

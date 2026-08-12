@@ -1,4 +1,5 @@
 import { hostname } from 'node:os'
+import type { ApiKeyStore } from './apiKeys.js'
 import { PairingError, type RunnerIdentity } from './pairing.js'
 import type { PresenceSnapshot } from './presence.js'
 
@@ -74,6 +75,77 @@ export async function runStatusCommand(_argv: readonly string[], context: PairCo
   const presence = context.presence?.()
   if (!presence) return { exitCode: 0, output: `${where} — not connected in this process` }
   return { exitCode: 0, output: `${where} — ${presence.state}${sinceSuffix(presence)}` }
+}
+
+export type KeyCommandContext = {
+  keys: ApiKeyStore
+  // A hidden TTY read in the binary, a stub in a test. The same shape pairing uses, for the
+  // same reason: the value must not reach the terminal's scrollback.
+  readSecret: (prompt: string) => Promise<string>
+}
+
+// `modula-runner key add <label> --provider <name>`. The key is prompted for and enters here
+// and nowhere else.
+//
+// FR-11 describes a browser hand-off to a local page. That page would be an inbound
+// listener, and this runner does not have one — "it listens on no inbound port" is the
+// transport's founding rule, and the schema already says of the pairing code that an inbound
+// path "would contradict the outbound-only rule the transport is built on… and there will
+// not be one". An API key is a stronger credential than a pairing code, so the argument that
+// settled the code settles this too; a loopback listener is also reachable by every process
+// on the machine and by any page the operator's browser happens to visit. What FR-11
+// actually promises — that the key never transits the control plane — is delivered here in
+// full. The criterion was amended rather than the rule bent (docs/model-access.md).
+//
+// Never accepted as an argument, unlike a pairing code: FR-6 documents the argv form for a
+// code, nothing documents it for a key, and arguments are readable by any local process.
+// Neither the key nor its fingerprint's source is ever echoed.
+export async function runKeyAddCommand(argv: readonly string[], context: KeyCommandContext): Promise<CommandResult> {
+  const [label, flag, provider, ...extra] = argv
+  if (!label || flag !== '--provider' || !provider || extra.length > 0) return { exitCode: 2, output: KEY_ADD_USAGE }
+  // Trimmed because a pasted key carries the newline that submitted it, and a key stored
+  // with trailing whitespace fails at the provider with an error nobody can trace back here.
+  const secret = (await context.readSecret(`API key for ${label} (${provider}): `)).trim()
+  if (!secret) return { exitCode: 2, output: 'no key was entered, so nothing was stored' }
+  try {
+    const record = await context.keys.put({ label, provider, secret })
+    return { exitCode: 0, output: `stored ${record.label} for ${record.provider} (****${record.lastFour})` }
+  } catch (error) {
+    // The message describes the key's shape, never its content: this line is going to a
+    // terminal that keeps scrollback.
+    return { exitCode: 1, output: `that key was not stored: ${messageOf(error)}` }
+  }
+}
+
+// `modula-runner key list`. Labels, providers and last-four only — there is no command, and
+// no store method, that prints a key.
+export async function runKeyListCommand(_argv: readonly string[], context: KeyCommandContext): Promise<CommandResult> {
+  const records = await context.keys.list()
+  if (records.length === 0) return { exitCode: 0, output: `no keys stored — add one with: ${KEY_ADD_FORM}` }
+  const rows = records.map(record => `${record.label}  ${record.provider}  ****${record.lastFour}${record.removedAt ? '  (removed)' : ''}`)
+  return { exitCode: 0, output: rows.join('\n') }
+}
+
+// `modula-runner key remove <label>`. Recorded as removed rather than erased, the same rule
+// a revoked binding follows. A pane already running keeps the value it was given: it lives
+// in that process's own environment and the runner cannot reach in. The kill switch is the
+// answer that exists, and saying so is better than implying one that does not.
+export async function runKeyRemoveCommand(argv: readonly string[], context: KeyCommandContext): Promise<CommandResult> {
+  const [label, ...extra] = argv
+  if (!label || extra.length > 0) return { exitCode: 2, output: 'usage: modula-runner key remove <label>' }
+  try {
+    await context.keys.remove(label)
+  } catch (error) {
+    return { exitCode: 1, output: messageOf(error) }
+  }
+  return { exitCode: 0, output: `removed ${label} — a pane already running keeps the key it was given; stop it to take the key out of that process` }
+}
+
+const KEY_ADD_FORM = 'modula-runner key add <label> --provider <name>'
+const KEY_ADD_USAGE = `usage: ${KEY_ADD_FORM} (the key itself is prompted for and is never accepted as an argument)`
+
+function messageOf(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function sinceSuffix(snapshot: PresenceSnapshot) {

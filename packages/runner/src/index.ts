@@ -38,6 +38,61 @@ export {
   type PreviewRecord,
   type PreviewSpec,
 } from './preview.js'
-export { runPairCommand, runStatusCommand, type CommandResult, type PairCommandContext } from './cli.js'
+export {
+  runKeyAddCommand,
+  runKeyListCommand,
+  runKeyRemoveCommand,
+  runPairCommand,
+  runStatusCommand,
+  type CommandResult,
+  type KeyCommandContext,
+  type PairCommandContext,
+} from './cli.js'
 export { JobControlHost, type JobControlHostOptions } from './jobControlHost.js'
 export { isLoopbackAddress, listeningSocketsFor, type ListeningSocket } from './listeningSockets.js'
+export { SECRET_PLACEHOLDER, SecretEnv } from './secretEnv.js'
+export {
+  LAST_FOUR_LENGTH,
+  MAX_API_KEY_LENGTH,
+  MAX_KEY_LABELS,
+  MIN_API_KEY_LENGTH,
+  createEncryptedApiKeyStore,
+  createMemoryApiKeyStore,
+  lastFourOf,
+  type ApiKeyRecord,
+  type ApiKeyStore,
+  type ApiKeyStoreOptions,
+  type KeyInjection,
+  type NewApiKey,
+} from './apiKeys.js'
+export {
+  DEFAULT_LOCAL_ENDPOINTS,
+  DEFAULT_PROBE_TIMEOUT_MS as DEFAULT_ENDPOINT_PROBE_TIMEOUT_MS,
+  LocalEndpointRegistry,
+  MAX_PROBE_RESPONSE_BYTES,
+  probeLocalEndpoint,
+  type LocalEndpointConfig,
+  type ProbeOptions,
+} from './localEndpoints.js'
+export {
+  CAPABILITY_REFRESH_MS,
+  CapabilityMonitor,
+  DEFAULT_RUNTIME_CATALOG,
+  DEFAULT_PROBE_TIMEOUT_MS as DEFAULT_RUNTIME_PROBE_TIMEOUT_MS,
+  MAX_PROBE_OUTPUT_BYTES,
+  MIN_CAPABILITY_REFRESH_MS,
+  probeRuntime,
+  type CapabilityMonitorOptions,
+  type RuntimeSpec,
+} from './capabilities.js'
+export {
+  ACCESS_REFUSALS,
+  AccessResolver,
+  accessRefusalGuidance,
+  isAccessRefusal,
+  type AccessRefusal,
+  type AccessResolution,
+  type AccessResolverOptions,
+  type LaunchPlan,
+  type LocalModelProfile,
+} from './accessProfiles.js'

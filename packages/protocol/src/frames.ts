@@ -25,6 +25,12 @@ export type ChannelResumeResult =
   | { id: string; status: 'resumed'; receivedSeq: number }
   | { id: string; status: 'expired' }
 
+// Capabilities deliberately do NOT ride here. `hello` shares one 1 MiB frame with a resume
+// roster bounded at 1024 channels precisely so the hello always fits, and an oversized hello
+// is terminal for the connection — a runner with a large model library would become unable
+// to handshake at all. Capability state rides the job-control channel instead, where it is
+// budgeted correctly, refreshable, and sealable when end-to-end encryption ships. OS and
+// architecture stay here, on `runner`, and the capability shape does not restate them.
 export type HelloFrame = { type: 'hello'; protocol: VersionRange; runner: RunnerInfo; channels: ChannelResumeState[] }
 export type WelcomeFrame = { type: 'welcome'; protocol: number; heartbeat: HeartbeatPolicy; channels: ChannelResumeResult[] }
 export type RejectFrame = { type: 'reject'; reason: string; supported: number[] }
@@ -56,4 +62,16 @@ export function isSafeIdentifier(value: unknown): value is string {
 
 export function isChannelKind(value: unknown): value is ChannelKind {
   return typeof value === 'string' && (CHANNEL_KINDS as readonly string[]).includes(value)
+}
+
+// Control characters are rejected at the wire, not at the process boundary. A NUL in a
+// command or path reaches spawn as a synchronous throw rather than a refusal value, and
+// CR and LF are header-injection shapes; none of them are anything a real command line,
+// model name or version string contains, so the protocol has no reason to carry them.
+export function hasControlCharacter(value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 0x20 || code === 0x7f) return true
+  }
+  return false
 }

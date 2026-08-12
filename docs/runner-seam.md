@@ -41,7 +41,9 @@ works in only one topology is a bug in this document.
 | Worktree provisioning | Deterministic worktree + branch creation against local repos. One runner owns the checkouts it provisions: lanes are serialized within the runner, and a failed attempt rolls back only what it still owns, so a contender can never delete a registered lane. Two runner processes sharing one checkout is outside this contract. |
 | Git and forge operations | All mutations (clone, branch, push, PR, merge) and the default read path, under local credentials — GitHub or a self-hosted forge, including one on a private network. |
 | Forge detect, wire, health | Detects an existing local forge, wires it via the runner's localhost setup flow, health-checks it. Guides new installs; never executes them, holds no install privileges. Config stays local; only opaque health crosses the seam. |
-| Model access resolution | Tri-modal, resolved entirely locally: subscription CLIs (their own login), API keys (encrypted local store, injected env-only), local models (any OpenAI-compatible endpoint). The pty host injects only non-secret orchestration variables into a session's environment; secret injection (API keys) is the key store's job (FR-11), delivered through a non-argv mechanism so nothing sensitive is visible in process arguments. |
+| Model access resolution | Tri-modal, resolved entirely locally: subscription CLIs (their own login), API keys (encrypted local store, injected env-only), local models (any OpenAI-compatible endpoint). The pty host injects only non-secret orchestration variables into a session's environment; secret injection (API keys) is the key store's job (FR-11), delivered through a non-argv mechanism so nothing sensitive is visible in process arguments. The endpoint URL travels the same non-argv path: not a secret, but on the never-crosses list for the same reason. Full contract: [`model-access.md`](model-access.md). |
+| Key custody and entry | API keys enter through the runner's local CLI, prompted — never an argument, never an inbound port, the same path and the same reasoning as a pairing code. They live in the runner's encrypted local store and are injected into the spawned CLI's environment and nothing else; a tmux server shared per worktree must not become a second holder. Removal is recorded, not erased, and a pane already running keeps what it was given. |
+| Endpoint configuration | Local model endpoints are configured, never discovered: the runner does not scan loopback ports. Its ids are operator-chosen and never derived from an address. |
 | Advisory review execution | Review rounds run here; the code under review never leaves the machine. |
 | Coms pools | Agent-to-agent coms transport: unix sockets, registries, and standing-peer attach points live beside the worktrees they serve. |
 | Preview servers and browser-QA targets | **Detected and terminated off-loopback, not prevented from binding there** — see the schema. Bind to the runner's localhost; the operator's browser is on the same machine (split) or same host (co-resident), so no tunneling. The binding is verified against the process's real listening sockets before its port is reported, because a command is free to bind more than it was configured with. Only the port crosses — a host or URL would be an endpoint. |
@@ -73,8 +75,18 @@ this connection — it can call no other API. On it:
 - **Heartbeats.** Liveness both ways; a missed window means reconnect (runner side) and
   visible offline state (hosted side).
 - **Channels.** All session traffic is multiplexed as channels with a declared kind.
-  Version 1 defines `terminal`; `coms`, `forge-event`, and `job-control` are reserved
+  Version 1 defines `terminal` and `job-control`; `coms` and `forge-event` remain reserved
   (reconciliation §1, §3). Channel payloads are opaque to the relay by design.
+- **Capability advertisement.** The runner says what it can run, so hosted surfaces offer
+  only what a machine has: detected CLI runtimes and their versions, each runtime's auth
+  state as the CLI itself reports it, and for each configured local endpoint an
+  operator-chosen opaque id, its kind, its health and its model inventory. OS and
+  architecture already ride the handshake. This is the most detailed thing the runner
+  discloses about the operator's machine, so it is listed here rather than left implicit —
+  it is a fingerprint, benign next to a credential but not nothing. What it never carries is
+  an endpoint's URL, host, port or scheme; an unreachable endpoint names an enumerated
+  reason, because an error string carries the address it failed to reach. Full contract:
+  [`model-access.md`](model-access.md).
 - **Reconnect and attach continuity.** Channels survive a dropped connection: each side
   keeps per-channel send/receive sequence numbers and a bounded replay buffer; on
   reconnect the runner presents each channel's id, attach token, and sequence state, and

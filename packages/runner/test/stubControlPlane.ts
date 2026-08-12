@@ -47,6 +47,9 @@ export class StubControlPlane {
   readonly closes: { channel: string; reason?: string }[] = []
   readonly opens: string[] = []
   readonly hellos: HelloFrame[] = []
+  // Every message the runner sent, verbatim. This is the whole of what a control plane
+  // could persist or log from this connection.
+  readonly rawFrames: string[] = []
   readonly runnerPings: string[] = []
   readonly runnerPongs: string[] = []
   connectionCount = 0
@@ -143,6 +146,10 @@ export class StubControlPlane {
   }
 
   private handleRaw(ws: WebSocket, raw: string) {
+    // Recorded before decoding, and undecodable messages are recorded too: a storage/log
+    // sweep for credentials (AC-2) has to look at everything that crossed the wire, not
+    // only at what a validator was willing to interpret.
+    this.rawFrames.push(raw)
     const frame = decodeFrame(raw)
     if (!frame) return
     if (frame.type === 'hello') return this.handleHello(ws, frame)

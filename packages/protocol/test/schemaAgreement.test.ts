@@ -1,7 +1,15 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { CHANNEL_KINDS, PROTOCOL_VERSION, REFUSAL_REASONS } from '../src/index.js'
+import {
+  ACCESS_MODES,
+  CHANNEL_KINDS,
+  CLI_AUTH_STATES,
+  ENDPOINT_UNREACHABLE_REASONS,
+  LOCAL_ENDPOINT_KINDS,
+  PROTOCOL_VERSION,
+  REFUSAL_REASONS,
+} from '../src/index.js'
 
 // The schema document is the contract; the validators are its executable form. Three
 // separate review findings in this checkpoint were the two disagreeing — a reason the
@@ -41,4 +49,26 @@ describe('schema and validators agree', () => {
   it('states the protocol version the package implements', () => {
     expect(schema).toContain(`*Protocol version **${PROTOCOL_VERSION}**`)
   })
+
+  // Every enum that crosses the wire, not only the two that existed when this file was
+  // written. An enum grows one member at a time and the document is updated by whoever
+  // remembers to; the point of this file is that nobody has to remember.
+  const wireEnums = {
+    'Access modes are': ACCESS_MODES,
+    'Per-CLI auth states are': CLI_AUTH_STATES,
+    'Endpoint kinds are': LOCAL_ENDPOINT_KINDS,
+    'An unreachable endpoint names one of': ENDPOINT_UNREACHABLE_REASONS,
+  }
+
+  for (const [marker, members] of Object.entries(wireEnums)) {
+    it(`documents every member the decoder accepts after "${marker}"`, () => {
+      const start = schema.indexOf(marker)
+      expect(start).toBeGreaterThan(-1)
+      const documented = backtickedIn(schema.slice(start, schema.indexOf('\n', start)))
+
+      const missing = members.filter(member => !documented.has(member))
+
+      expect(missing).toEqual([])
+    })
+  }
 })

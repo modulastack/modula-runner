@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -18,6 +18,7 @@ import {
   type PaneStatus,
   type TmuxRef,
 } from './tmux.js'
+import type { SecretEnv } from './secretEnv.js'
 
 export type FlowPolicy = { highWaterBytes: number; lowWaterBytes: number; flushMs: number }
 
@@ -39,13 +40,24 @@ const EXIT_FILE_ENV = 'MODULA_RUNNER_EXIT_FILE'
 // The wrapper writes the wrapped command's exit code before the tmux session can
 // die: the attach client's own exit code is tmux's, never the CLI's.
 const EXIT_WRAPPER = `"$0" "$@"; code=$?; printf %s "$code" > "$${EXIT_FILE_ENV}"; exit "$code"`
+const SECRET_FILE_ENV = 'MODULA_RUNNER_SECRET_FILE'
+// Sourced, then deleted, then checked — in that order, so the file is gone whether or not
+// it could be read. A failed source abandons the launch rather than starting a CLI without
+// the credential it was configured with: that failure would surface later, further away,
+// and look like a provider outage instead of a missing file.
+const SECRET_PRELUDE = `. "$${SECRET_FILE_ENV}"; sourced=$?; rm -f "$${SECRET_FILE_ENV}"; [ "$sourced" -eq 0 ] || exit 78; `
 
 export type TerminalLaunchSpec = {
   command: string
   args?: string[]
   cwd: string
   profile?: string
+  // Non-secret orchestration variables. These ride tmux's `-e` arguments, which are
+  // visible in the process table — fine for a session id, disqualifying for a credential.
   env?: Record<string, string>
+  // Secret variables, delivered by a path that puts them in no process's argument vector.
+  // FR-11: API keys are injected env-only and never through argv.
+  secrets?: SecretEnv
   socket?: string
 }
 
@@ -90,6 +102,57 @@ function assertSessionMetadata(spec: { command: string; cwd: string; profile: st
       throw new Error(`${field} must be a non-empty string of at most ${MAX_METADATA_LENGTH} characters`)
     }
   }
+}
+
+// The secret half of a launch reaches the command through a file the wrapper sources and
+// deletes before the command runs, because every other route puts the value in an argument
+// vector: `tmux new-session -e KEY=value` places it in a tmux client's argv, and `ps` is
+// world-readable to every user on the machine.
+//
+// Seeding the tmux SERVER's environment would be the obvious alternative and it is wrong.
+// One server serves every pane in a worktree, so a provider key set there would be
+// inherited by later panes — including a `local` pane that must never see one. The value is
+// scoped to the process it was injected into and to nothing else.
+//
+// The file inherits the key store's custody: a private directory this process created
+// (mkdtemp is 0700), exclusive creation, 0600, and a lifetime of one shell statement. It is
+// plaintext for that instant, which is the trade being made — an argv exposure is durable
+// and readable by every local user, this is neither, and neither defends against an
+// attacker already running as this user.
+function writeSecretHandoff(directory: string, secrets: SecretEnv | undefined) {
+  if (!secrets || secrets.size === 0) return undefined
+  assertInjectableNames(secrets)
+  const target = path.join(directory, 'secret-env')
+  secrets.use(entries => {
+    // Single-quoted with the POSIX escape for a quote, which is total: every byte except
+    // NUL survives it literally, and SecretEnv refuses a NUL at construction.
+    const script = Object.entries(entries).map(([name, value]) => `export ${name}='${value.replace(/'/g, "'\\''")}'\n`).join('')
+    writeFileSync(target, script, { flag: 'wx', mode: 0o600 })
+  })
+  return target
+}
+
+function removeHandoff(handoff: string | undefined) {
+  if (!handoff) return
+  try {
+    rmSync(handoff, { force: true })
+  } catch {
+    // Already gone is the ordinary case — the wrapper deletes it the moment it sources it,
+    // so a launch that got far enough to run the shell will have removed it first.
+  }
+}
+
+// The wrapper reads both of these back by name *after* sourcing the hand-off — one to
+// delete the hand-off, one to record the exit code — so a secret exported under either name
+// changes what those reads resolve to. The hand-off would survive with plaintext in it, and
+// the exit code would land on a file of the exporter's choosing, owned by the runner user.
+//
+// Refused rather than renamed or dropped: a launch that cannot mean what it says should not
+// half-happen. The derived form can never reach this — `<PROVIDER>_API_KEY` has a fixed
+// suffix — so what it guards is a hand-written catalog entry or a direct `SecretEnv.of`.
+function assertInjectableNames(secrets: SecretEnv) {
+  const reserved = secrets.names.filter(name => name === SECRET_FILE_ENV || name === EXIT_FILE_ENV)
+  if (reserved.length > 0) throw new Error(`the launch wrapper reserves these variable names: ${reserved.join(', ')}`)
 }
 
 // Carries the session that outlived a failed launch, so the host can keep it
@@ -173,23 +236,46 @@ export class TerminalSession {
     // not leave the command's side effects behind on its way to being refused.
     const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
     assertSessionMetadata(normalized)
+    // Checked here as well as where the file is written, so a refused launch leaves no temp
+    // directory and spawns no tmux call on its way out.
+    if (spec.secrets) assertInjectableNames(spec.secrets)
     const exitDir = mkdtempSync(path.join(tmpdir(), 'modula-runner-'))
     const id = randomUUID()
     const ref = { socket: spec.socket ?? worktreeSocket(spec.cwd), sessionName: tmuxSessionName(spec.cwd, id) }
     // A half-launched session is torn down whole: a failed attach must not
     // leave a command running unobserved or a temp directory behind.
+    let handoff: string | undefined
     try {
+      handoff = writeSecretHandoff(exitDir, spec.secrets)
       await startTmuxSession({
         ...ref,
         cwd: spec.cwd,
         file: '/bin/sh',
-        args: ['-c', EXIT_WRAPPER, spec.command, ...(spec.args ?? [])],
-        env: { ...spec.env, [EXIT_FILE_ENV]: path.join(exitDir, 'exit-code') },
+        args: ['-c', handoff ? `${SECRET_PRELUDE}${EXIT_WRAPPER}` : EXIT_WRAPPER, spec.command, ...(spec.args ?? [])],
+        // Only the PATH of the handoff rides tmux's `-e` arguments, never its contents: a
+        // path is not a credential, and this one names a file no other user can open.
+        //
+        // The order is load-bearing: the runner's own two variables are written after the
+        // caller's, so `env` cannot redirect the wrapper's reads the way a secret under a
+        // reserved name would. A test pins it, because reversing a spread is an easy edit.
+        env: { ...spec.env, [EXIT_FILE_ENV]: path.join(exitDir, 'exit-code'), ...(handoff ? { [SECRET_FILE_ENV]: handoff } : {}) },
       })
       const session = new TerminalSession({ id, spec: normalized, ref, exitDir, policy, events })
       session.attach()
       return session
     } catch (error) {
+      // The credential goes first, before anything that can throw on the way out. An
+      // unconfirmed kill leaves by a path that skips the cleanup below, and that is exactly
+      // the case where a plaintext hand-off would be left on disk — the moment the promise
+      // that it lives for one shell statement matters most.
+      //
+      // The exit file's reasoning does not extend to it: that one is kept because a live
+      // command still writes to it. This is write-once and read-once, deleted by the wrapper
+      // itself, and if a session did start without sourcing it yet, removing it makes the
+      // wrapper exit 78 — a session we are already abandoning fails to start, which is the
+      // outcome being asked for. Failing closed on a credential beats preserving a file for
+      // a launch that is being given up on.
+      removeHandoff(handoff)
       // A session that cannot be confirmed dead keeps its tmux session and its
       // exit file: deleting state a live command still writes to, and reporting
       // the original failure alone, would hide a running process nobody owns.

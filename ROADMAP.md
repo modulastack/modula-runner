@@ -6,9 +6,12 @@ commit, and so is this plan.
 
 ## Now
 
-- **Tri-modal model access** — the next slice: your CLI subscriptions, your API keys in an
-  encrypted local store, or local models on your own hardware, with a capability handshake
-  so the interface only offers what your machine actually has. *Not started.*
+- **Security invariants, tested** — the next slice: the command allowlist as a signed,
+  locally-editable file the control plane cannot extend, per-directory consent, the kill
+  switch, an append-only local audit log, and the test asserting the binary never opens a
+  CLI auth path. It is also where preview containment lands — today a preview that binds off
+  your loopback is found and stopped, and an OS containment unit is what would stop it
+  happening at all. *Not started.*
 
 Landed so far: the seam contract ([`docs/runner-seam.md`](docs/runner-seam.md), reconciled
 in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)); the versioned protocol
@@ -22,8 +25,13 @@ encrypted local store, that token authenticating the socket and nothing else, re
 ending the binding rather than being retried, presence riding the negotiated heartbeat so
 offline is visible within the timeout window, and preview servers whose real listening
 sockets are checked before their port is reported and for as long as they run, so one that
-strays off loopback is stopped rather than served — all tested against a stub control
-plane ([`packages/runner`](packages/runner)).
+strays off loopback is stopped rather than served; and tri-modal model access
+([`docs/model-access.md`](docs/model-access.md)) — subscription CLIs, API keys in the
+runner's encrypted store injected into a process's environment and into no argument vector
+anywhere in the chain, and local models behind any OpenAI-compatible endpoint with Ollama as
+the reference integration, plus a capability advertisement that tells the interface what
+this machine can actually run without telling it where anything lives — all tested against a
+stub control plane ([`packages/runner`](packages/runner)).
 
 ## The split
 
@@ -36,9 +44,11 @@ The path to a runner that executes real jobs against a hosted control plane:
 - [x] **Pairing, presence, preview adjacency** — device-code pairing with revocable
       per-runner tokens; online/offline visible, never silent; previews that stray off
       your loopback are detected and stopped; see *Now* for what landed
-- [ ] **Tri-modal model access** — your CLI subscriptions, your API keys (encrypted local
+- [x] **Tri-modal model access** — your CLI subscriptions, your API keys (encrypted local
       store, env-injected only), or local models via any OpenAI-compatible endpoint;
-      capability handshake so the UI only offers what your machine actually has
+      capability handshake so the UI only offers what your machine actually has. Keys enter
+      through the local CLI and never a browser page, because the runner opens no inbound
+      port; see *Now* for what landed
 - [ ] **Security invariants, tested** — command allowlist (signed, locally editable,
       never remotely extendable), per-directory consent, kill switch, append-only local
       audit log, and the test asserting the binary never opens CLI auth paths. Also where

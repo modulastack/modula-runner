@@ -73,7 +73,19 @@ bug to fix.
   of an existing field, bumps the version. Adding a new frame type or a new optional
   field does not; unknown *frame types* are a decode error (each version's frame set is
   closed), so new frame types ship with a version bump, while new optional fields on
-  existing frames may ship within a version because validators ignore unknown fields.
+  existing frames may ship within a version.
+- Validators **discard** unknown fields rather than carrying them: each frame is
+  reconstructed from the fields its version defines. A new optional field therefore
+  travels only between peers that both know it, which is why such a field must be
+  genuinely optional and why its absence has to mean something a peer can act on. It is
+  also what makes the no-place-to-put-a-secret guarantee at the end of this document
+  structural rather than aspirational — an extra property does not survive decoding.
+- **Growing a closed enum whose members cross the wire bumps the version**, for the same
+  reason a new frame type does: the receiver rejects the unknown member, so a peer written
+  against the older document drops traffic the newer one considers valid. This covers
+  channel kinds, refusal reasons, and the capability enums. Payload *message types* are
+  not enums in this sense — an unrecognised message parses to null and an endpoint ignores
+  it, which is how the terminal and job-control payload sets each shipped inside version 1.
 
 ## Frames
 
@@ -285,7 +297,10 @@ is still alive.
 
 ## Job-control channel payloads
 
-The `job-control` kind carries preview-server lifecycle. Messages ride as `json` payloads
+The `job-control` kind is the runner-level control channel: preview-server lifecycle, and the
+runner's capability state. It is runner-level rather than per-session, which is why exactly
+one of these channels exists per connection — a second would leave the control plane guessing
+which one a `PREVIEW_START` belongs on. Messages ride as `json` payloads
 inside ordinary `data` frames — no new frame types, no change to any existing field, and
 therefore no version bump: the set of wire-valid frames is unchanged, exactly as with the
 terminal payloads above. `job-control` has been a wire-valid kind since version 1 with its
@@ -305,6 +320,7 @@ Runner → control plane:
 | `PREVIEW_READY` | `previewId` · `port` | The preview is listening on the runner's loopback at this port. |
 | `PREVIEW_EXIT` | `previewId` · `exitCode` · `signal` | The preview process ended. |
 | `REFUSED` | `requestId` · `reason` | The runner declined a request, and why. |
+| `CAPABILITIES` | `capabilities` | What this machine can run. See "Capability payloads". |
 
 **The control plane names what to run, never how.** `recipe` is an identifier for a
 command line the runner holds locally; no command and no argument vector crosses this
@@ -357,6 +373,64 @@ its reason — `not-allowlisted`, `path-not-granted`, `runner-paused`, `non-loop
 `already-running`, `unknown-preview`, `spawn-failed`, `ambiguous-listener`, `at-capacity`. Nothing is held for a later attempt.
 This is the wire form of the seam's fourth principle: an offline or unwilling runner is
 visible, and a request that will not be served never looks like one still in progress.
+
+## Capability payloads
+
+`CAPABILITIES` carries what the runner can actually run, so the hosted Models surface offers
+only what a machine has. The runner-side contract — resolution, injection, endpoint dialing —
+is [`docs/model-access.md`](../../docs/model-access.md); this section is the wire form.
+
+**The probe shapes behind an endpoint's `reachable` and `models` are a proposal**, recorded
+in that document rather than here, and deliberately so: they are HTTP calls the runner makes
+to a service on its own machine, not traffic that crosses this seam, and the wire schema
+should not grow a section describing requests it never carries. They are a proposal for the
+same reason the pairing redemption shape above is one — Ollama's API belongs to its project
+and the OpenAI-compatible path is a de-facto convention, so both are strictly validated here
+and expected to be settled by whoever meets them next.
+
+It rides the job-control channel and not `hello`, deliberately. A `hello` shares one 1 MiB
+frame with a resume roster bounded at 1024 channels so the frame always fits; an oversized
+`hello` is terminal for the connection, and an operator-sized model inventory in the same
+frame would break that arithmetic — a large model library must not leave a runner unable to
+connect. A channel is also refreshable and sealable, so one mechanism serves the initial
+advertisement and every later change instead of two code paths for one fact.
+
+The snapshot is always **whole**, never a delta: a peer that missed an update must not be left
+reconstructing state from a partial history, and a replayed duplicate is then harmless.
+
+Access modes are `subscription`, `api-key` and `local`.
+Per-CLI auth states are `authenticated`, `unauthenticated` and `unknown` — `unknown` being the answer for a runtime that offers no way to ask, since reporting a signed-in CLI as signed out renders sign-in guidance at somebody already signed in.
+Endpoint kinds are `ollama` and `openai-compatible`.
+An unreachable endpoint names one of `not-running`, `refused`, `timed-out`, `unauthorized` or `unreadable-response`.
+
+| Field | Shape |
+|---|---|
+| `runtimes[]` | `runtime` (safe identifier) · `version` (≤64 chars, or `null` when the runtime would not say) · `auth` · `access[]` |
+| `endpoints[]` | `endpointId` (safe identifier) · `kind` · `reachable` · `models[]` · `modelCount` · `reason?` |
+
+**OS and architecture are already on `hello.runner`.** FR-10's advertisement is the two fields
+together, and a capability snapshot that restated them would be a second source of truth for
+something the handshake already says.
+
+**An advertisement is not an endpoint disclosure.** What crosses is the *fact* of a local
+endpoint — an opaque, operator-chosen id, its kind, its health and its inventory — never its
+URL, host, port or scheme, because those are on the seam's never-crosses list. The
+unreachable reason is enumerated for the same purpose: a transport error message carries the
+address it failed to reach, so free text here would leak precisely what the id withholds. The
+id is operator-chosen and never derived from the address; a hash of `http://127.0.0.1:<port>`
+has an input space of about 65,000 values and is brute-forced back to the port in
+milliseconds.
+
+**Everything is bounded, and truncation announces itself.** Runtimes cap at 32, endpoints at
+8, models at 64 per endpoint, model names at 128 characters and versions at 64. `modelCount`
+carries the true total, so a list shortened to fit says so rather than quietly lying —
+staleness is visible, never silent. An endpoint with nothing installed is a reachable endpoint
+with an empty inventory, not a failure.
+
+**Model names are not safe identifiers.** Real ones contain a colon
+(`llama3.1:8b-instruct-q4_K_M`), which the safe-segment rule rejects, so they cross as bounded
+strings free of control characters under their own rule — and therefore must never be used as
+a path segment on the runner.
 
 ## End-to-end capability
 
