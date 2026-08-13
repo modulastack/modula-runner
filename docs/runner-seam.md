@@ -33,9 +33,13 @@ remote), or the operator installs a customer-pinned artifact — the signed desk
 that Modula cannot replace at runtime. Runner-credential authority stays on the
 user's side in every deployment: the control plane that owns the runner's WebSocket
 mints, verifies and revokes the token it accepts — Modula never holds a credential that
-can connect as a runner. In hosted mode the coordination service brokers pairing as
-opaque account-level approval (device code in, approval out) and may demand revocation,
-but final credential issuance is the socket-owning plane's alone; a signed revocation
+can connect as a runner. In hosted mode the coordination service forwards pairing
+requests but cannot authorize them: the socket-owning control plane issues a runner
+credential only after verifying local operator approval, or an approval signed by a
+customer-held key it verifies independently — a coordinator assertion alone is never
+sufficient, so a compromised coordinator cannot pair a machine into your plane. The
+coordinator may demand revocation, but final credential issuance is the socket-owning
+plane's alone; a signed revocation
 event — operator-initiated on the control plane or account-initiated through the
 coordinator — marks the binding revoked, closes every connection authenticated by it,
 and makes every later upgrade with that token fail closed, so a revoked runner's
@@ -128,7 +132,7 @@ plane it is paired with; the control plane just lives with the user.
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free envelopes — end-to-end-sealed ones only once the #12 suite ships (v2). |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as forwarding only — issuance requires local operator approval or a customer-key signature the control plane verifies independently (v2, above) — and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free envelopes — end-to-end-sealed ones only once the #12 suite ships (v2). |
 | The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
