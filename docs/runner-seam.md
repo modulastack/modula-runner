@@ -23,15 +23,23 @@ works in only one topology is a bug in this document.
 controls in every deployment — the runner's own host (co-resident, today's default) or an
 always-on machine the team owns. What Modula operates in hosted mode is a thin
 **coordination service**: accounts and SSO, billing entitlements, device pairing and token
-revocation, presence aggregation, web-app delivery, content-free or sealed push envelopes,
-and a content-blind relay that joins the operator's browser — or a runner that cannot
-reach its control plane directly — to that control plane. The coordination service stores
-no project content: no plans, FRDs, boards, ledgers, receipts, transcripts, or memory; it
-sees connection metadata only. A relay operated by Modula must be content-blind from its
-first ship — TLS terminating on the user's plane (SNI passthrough) or `sealed` frames
-(schema, "End-to-end capability"). Nothing on this contract's wire changes: the runner
-still dials the control plane it is paired with; the control plane just lives with the
-user.
+revocation, presence aggregation, content-free or sealed push envelopes, and a
+content-blind relay that joins the operator's client — or a runner that cannot reach its
+control plane directly — to that control plane. The content-handling client is never
+Modula-delivered: the user's control plane serves the web client (through the relay when
+remote), or the operator installs a customer-pinned artifact — the signed desktop client —
+that Modula cannot replace at runtime. Runner-credential authority is singular per
+deployment: the plane the runner is paired to issues and revokes its token — the control
+plane when it terminates the runner's WebSocket itself (self-host), the coordination
+service when pairing is account-scoped (hosted) — and whichever plane accepts the upgrade
+verifies the issuer's signed status and rejects revoked credentials; two authorities never
+coexist for one binding. The coordination service stores no project content — no plans,
+FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
+carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
+delivery. A relay operated by Modula must be content-blind from its first ship — TLS
+terminating on the user's plane (SNI passthrough) or `sealed` frames (schema, "End-to-end
+capability"). Nothing on this contract's wire changes: the runner still dials the control
+plane it is paired with; the control plane just lives with the user.
 
 ## Principles
 
@@ -81,8 +89,8 @@ user.
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification store and fan-out; pairing and token issue/revocation; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
-| The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the web app is delivered by Modula's coordination service but talks to the user's control plane — directly over localhost adjacency, or through the content-blind relay (v2). |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the pairing authority (v2, above): the control plane itself in self-host, Modula's coordination service in hosted mode — and the plane accepting the WebSocket upgrade verifies the issuer's signed status and rejects revoked credentials. Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
+| The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
 
@@ -129,11 +137,11 @@ the same list. Toward the control plane, no frame ever carries:
   activity produces (terminal output, review findings), which are exactly the payloads
   the end-to-end capability seals
 
-Toward Modula's coordination service (hosted mode, v2), no message ever carries project
-content of any kind — plans, FRDs, boards, ledgers, receipts, transcripts, memory. The
-coordination plane handles accounts, entitlements, pairing, presence, and sealed or
-content-free envelopes; a duty that needs more than that belongs to the user's control
-plane, not to Modula.
+Toward Modula's coordination service (hosted mode, v2), no message ever exposes plaintext
+or otherwise readable project content. The coordination plane handles accounts,
+entitlements, pairing, presence, content-free envelopes, and ephemeral
+end-to-end-sealed envelopes it cannot decrypt and does not retain beyond delivery; a duty
+that requires readable content belongs to the user's control plane, not to Modula.
 
 Toward the runner, no frame ever carries: commands outside the runner's local allowlist,
 paths outside granted directories, or any extension of either. The control plane can ask;
