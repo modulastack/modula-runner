@@ -46,9 +46,11 @@ lease lapses — past that point the binding is already dead. Coordinator-broker
 carry a freshness lease the control plane renews against the coordinator, and every
 renewal verifies binding status — a binding with a pending revocation is refused renewal,
 so the pushed event is the fast path and the renewal check is the guaranteed one. When
-the coordinator is unreachable past the lease window those bindings fail closed — a
-revoked token can outlive its revocation only within the lease bound, never
-indefinitely. The coordination service stores no project content — no plans,
+the coordinator is unreachable past the lease window those bindings fail closed, and the
+lease lifetime is itself bounded by contract — the protocol schema fixes a normative
+maximum measured in hours, not days, and the control plane rejects renewal and upgrade
+alike past a binding's signed expiry — so a revoked token can outlive its revocation
+only within that short bound, never indefinitely. The coordination service stores no project content — no plans,
 FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
 carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
 delivery. A relay operated by Modula must be content-blind from its first ship, and
@@ -58,7 +60,12 @@ that terminated TLS for a client it delivers could tamper with the sealing code 
 `sealed` frames (schema, "End-to-end capability") may traverse a TLS-terminating relay
 only when the endpoint is a customer-pinned client whose artifact integrity is
 established independently of Modula; everywhere else they are defense-in-depth on top of
-passthrough, never a substitute for it. A relayed **runner** connection preserves
+passthrough, never a substitute for it. And passthrough is only as strong as its trust
+anchor, so the hostname and TLS identity stay customer-controlled: the certificate's
+private key and its issuance authority are inaccessible to Modula — a customer domain,
+or a delegated name whose issuance the customer holds — or the endpoint is the pinned
+desktop client, whose trust anchor never came from Modula at all. A deployment where
+Modula could mint the certificate is not passthrough, whatever the packets look like. A relayed **runner** connection preserves
 end-to-end TLS to the control plane always: its bearer credential rides the HTTP upgrade
 header, which frame sealing cannot protect — sealed frames protect payloads, never the
 upgrade. Nothing on this contract's wire changes: the runner still dials the control
