@@ -5,8 +5,9 @@
 PRD §14): the control plane itself runs on customer infrastructure, and a Modula-operated
 relay is content-blind from its first ship. The wire between the planes is unchanged.*
 
-This document is the contract between the two planes of Modula Stack: the hosted **control
-plane** (the web product) and the local **execution plane** (this runner). It enumerates
+This document is the contract between the two planes of Modula Stack: the **control
+plane** (the web product — customer-run in every deployment; v2, below) and the local
+**execution plane** (this runner). It enumerates
 what runs where, what travels between them, and what may never travel between them. The
 wire-level companion is the versioned protocol schema in
 [`packages/protocol`](../packages/protocol/SCHEMA.md).
@@ -40,10 +41,14 @@ and makes every later upgrade with that token fail closed, so a revoked runner's
 reconnect terminates as revoked, never as a retry. Operator-initiated revocation is
 immediate by construction: it happens on the plane that owns the socket.
 Account-initiated revocation is bounded, not assumed: the coordinator retries the signed
-event until the control plane acknowledges it, coordinator-brokered bindings carry a
-freshness lease the control plane renews against the coordinator, and when the
-coordinator is unreachable past the lease window those bindings fail closed — a revoked
-token can outlive its revocation only within the lease bound, never indefinitely. The coordination service stores no project content — no plans,
+event until the control plane acknowledges it, and retires the event once the binding's
+lease lapses — past that point the binding is already dead. Coordinator-brokered bindings
+carry a freshness lease the control plane renews against the coordinator, and every
+renewal verifies binding status — a binding with a pending revocation is refused renewal,
+so the pushed event is the fast path and the renewal check is the guaranteed one. When
+the coordinator is unreachable past the lease window those bindings fail closed — a
+revoked token can outlive its revocation only within the lease bound, never
+indefinitely. The coordination service stores no project content — no plans,
 FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
 carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
 delivery. A relay operated by Modula must be content-blind from its first ship, and
@@ -107,7 +112,7 @@ plane it is paired with; the control plane just lives with the user.
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
 | The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
