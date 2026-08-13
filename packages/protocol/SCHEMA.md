@@ -438,7 +438,9 @@ Version 1 relays session payloads through the control plane over TLS: the relay 
 read what it relays**, and product surfaces must say so honestly until end-to-end
 encryption ships. (Seam contract v2, 2026-08-13: that readable relay is only ever the
 user's own control plane — a relay operated by Modula is content-blind from its first
-ship, via TLS passthrough terminating on the user's plane or `sealed` payloads. Zero
+ship, via TLS passthrough terminating on the user's plane, or `sealed` payloads for
+browser sessions; a relayed runner WebSocket always uses passthrough, because its
+bearer credential rides the upgrade header that frame sealing cannot protect. Zero
 content custody, product PRD §14.) The frames are designed so that shipping it is a key
 exchange, not a redesign:
 

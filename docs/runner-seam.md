@@ -35,14 +35,19 @@ can connect as a runner. In hosted mode the coordination service brokers pairing
 opaque account-level approval (device code in, approval out) and may demand revocation,
 but final credential issuance is the socket-owning plane's alone; a signed revocation
 event — operator-initiated on the control plane or account-initiated through the
-coordinator — closes matching live connections immediately, never waiting for the next
-upgrade. The coordination service stores no project content — no plans,
+coordinator — marks the binding revoked, closes every connection authenticated by it
+immediately, and makes every later upgrade with that token fail closed, so a revoked
+runner's reconnect terminates as revoked, never as a retry. The coordination service stores no project content — no plans,
 FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
 carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
 delivery. A relay operated by Modula must be content-blind from its first ship — TLS
-terminating on the user's plane (SNI passthrough) or `sealed` frames (schema, "End-to-end
-capability"). Nothing on this contract's wire changes: the runner still dials the control
-plane it is paired with; the control plane just lives with the user.
+terminating on the user's plane (SNI passthrough), or `sealed` frames (schema, "End-to-end
+capability") for browser sessions. A relayed **runner** connection preserves end-to-end
+TLS to the control plane always: its bearer credential rides the HTTP upgrade header,
+which frame sealing cannot protect, so passthrough is the only blind transport for it —
+sealed frames protect payloads, never the upgrade. Nothing on this contract's wire
+changes: the runner still dials the control plane it is paired with; the control plane
+just lives with the user.
 
 ## Principles
 
@@ -92,7 +97,7 @@ plane it is paired with; the control plane just lives with the user.
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close matching live connections immediately. Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections immediately and fail every later upgrade with that token. Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
 | The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
