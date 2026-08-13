@@ -442,8 +442,11 @@ ship, with end-to-end TLS passthrough to the user's plane as the default posture
 browser sessions and runner WebSockets alike: the upgrade header cannot be frame-sealed,
 and a TLS-terminating relay could tamper with sealing code it delivers. `sealed`
 payloads may traverse a terminating relay only toward a customer-pinned client whose
-integrity is established independently of Modula. Zero content custody, product
-PRD §14.) The frames are designed so that shipping it is a key
+integrity is established independently of Modula — and only once the versioned
+sealed-suite contract ships (authenticated AEAD, enforced algorithms and nonce rules;
+tracked as #12): as reserved today, `sealed` is a frame shape, not an encryption
+guarantee, so until then a Modula-operated relay does not terminate TLS at all. Zero
+content custody, product PRD §14.) The frames are designed so that shipping it is a key
 exchange, not a redesign:
 
 - Routing (`type`, `channel`, `seq`) is separate from content (`payload`) in every

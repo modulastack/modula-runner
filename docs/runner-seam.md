@@ -48,19 +48,24 @@ renewal verifies binding status — a binding with a pending revocation is refus
 so the pushed event is the fast path and the renewal check is the guaranteed one. When
 the coordinator is unreachable past the lease window those bindings fail closed, and the
 lease lifetime is itself bounded by contract — the protocol schema fixes a normative
-maximum measured in hours, not days, and the control plane rejects renewal and upgrade
-alike past a binding's signed expiry — so a revoked token can outlive its revocation
-only within that short bound, never indefinitely. The coordination service stores no project content — no plans,
+maximum measured in hours, not days, with signed expiry rejected at renewal and upgrade
+alike (the schema slice defining these message shapes and validators is runner repo #11;
+hosted account-scoped pairing does not ship before it lands) — so a revoked token can
+outlive its revocation only within that short bound, never indefinitely. The coordination service stores no project content — no plans,
 FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
 carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
 delivery. A relay operated by Modula must be content-blind from its first ship, and
 **passthrough is the default posture**: end-to-end TLS to the user's plane (SNI
 passthrough) for every browser session that loads its client through the relay — a relay
 that terminated TLS for a client it delivers could tamper with the sealing code itself.
-`sealed` frames (schema, "End-to-end capability") may traverse a TLS-terminating relay
-only when the endpoint is a customer-pinned client whose artifact integrity is
-established independently of Modula; everywhere else they are defense-in-depth on top of
-passthrough, never a substitute for it. And passthrough is only as strong as its trust
+Today `sealed` is a reserved frame shape, not an encryption guarantee — so until the
+versioned sealed-suite contract ships (authenticated key exchange, enforced AEAD suite
+and nonce discipline, validator-rejected anything-else — runner repo #12), a
+Modula-operated relay does not terminate TLS at all, no exceptions. Once that contract
+exists, `sealed` frames may traverse a TLS-terminating relay only toward a
+customer-pinned client whose artifact integrity is established independently of Modula;
+everywhere else they are defense-in-depth on top of passthrough, never a substitute for
+it. And passthrough is only as strong as its trust
 anchor, so the hostname and TLS identity stay customer-controlled: the certificate's
 private key and its issuance authority are inaccessible to Modula — a customer domain,
 or a delegated name whose issuance the customer holds — or the endpoint is the pinned
@@ -79,12 +84,15 @@ plane it is paired with; the control plane just lives with the user.
 2. **Outbound only.** The runner dials one authenticated WebSocket out to the control
    plane. It listens on no inbound port. Everything the control plane wants from the
    runner arrives as a reply on that connection, never as a connection *to* the runner.
-3. **The control plane holds orchestration state and receipts, never secrets — and
-   Modula's servers hold neither.** Profile metadata, board state, round verdicts,
-   presence — control plane, yes. Credentials, endpoints, code checkouts — no. And since
-   the control plane runs on the user's infrastructure (v2, above), orchestration state
-   never lands on Modula's servers either: the coordination service keeps accounts,
-   entitlements, pairing, presence — connection metadata, not content.
+3. **The control plane holds orchestration state, receipts, and runner-credential
+   authority — never workload secrets — and Modula's servers hold none of it.** Profile
+   metadata, board state, round verdicts, presence, and the verifiers for the runner
+   tokens it mints (verifiers, never the bearer secret itself) belong on the control
+   plane; workload credentials — model keys, forge tokens, local endpoints — and code
+   checkouts stay on the runner. And since the control plane runs on the user's
+   infrastructure (v2, above), none of it lands on Modula's servers: the coordination
+   service keeps accounts, entitlements, pairing, presence — connection metadata, not
+   content, not credential material.
 4. **Staleness is visible, never silent.** When the runner is offline, hosted surfaces
    say so and say why. Nothing queues silently; nothing serves old data as current.
 5. **The relay routes, it does not need to read — and a Modula-operated relay may not.**
