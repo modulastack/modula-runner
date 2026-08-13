@@ -24,9 +24,10 @@ works in only one topology is a bug in this document.
 controls in every deployment — the runner's own host (co-resident, today's default) or an
 always-on machine the team owns. What Modula operates in hosted mode is a thin
 **coordination service**: accounts and SSO, billing entitlements, device pairing and token
-revocation, presence aggregation, content-free or sealed push envelopes, and a
-content-blind relay that joins the operator's client — or a runner that cannot reach its
-control plane directly — to that control plane. The content-handling client is never
+revocation, presence aggregation, content-free push envelopes — end-to-end-sealed ones
+only once the versioned sealed-suite contract ships (#12) — and a content-blind relay
+that joins the operator's client — or a runner that cannot reach its control plane
+directly — to that control plane. The content-handling client is never
 Modula-delivered: the user's control plane serves the web client (through the relay when
 remote), or the operator installs a customer-pinned artifact — the signed desktop client —
 that Modula cannot replace at runtime. Runner-credential authority stays on the
@@ -127,7 +128,7 @@ plane it is paired with; the control plane just lives with the user.
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as opaque approval only, and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free envelopes — end-to-end-sealed ones only once the #12 suite ships (v2). |
 | The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
@@ -177,9 +178,10 @@ the same list. Toward the control plane, no frame ever carries:
 
 Toward Modula's coordination service (hosted mode, v2), no message ever exposes plaintext
 or otherwise readable project content. The coordination plane handles accounts,
-entitlements, pairing, presence, content-free envelopes, and ephemeral
-end-to-end-sealed envelopes it cannot decrypt and does not retain beyond delivery; a duty
-that requires readable content belongs to the user's control plane, not to Modula.
+entitlements, pairing, presence, and content-free envelopes — plus, only once the
+versioned sealed suite ships (#12), ephemeral end-to-end-sealed envelopes it cannot
+decrypt and does not retain beyond delivery; a duty that requires readable content
+belongs to the user's control plane, not to Modula.
 
 Toward the runner, no frame ever carries: commands outside the runner's local allowlist,
 paths outside granted directories, or any extension of either. The control plane can ask;
