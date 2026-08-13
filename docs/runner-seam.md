@@ -40,14 +40,18 @@ immediately, and makes every later upgrade with that token fail closed, so a rev
 runner's reconnect terminates as revoked, never as a retry. The coordination service stores no project content — no plans,
 FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
 carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
-delivery. A relay operated by Modula must be content-blind from its first ship — TLS
-terminating on the user's plane (SNI passthrough), or `sealed` frames (schema, "End-to-end
-capability") for browser sessions. A relayed **runner** connection preserves end-to-end
-TLS to the control plane always: its bearer credential rides the HTTP upgrade header,
-which frame sealing cannot protect, so passthrough is the only blind transport for it —
-sealed frames protect payloads, never the upgrade. Nothing on this contract's wire
-changes: the runner still dials the control plane it is paired with; the control plane
-just lives with the user.
+delivery. A relay operated by Modula must be content-blind from its first ship, and
+**passthrough is the default posture**: end-to-end TLS to the user's plane (SNI
+passthrough) for every browser session that loads its client through the relay — a relay
+that terminated TLS for a client it delivers could tamper with the sealing code itself.
+`sealed` frames (schema, "End-to-end capability") may traverse a TLS-terminating relay
+only when the endpoint is a customer-pinned client whose artifact integrity is
+established independently of Modula; everywhere else they are defense-in-depth on top of
+passthrough, never a substitute for it. A relayed **runner** connection preserves
+end-to-end TLS to the control plane always: its bearer credential rides the HTTP upgrade
+header, which frame sealing cannot protect — sealed frames protect payloads, never the
+upgrade. Nothing on this contract's wire changes: the runner still dials the control
+plane it is paired with; the control plane just lives with the user.
 
 ## Principles
 
