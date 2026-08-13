@@ -436,8 +436,11 @@ a path segment on the runner.
 
 Version 1 relays session payloads through the control plane over TLS: the relay **can
 read what it relays**, and product surfaces must say so honestly until end-to-end
-encryption ships. The frames are designed so that shipping it is a key exchange, not a
-redesign:
+encryption ships. (Seam contract v2, 2026-08-13: that readable relay is only ever the
+user's own control plane — a relay operated by Modula is content-blind from its first
+ship, via TLS passthrough terminating on the user's plane or `sealed` payloads. Zero
+content custody, product PRD §14.) The frames are designed so that shipping it is a key
+exchange, not a redesign:
 
 - Routing (`type`, `channel`, `seq`) is separate from content (`payload`) in every
   session frame. The relay routes on the envelope alone.

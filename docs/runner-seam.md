@@ -1,7 +1,9 @@
 # The runner seam
 
-*Contract version 1 · 2026-08-09 · reconciled against upstream movement in
-[`seam-reconciliation.md`](seam-reconciliation.md).*
+*Contract version 2 · 2026-08-13 (v1 2026-08-09) · reconciled against upstream movement in
+[`seam-reconciliation.md`](seam-reconciliation.md). v2 records zero content custody (product
+PRD §14): the control plane itself runs on customer infrastructure, and a Modula-operated
+relay is content-blind from its first ship. The wire between the planes is unchanged.*
 
 This document is the contract between the two planes of Modula Stack: the hosted **control
 plane** (the web product) and the local **execution plane** (this runner). It enumerates
@@ -16,6 +18,21 @@ frames, and every localhost-adjacency assumption below becomes trivially true. C
 is the always-reachable special case of this contract, not a fork of it. Anything that
 works in only one topology is a bug in this document.
 
+**Where the control plane itself runs (v2).** Zero content custody (product PRD §14,
+2026-08-13) fixes the control plane's residency: it runs on infrastructure the user
+controls in every deployment — the runner's own host (co-resident, today's default) or an
+always-on machine the team owns. What Modula operates in hosted mode is a thin
+**coordination service**: accounts and SSO, billing entitlements, device pairing and token
+revocation, presence aggregation, web-app delivery, content-free or sealed push envelopes,
+and a content-blind relay that joins the operator's browser — or a runner that cannot
+reach its control plane directly — to that control plane. The coordination service stores
+no project content: no plans, FRDs, boards, ledgers, receipts, transcripts, or memory; it
+sees connection metadata only. A relay operated by Modula must be content-blind from its
+first ship — TLS terminating on the user's plane (SNI passthrough) or `sealed` frames
+(schema, "End-to-end capability"). Nothing on this contract's wire changes: the runner
+still dials the control plane it is paired with; the control plane just lives with the
+user.
+
 ## Principles
 
 1. **Execution follows the credentials.** Repos, git identity, CLI logins, API keys,
@@ -24,14 +41,18 @@ works in only one topology is a bug in this document.
 2. **Outbound only.** The runner dials one authenticated WebSocket out to the control
    plane. It listens on no inbound port. Everything the control plane wants from the
    runner arrives as a reply on that connection, never as a connection *to* the runner.
-3. **The hosted plane holds orchestration state and receipts, never secrets.** Profile
-   metadata, board state, round verdicts, presence — yes. Credentials, endpoints, code
-   checkouts — no.
+3. **The control plane holds orchestration state and receipts, never secrets — and
+   Modula's servers hold neither.** Profile metadata, board state, round verdicts,
+   presence — control plane, yes. Credentials, endpoints, code checkouts — no. And since
+   the control plane runs on the user's infrastructure (v2, above), orchestration state
+   never lands on Modula's servers either: the coordination service keeps accounts,
+   entitlements, pairing, presence — connection metadata, not content.
 4. **Staleness is visible, never silent.** When the runner is offline, hosted surfaces
    say so and say why. Nothing queues silently; nothing serves old data as current.
-5. **The relay routes, it does not need to read.** Session payloads are structured so a
-   later end-to-end encryption mode changes keys, not frames (schema, "End-to-end
-   capability").
+5. **The relay routes, it does not need to read — and a Modula-operated relay may not.**
+   Session payloads are structured so end-to-end sealing changes keys, not frames (schema,
+   "End-to-end capability"). A readable relay is only ever the user's own control plane;
+   any relay Modula operates is content-blind from its first ship (v2).
 
 ## Executes on the runner
 
@@ -53,15 +74,15 @@ works in only one topology is a bug in this document.
 | Pairing and the runner's own credential | A pairing code enters through the local terminal and no other path — prompted for rather than passed as an argument, since arguments are readable by any local process, the same exposure this contract already forbids for secrets; and is redeemed outbound. The minted per-runner token lives in an encrypted local store and authenticates one WebSocket. Revocation is the control plane refusing the upgrade, which ends the binding rather than starting a retry. |
 | The local floor | Command allowlist (ships signed, editable only locally), per-directory consent, kill switch, append-only local audit log. Enforced here, configurable only here. |
 
-## Stays on the control plane
+## Stays on the control plane (user-run in every deployment — v2)
 
 | Duty | Notes |
 |---|---|
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification fan-out; pairing and token issue/revocation; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). |
-| The web UI and relay | Serves the browser, relays session frames between browser and runner. |
+| Notifications and admin | Notification store and fan-out; pairing and token issue/revocation; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Remote delivery while the operator is away rides Modula's coordination service as content-free or sealed envelopes (v2). |
+| The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the web app is delivered by Modula's coordination service but talks to the user's control plane — directly over localhost adjacency, or through the content-blind relay (v2). |
 
 ## The wire between them
 
@@ -107,6 +128,12 @@ the same list. Toward the control plane, no frame ever carries:
 - Repo contents as such — code moves only as session payloads the operator's own
   activity produces (terminal output, review findings), which are exactly the payloads
   the end-to-end capability seals
+
+Toward Modula's coordination service (hosted mode, v2), no message ever carries project
+content of any kind — plans, FRDs, boards, ledgers, receipts, transcripts, memory. The
+coordination plane handles accounts, entitlements, pairing, presence, and sealed or
+content-free envelopes; a duty that needs more than that belongs to the user's control
+plane, not to Modula.
 
 Toward the runner, no frame ever carries: commands outside the runner's local allowlist,
 paths outside granted directories, or any extension of either. The control plane can ask;
