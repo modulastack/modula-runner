@@ -3,6 +3,11 @@
 *2026-08-09 · input to [`runner-seam.md`](runner-seam.md); written before the first line of
 protocol code.*
 
+**v2 note (2026-08-13):** partially superseded by [`runner-seam.md`](runner-seam.md)
+Contract v2 (zero content custody): the plane this note calls *hosted* is customer-run in
+every deployment, and the v1 readable-relay posture applies only to the user's own control
+plane — a relay operated by Modula is content-blind from its first ship.
+
 The runner's seam was specified while the control plane kept shipping. Before this
 repository commits to a contract, this note pins the upstream changes that landed after the
 seam was first drafted and derives what each one means for the seam and the protocol. The
@@ -86,12 +91,13 @@ credential stays on the runner, or a self-hosted review stack beside the user's 
 
 - Review execution is an execution-plane job like any other lane — same channel classes,
   no special transport, nothing for the protocol to add.
-- The hosted plane orchestrates rounds and stores verdicts and receipts. To be precise
-  about what that means: the review *input* — the checkout, the diff — never leaves the
-  runner; *findings*, including whatever evidence a reviewer quotes, are orchestration
-  artifacts the operator's UI displays, and in the split they transit the relay the same
-  way terminal output does — readable by the relay in v1, sealable under §4 once
-  end-to-end encryption ships.
+- The control plane (customer-run in every deployment — v2 note above) orchestrates
+  rounds and stores verdicts and receipts. To be precise about what that means: the
+  review *input* — the checkout, the diff — never leaves the runner; *findings*,
+  including whatever evidence a reviewer quotes, are orchestration artifacts the
+  operator's UI displays, and in the split they transit the same wire terminal output
+  does — readable in v1 only by the user's own control plane (a Modula-operated relay is
+  content-blind from first ship, v2), sealable under §4 on top.
 - The inbound problem folds in here: review triggers are webhook-shaped, the runner
   accepts no inbound connections, and a LAN-only forge can reach nothing hosted. Direction
   recorded now: forge events reach the reviewer either co-resident (forge and reviewer on
@@ -104,8 +110,9 @@ credential stays on the runner, or a self-hosted review stack beside the user's 
 
 **Posture.** Version 1 relays session payloads through the control plane over TLS. The
 relay can read what it relays, and hosted-mode product copy must say so plainly until
-end-to-end encryption ships. What is non-negotiable now is that shipping it later must be
-a key exchange away, not a redesign.
+end-to-end encryption ships. (v2: that readable relay is only ever the user's own control
+plane — a Modula-operated relay is content-blind from its first ship.) What is
+non-negotiable now is that shipping it later must be a key exchange away, not a redesign.
 
 **Design, implemented in the schema now:**
 

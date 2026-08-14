@@ -1,10 +1,13 @@
 # The runner seam
 
-*Contract version 1 · 2026-08-09 · reconciled against upstream movement in
-[`seam-reconciliation.md`](seam-reconciliation.md).*
+*Contract version 2 · 2026-08-13 (v1 2026-08-09) · reconciled against upstream movement in
+[`seam-reconciliation.md`](seam-reconciliation.md). v2 records zero content custody (product
+PRD §14): the control plane itself runs on customer infrastructure, and a Modula-operated
+relay is content-blind from its first ship. The wire between the planes is unchanged.*
 
-This document is the contract between the two planes of Modula Stack: the hosted **control
-plane** (the web product) and the local **execution plane** (this runner). It enumerates
+This document is the contract between the two planes of Modula Stack: the **control
+plane** (the web product — customer-run in every deployment; v2, below) and the local
+**execution plane** (this runner). It enumerates
 what runs where, what travels between them, and what may never travel between them. The
 wire-level companion is the versioned protocol schema in
 [`packages/protocol`](../packages/protocol/SCHEMA.md).
@@ -16,6 +19,68 @@ frames, and every localhost-adjacency assumption below becomes trivially true. C
 is the always-reachable special case of this contract, not a fork of it. Anything that
 works in only one topology is a bug in this document.
 
+**Where the control plane itself runs (v2).** Zero content custody (product PRD §14,
+2026-08-13) fixes the control plane's residency: it runs on infrastructure the user
+controls in every deployment — the runner's own host (co-resident, today's default) or an
+always-on machine the team owns. What Modula operates in hosted mode is a thin
+**coordination service**: accounts and SSO, billing entitlements, device pairing and token
+revocation, presence aggregation, content-free push envelopes — end-to-end-sealed ones
+only once the versioned sealed-suite contract ships (#12) — and a content-blind relay
+that joins the operator's client — or a runner that cannot reach its control plane
+directly — to that control plane. The content-handling client is never
+Modula-delivered: the user's control plane serves the web client (through the relay when
+remote), or the operator installs a customer-pinned artifact — the signed desktop client —
+that Modula cannot replace at runtime. Runner-credential authority stays on the
+user's side in every deployment: the control plane that owns the runner's WebSocket
+mints, verifies and revokes the token it accepts — Modula never holds a credential that
+can connect as a runner. In hosted mode the coordination service forwards pairing
+requests but cannot authorize them: the socket-owning control plane issues a runner
+credential only after verifying local operator approval, or an approval signed by a
+customer-held key it verifies independently — a coordinator assertion alone is never
+sufficient, so a compromised coordinator cannot pair a machine into your plane. The
+coordinator may demand revocation, but final credential issuance is the socket-owning
+plane's alone; a signed revocation
+event — operator-initiated on the control plane or account-initiated through the
+coordinator — marks the binding revoked, closes every connection authenticated by it,
+and makes every later upgrade with that token fail closed, so a revoked runner's
+reconnect terminates as revoked, never as a retry. Operator-initiated revocation is
+immediate by construction: it happens on the plane that owns the socket.
+Account-initiated revocation is bounded, not assumed: the coordinator retries the signed
+event until the control plane acknowledges it, and retires the event once the binding's
+lease lapses — past that point the binding is already dead. Coordinator-brokered bindings
+carry a freshness lease the control plane renews against the coordinator, and every
+renewal verifies binding status — a binding with a pending revocation is refused renewal,
+so the pushed event is the fast path and the renewal check is the guaranteed one. When
+the coordinator is unreachable past the lease window those bindings fail closed, and the
+lease lifetime is itself bounded by contract — the protocol schema fixes a normative
+maximum measured in hours, not days, with signed expiry rejected at renewal and upgrade
+alike (the schema slice defining these message shapes and validators is runner repo #11;
+hosted account-scoped pairing does not ship before it lands) — so a revoked token can
+outlive its revocation only within that short bound, never indefinitely. The coordination service stores no project content — no plans,
+FRDs, boards, ledgers, receipts, transcripts, or memory; beyond connection metadata it
+carries only end-to-end-sealed ciphertext it cannot decrypt and does not retain past
+delivery. A relay operated by Modula must be content-blind from its first ship, and
+**passthrough is the default posture**: end-to-end TLS to the user's plane (SNI
+passthrough) for every browser session that loads its client through the relay — a relay
+that terminated TLS for a client it delivers could tamper with the sealing code itself.
+Today `sealed` is a reserved frame shape, not an encryption guarantee — so until the
+versioned sealed-suite contract ships (authenticated key exchange, enforced AEAD suite
+and nonce discipline, validator-rejected anything-else — runner repo #12), a
+Modula-operated relay does not terminate TLS at all, no exceptions. Once that contract
+exists, `sealed` frames may traverse a TLS-terminating relay only toward a
+customer-pinned client whose artifact integrity is established independently of Modula;
+everywhere else they are defense-in-depth on top of passthrough, never a substitute for
+it. And passthrough is only as strong as its trust
+anchor, so the hostname and TLS identity stay customer-controlled: the certificate's
+private key and its issuance authority are inaccessible to Modula — a customer domain,
+or a delegated name whose issuance the customer holds — or the endpoint is the pinned
+desktop client, whose trust anchor never came from Modula at all. A deployment where
+Modula could mint the certificate is not passthrough, whatever the packets look like. A relayed **runner** connection preserves
+end-to-end TLS to the control plane always: its bearer credential rides the HTTP upgrade
+header, which frame sealing cannot protect — sealed frames protect payloads, never the
+upgrade. Nothing on this contract's wire changes: the runner still dials the control
+plane it is paired with; the control plane just lives with the user.
+
 ## Principles
 
 1. **Execution follows the credentials.** Repos, git identity, CLI logins, API keys,
@@ -24,14 +89,21 @@ works in only one topology is a bug in this document.
 2. **Outbound only.** The runner dials one authenticated WebSocket out to the control
    plane. It listens on no inbound port. Everything the control plane wants from the
    runner arrives as a reply on that connection, never as a connection *to* the runner.
-3. **The hosted plane holds orchestration state and receipts, never secrets.** Profile
-   metadata, board state, round verdicts, presence — yes. Credentials, endpoints, code
-   checkouts — no.
+3. **The control plane holds orchestration state, receipts, and runner-credential
+   authority — never workload secrets — and Modula's servers hold none of it.** Profile
+   metadata, board state, round verdicts, presence, and the verifiers for the runner
+   tokens it mints (verifiers, never the bearer secret itself) belong on the control
+   plane; workload credentials — model keys, forge tokens, local endpoints — and code
+   checkouts stay on the runner. And since the control plane runs on the user's
+   infrastructure (v2, above), none of it lands on Modula's servers: the coordination
+   service keeps accounts, entitlements, pairing, presence — connection metadata, not
+   content, not credential material.
 4. **Staleness is visible, never silent.** When the runner is offline, hosted surfaces
    say so and say why. Nothing queues silently; nothing serves old data as current.
-5. **The relay routes, it does not need to read.** Session payloads are structured so a
-   later end-to-end encryption mode changes keys, not frames (schema, "End-to-end
-   capability").
+5. **The relay routes, it does not need to read — and a Modula-operated relay may not.**
+   Session payloads are structured so end-to-end sealing changes keys, not frames (schema,
+   "End-to-end capability"). A readable relay is only ever the user's own control plane;
+   any relay Modula operates is content-blind from its first ship (v2).
 
 ## Executes on the runner
 
@@ -46,22 +118,22 @@ works in only one topology is a bug in this document.
 | Endpoint configuration | Local model endpoints are configured, never discovered: the runner does not scan loopback ports. Its ids are operator-chosen and never derived from an address. |
 | Advisory review execution | Review rounds run here; the code under review never leaves the machine. |
 | Coms pools | Agent-to-agent coms transport: unix sockets, registries, and standing-peer attach points live beside the worktrees they serve. |
-| Preview servers and browser-QA targets | **Detected and terminated off-loopback, not prevented from binding there** — see the schema. Bind to the runner's localhost; the operator's browser is on the same machine (split) or same host (co-resident), so no tunneling. The binding is verified against the process's real listening sockets before its port is reported, because a command is free to bind more than it was configured with. Only the port crosses — a host or URL would be an endpoint. |
+| Preview servers and browser-QA targets | **Detected and terminated off-loopback, not prevented from binding there** — see the schema. Bind to the runner's localhost; the operator's browser is on the same machine (split) or same host (co-resident), so no tunneling. The binding is verified against the process's real listening sockets before its port is reported, because a command is free to bind more than it was configured with. Only the port crosses — a host or URL would be an endpoint. (v2) A co-resident affordance by design: a remote client reached through the relay cannot resolve the runner's loopback, so remote sessions surface previews as local-to-the-runner-host with an explicit reason, never a dead link; a sealed preview tunnel over the runner's outbound connection is future work, and no preview traffic transits Modula readable before it exists. |
 | Preview process ownership | Previews are spawned into their own process group, and the runner tracks them by group membership as well as parentage — a wrapper that spawns a detached child and exits leaves that child adopted by init, where no ancestry walk finds it again. A descendant that deliberately calls `setsid` escapes both, and closing that needs an OS containment unit: a cgroup on Linux, with no clean equivalent on macOS. Deferred rather than hidden — the runner's own recipes are the only commands it will start, so the escape requires a recipe the operator installed locally. |
 | Preview exposure before verification | A preview is spawned in the host's network namespace, so between spawn and the first successful inspection a recipe that ignores the loopback hint can accept external connections. The window is bounded — readiness polls from 50 ms, the tree is settled before readiness is granted, and the sweep re-checks continuously — but it is not zero, and only OS-level network isolation (a network namespace on Linux, no clean equivalent on macOS) closes it. Deferred and stated rather than implied: the exposure requires a recipe the operator installed locally, since the control plane cannot supply a command line. |
 | Preview working directory | The grant is checked on the resolved real path, the command is spawned into that resolved path rather than the caller's, and on Linux the running process's own working directory is read back and re-checked against the grants. A platform without that read-back keeps a narrow window between resolving a path and entering it. |
 | Pairing and the runner's own credential | A pairing code enters through the local terminal and no other path — prompted for rather than passed as an argument, since arguments are readable by any local process, the same exposure this contract already forbids for secrets; and is redeemed outbound. The minted per-runner token lives in an encrypted local store and authenticates one WebSocket. Revocation is the control plane refusing the upgrade, which ends the binding rather than starting a retry. |
 | The local floor | Command allowlist (ships signed, editable only locally), per-directory consent, kill switch, append-only local audit log. Enforced here, configurable only here. |
 
-## Stays on the control plane
+## Stays on the control plane (user-run in every deployment — v2)
 
 | Duty | Notes |
 |---|---|
 | Project registry and boards | Projects, jobs, flight plan, presence rendering. |
 | Planning surfaces | FRD studio, planner, validation ledger, receipts. |
 | Coms hub reasoning | The Lead's reasoning loop and page bots — the *consumers* of coms traffic. Their pool attach points are runner-side (see reconciliation §1). |
-| Notifications and admin | Notification fan-out; pairing and token issue/revocation; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). |
-| The web UI and relay | Serves the browser, relays session frames between browser and runner. |
+| Notifications and admin | Notification store and fan-out; profile metadata (provider, model, mode, label — plus at most a key's label and last-four fingerprint). Runner-credential issue/revocation belongs to the socket-owning control plane in every deployment (v2, above); hosted pairing rides the coordination service as forwarding only — issuance requires local operator approval or a customer-key signature the control plane verifies independently (v2, above) — and signed revocation events close live connections and fail every later upgrade with that token — account-initiated revocation renewal-verified, ack-retried and lease-bounded, fail-closed past the lease window (v2, above). Remote delivery while the operator is away rides Modula's coordination service as content-free envelopes — end-to-end-sealed ones only once the #12 suite ships (v2). |
+| The web UI and relay | Serves the browser, relays session frames between browser and runner. In hosted mode the content-handling web client is still served by the user's control plane — directly over localhost adjacency, or through the content-blind relay; Modula delivers only account and pairing surfaces, and the signed desktop client is a customer-pinned artifact Modula cannot replace at runtime (v2). |
 
 ## The wire between them
 
@@ -107,6 +179,13 @@ the same list. Toward the control plane, no frame ever carries:
 - Repo contents as such — code moves only as session payloads the operator's own
   activity produces (terminal output, review findings), which are exactly the payloads
   the end-to-end capability seals
+
+Toward Modula's coordination service (hosted mode, v2), no message ever exposes plaintext
+or otherwise readable project content. The coordination plane handles accounts,
+entitlements, pairing, presence, and content-free envelopes — plus, only once the
+versioned sealed suite ships (#12), ephemeral end-to-end-sealed envelopes it cannot
+decrypt and does not retain beyond delivery; a duty that requires readable content
+belongs to the user's control plane, not to Modula.
 
 Toward the runner, no frame ever carries: commands outside the runner's local allowlist,
 paths outside granted directories, or any extension of either. The control plane can ask;
