@@ -61,6 +61,14 @@ The path to a runner that executes real jobs against a hosted control plane:
 the runner and pairing protocol — findings triaged, highs fixed, report published in this
 repository. Recurs on major protocol revisions.
 
+## Pre-audit verification
+
+Before that external audit, the split earns two internal passes: the runner exercised end to
+end through its CLI the way an operator uses it, and an adversarial general and security review
+at higher capability than it was built with. Both are scoped in
+[`docs/frd-runner-verification.md`](docs/frd-runner-verification.md); their findings feed back
+into the security and release slices, and then the external audit begins.
+
 ## After the split
 
 Future work, each item becoming its own spec before it's built:
