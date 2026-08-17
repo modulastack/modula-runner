@@ -7,11 +7,32 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RunnerClient, type RunnerClientOptions } from '../src/client.js'
 import { TerminalHost, type TerminalHostOptions } from '../src/terminalHost.js'
-import { captureTmuxScrollback, exitTmuxCopyMode, hasTmuxSession, killTmuxSession, paneStatus, paneWatcherCount, tmuxSessionPresence } from '../src/tmux.js'
+import {
+  captureTmuxScrollback as captureTmuxScrollbackRaw,
+  exitTmuxCopyMode as exitTmuxCopyModeRaw,
+  hasTmuxSession as hasTmuxSessionRaw,
+  killTmuxSession as killTmuxSessionRaw,
+  paneStatus as paneStatusRaw,
+  paneWatcherCount,
+  tmuxSessionPresence as tmuxSessionPresenceRaw,
+  type TmuxRef,
+} from '../src/tmux.js'
 import type { TerminalClientMessage } from '@modulastack/runner-protocol'
 import type { TerminalLaunchSpec } from '../src/terminalSession.js'
 import { StubControlPlane, type StubOptions } from './stubControlPlane.js'
 import { sleep, testRunnerInfo, until } from './helpers.js'
+import { permissiveSpawnSeam } from './spawnSeamSupport.js'
+
+// The tmux driver now takes the spawn seam; these tests exercise the terminal stack, not the
+// allowlist, so a permissive seam is bound once and the call sites read unchanged.
+const testSeam = permissiveSpawnSeam()
+const hasTmuxSession = (ref: TmuxRef) => hasTmuxSessionRaw(ref, testSeam)
+const killTmuxSession = (ref: TmuxRef) => killTmuxSessionRaw(ref, testSeam)
+const tmuxSessionPresence = (ref: TmuxRef) => tmuxSessionPresenceRaw(ref, testSeam)
+const paneStatus = (ref: TmuxRef) => paneStatusRaw(ref, testSeam)
+const exitTmuxCopyMode = (ref: TmuxRef) => exitTmuxCopyModeRaw(ref, testSeam)
+const captureTmuxScrollback = (ref: TmuxRef, lines: number, stillWanted?: () => boolean) =>
+  captureTmuxScrollbackRaw(ref, lines, testSeam, stillWanted)
 
 type Rig = {
   stub: StubControlPlane
@@ -34,13 +55,13 @@ afterEach(async () => {
   rigs = []
 })
 
-async function createRig(options: { stub?: StubOptions; client?: Partial<RunnerClientOptions>; host?: TerminalHostOptions } = {}): Promise<Rig> {
+async function createRig(options: { stub?: StubOptions; client?: Partial<RunnerClientOptions>; host?: Partial<TerminalHostOptions> } = {}): Promise<Rig> {
   const stub = await new StubControlPlane(options.stub ?? {}).start()
   const client = new RunnerClient({ url: stub.url, token: 'stub-token', runner: testRunnerInfo, backoff: { baseMs: 20, capMs: 50 }, ...options.client })
   const connected = once(client, 'connected')
   client.connect()
   await connected
-  const host = new TerminalHost(client, options.host ?? {})
+  const host = new TerminalHost(client, { seam: permissiveSpawnSeam(), ...options.host })
   const cwd = mkdtempSync(path.join(tmpdir(), 'mr-term-test-'))
   const socket = `mr-test-${randomBytes(4).toString('hex')}`
   const rig = { stub, client, host, cwd, socket }

@@ -13,8 +13,12 @@ import {
   type TerminalSessionEvents,
 } from './terminalSession.js'
 import { killTmuxSession, type TmuxRef } from './tmux.js'
+import type { SpawnSeam } from './spawnSeam.js'
 
 export type TerminalHostOptions = {
+  // Every pane the host launches spawns its command and its tmux through this gate: the seam
+  // is what makes the pane surface obey the runner's local command allowlist.
+  seam: SpawnSeam
   flow?: Partial<FlowPolicy>
   replayLines?: number
   pollMs?: number
@@ -59,8 +63,10 @@ export class TerminalHost {
   private shuttingDown = false
   private shutdown: Promise<string[]> | undefined
   private readonly policy: SessionPolicy
+  private readonly seam: SpawnSeam
 
-  constructor(private readonly client: RunnerClient, options: TerminalHostOptions = {}) {
+  constructor(private readonly client: RunnerClient, options: TerminalHostOptions) {
+    this.seam = options.seam
     this.policy = {
       flow: validatedFlow({ ...DEFAULT_FLOW, ...options.flow }),
       replayLines: validatedLines(options.replayLines ?? DEFAULT_REPLAY_LINES),
@@ -75,12 +81,12 @@ export class TerminalHost {
 
   launch(spec: TerminalLaunchSpec) {
     this.assertOpen()
-    return this.track(this.bind(channel => TerminalSession.launch(spec, this.policy, this.sessionEvents(channel))))
+    return this.track(this.bind(channel => TerminalSession.launch(spec, this.policy, this.sessionEvents(channel), this.seam)))
   }
 
   adopt(ref: TmuxRef, spec: TerminalAdoptSpec) {
     this.assertOpen()
-    return this.track(this.bind(channel => TerminalSession.adopt(ref, spec, this.policy, this.sessionEvents(channel))))
+    return this.track(this.bind(channel => TerminalSession.adopt(ref, spec, this.policy, this.sessionEvents(channel), this.seam)))
   }
 
   // Starting a session while the host is killing them would race the shutdown
@@ -127,7 +133,7 @@ export class TerminalHost {
       } catch {}
     }
     for (const [name, ref] of [...this.orphans]) {
-      if (await killTmuxSession(ref)) this.orphans.delete(name)
+      if (await killTmuxSession(ref, this.seam)) this.orphans.delete(name)
       else unconfirmed.push(name)
     }
     this.shuttingDown = false

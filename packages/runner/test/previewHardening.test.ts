@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { parseJobControlClientMessage } from '@modulastack/runner-protocol'
 import { PreviewHost, RunnerIdentity, createEncryptedPairingStore, createMemoryPairingStore } from '../src/index.js'
 import { until } from './helpers.js'
+import { grantingSpawnSeam } from './spawnSeamSupport.js'
 
 const hosts: PreviewHost[] = []
 const paths: string[] = []
@@ -23,10 +24,8 @@ async function workspace() {
 }
 
 function host(root: string, script: string, readyTimeoutMs = 4_000) {
-  const created = new PreviewHost({
-    allowlist: { recipes: { app: { command: process.execPath, args: [script] } }, grantedPaths: [root] },
-    readyTimeoutMs,
-  })
+  const { seam, consent } = grantingSpawnSeam({ app: { command: process.execPath, args: [script] } }, [root])
+  const created = new PreviewHost({ seam, consent, readyTimeoutMs })
   hosts.push(created)
   return created
 }
@@ -132,11 +131,8 @@ describe('preview hardening', () => {
     const root = await workspace()
     const script = join(root, 'server.mjs')
     await writeFile(script, "import {createServer} from 'node:http'\ncreateServer((q,s)=>s.end('ok')).listen(0,'127.0.0.1')\n")
-    const previews = new PreviewHost({
-      allowlist: { recipes: { app: { command: process.execPath, args: [script] } }, grantedPaths: [root] },
-      readyTimeoutMs: 4_000,
-      maxPreviews: 2,
-    })
+    const capped = grantingSpawnSeam({ app: { command: process.execPath, args: [script] } }, [root])
+    const previews = new PreviewHost({ seam: capped.seam, consent: capped.consent, readyTimeoutMs: 4_000, maxPreviews: 2 })
     hosts.push(previews)
 
     const first = await previews.start({ previewId: 'one', recipe: 'app', cwd: root })

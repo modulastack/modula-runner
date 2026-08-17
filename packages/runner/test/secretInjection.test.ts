@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { SecretEnv } from '../src/secretEnv.js'
 import { DEFAULT_FLOW, DEFAULT_POLL_MS, DEFAULT_REPLAY_LINES, TerminalSession, UnkillableSessionError } from '../src/terminalSession.js'
 import { until } from './helpers.js'
+import { permissiveSpawnSeam } from './spawnSeamSupport.js'
 
 // FR-11's env-only rule, exercised through the real tmux and pty path rather than argued
 // about. Three things are being checked, and the second and third are the ones that a
@@ -75,7 +76,7 @@ async function launch(lane: Lane, name: string, secrets?: SecretEnv) {
     cwd: lane.root,
     socket: lane.socket,
     ...(secrets ? { secrets } : {}),
-  }, POLICY, EVENTS)
+  }, POLICY, EVENTS, permissiveSpawnSeam())
   lane.sessions.push(session)
   await until(() => existsSync(dumped.dump))
   return dumped.read()
@@ -171,7 +172,7 @@ describe('secret injection', () => {
       cwd: worktree.root,
       socket: worktree.socket,
       secrets: SecretEnv.of({ ANTHROPIC_API_KEY: SECRET }),
-    }, POLICY, EVENTS)
+    }, POLICY, EVENTS, permissiveSpawnSeam())
 
     // The path that skips the ordinary cleanup: the kill could not be confirmed, so the
     // launch leaves by throwing rather than by tidying up after itself. That is precisely
@@ -194,7 +195,7 @@ describe('secret injection', () => {
         cwd: worktree.root,
         socket: worktree.socket,
         secrets: SecretEnv.of({ [reserved]: '/tmp/somewhere-of-my-choosing' }),
-      }, POLICY, EVENTS)
+      }, POLICY, EVENTS, permissiveSpawnSeam())
 
       await expect(launch).rejects.toThrow(/reserves these variable names/)
     }
@@ -218,7 +219,7 @@ describe('secret injection', () => {
       // of the vulnerability above — so it is pinned here rather than left to be noticed.
       env: { MODULA_RUNNER_EXIT_FILE: '/tmp/not-the-exit-file', MODULA_RUNNER_SECRET_FILE: '/tmp/not-the-handoff' },
       secrets: SecretEnv.of({ ANTHROPIC_API_KEY: SECRET }),
-    }, POLICY, EVENTS)
+    }, POLICY, EVENTS, permissiveSpawnSeam())
     worktree.sessions.push(session)
     await until(() => existsSync(dumped.dump))
 
@@ -239,7 +240,7 @@ describe('secret injection', () => {
       socket: worktree.socket,
       env: { MODULA_RUNNER_LANE: 'coder' },
       secrets: SecretEnv.of({ OLLAMA_HOST: 'http://127.0.0.1:59137' }),
-    }, POLICY, EVENTS)
+    }, POLICY, EVENTS, permissiveSpawnSeam())
     worktree.sessions.push(session)
     await until(() => existsSync(dumped.dump))
 

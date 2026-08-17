@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { validateHeaderValue } from 'node:http'
 import { isSafeIdentifier, type RunnerInfo } from '@modulastack/runner-protocol'
 import { assertSecureControlPlaneUrl } from './secureUrl.js'
@@ -288,6 +289,13 @@ function bindingFromResponse(body: unknown, base: URL): RunnerBinding {
 
 // Phase two. A failure here leaves the binding pending rather than lost: the token is
 // already durable, so a later run resumes the confirmation instead of spending a new code.
+//
+// The runner token never rides this request. It authenticates the WebSocket and nothing else
+// (FR-17), so putting it on a non-upgrade HTTP call — where a proxy or access log along the way
+// could capture it — is exactly the exposure that rule forbids. The confirm proves the runner
+// holds the pending token by presenting a one-way digest of it: the control plane, which minted
+// the token, recomputes the same digest and matches. Replay is harmless because confirmation is
+// idempotent, and the digest reveals nothing about the token itself.
 export async function confirmPairing(binding: RunnerBinding) {
   const base = assertSecureControlPlaneUrl(binding.controlPlaneUrl)
   const endpoint = new URL(CONFIRM_PATH, base)
@@ -295,8 +303,8 @@ export async function confirmPairing(binding: RunnerBinding) {
   try {
     response = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${binding.token}` },
-      body: JSON.stringify({ runnerId: binding.runnerId }),
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runnerId: binding.runnerId, tokenProof: confirmationProof(binding.token) }),
       redirect: 'error',
       signal: AbortSignal.timeout(REDEEM_TIMEOUT_MS),
     })
@@ -310,6 +318,12 @@ export async function confirmPairing(binding: RunnerBinding) {
     // runs on every start until it succeeds.
     await response.body?.cancel().catch(() => undefined)
   }
+}
+
+// A one-way proof of token possession for the confirmation request, so the credential itself
+// never leaves the runner except on the WebSocket upgrade it authenticates.
+function confirmationProof(token: string): string {
+  return createHash('sha256').update(token).digest('hex')
 }
 
 // A code that cannot be a code never becomes a request: the control plane should not be

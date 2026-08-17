@@ -3,10 +3,23 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import type { SpawnSeam } from './spawnSeam.js'
 
 export type TmuxRef = {
   socket: string
   sessionName: string
+}
+
+// tmux is one allowlisted executable driven on a short leash. Every invocation passes the
+// seam: the session's own lifecycle — creating it and killing it — is gated and audited like
+// any runner-owned spawn, and the high-frequency control calls that operate an
+// already-authorized session (presence, status, capture, copy-mode, the poll listing) are
+// gated by the cheap `check` so a denied `tmux` policy stops them without flooding the audit
+// log with a record per poll.
+const TMUX_DENIED = 'tmux is not on the runner command allowlist'
+
+function tmuxAllowed(seam: SpawnSeam) {
+  return seam.check('tmux')
 }
 
 export type TmuxLaunch = TmuxRef & {
@@ -68,26 +81,41 @@ function serverConfigPath() {
   return serverConfigFile
 }
 
-export async function startTmuxSession(launch: TmuxLaunch) {
+export async function startTmuxSession(launch: TmuxLaunch, seam: SpawnSeam) {
   const envArgs = Object.entries(launch.env ?? {}).flatMap(([key, value]) => ['-e', `${key}=${value}`])
   const args = ['-L', launch.socket, '-f', serverConfigPath(), 'new-session', '-d', '-s', launch.sessionName, '-c', launch.cwd, ...envArgs, '--', launch.file, ...launch.args]
   // Session variables ride the per-session `-e` arguments only. Seeding them
   // into the process that may *start* the server would hand every later
   // session on that socket the first session's environment.
-  const failure = await runTmux(args, process.env)
+  // Creating the session is the audited lifecycle spawn: it runs the pane's command, and a
+  // denied allowlist stops it here rather than after the process exists.
+  const failure = await runTmuxAudited(seam, args, launch.cwd, process.env)
   if (failure) throw new Error(failure)
   // tmux can exit zero and still not create the session (an unusable socket
   // path reports its error without a failing status); trust the session, not
   // the exit code.
-  if (!(await hasTmuxSession(launch))) throw new Error('tmux session was not created')
+  if (!(await hasTmuxSession(launch, seam))) throw new Error('tmux session was not created')
 }
 
-function runTmux(args: string[], env: NodeJS.ProcessEnv): Promise<string | null> {
+function execTmux(args: string[], env: NodeJS.ProcessEnv): Promise<string | null> {
   return new Promise(resolve => {
     execFile('tmux', args, { encoding: 'utf8', timeout: TMUX_TIMEOUT_MS, env }, (error, stdout, stderr) => {
       resolve(error ? (stderr || stdout || 'tmux command failed').trim() : null)
     })
   })
+}
+
+// A lifecycle tmux command: gated and audited through the seam. Refusal reads as a command
+// failure, which is exactly how the callers already treat an unavailable tmux.
+async function runTmuxAudited(seam: SpawnSeam, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  const result = await seam.run(
+    { kind: 'tmux', executable: 'tmux', args, cwd, grantScoped: false },
+    async () => {
+      const failure = await execTmux(args, env)
+      return { outcome: failure ? { spawnFailed: true } : { exitCode: 0, signal: null }, value: failure }
+    },
+  )
+  return result.status === 'refused' ? TMUX_DENIED : result.value
 }
 
 export type SessionPresence = 'present' | 'absent' | 'unknown'
@@ -96,7 +124,10 @@ export type SessionPresence = 'present' | 'absent' | 'unknown'
 // timeout, a signal — means the question went unanswered. Collapsing the two
 // would let an operational failure masquerade as a dead session and retire a
 // command that is still running.
-export function tmuxSessionPresence(ref: TmuxRef): Promise<SessionPresence> {
+export function tmuxSessionPresence(ref: TmuxRef, seam: SpawnSeam): Promise<SessionPresence> {
+  // A poll on an already-created session: gated, not audited. A denied policy makes the
+  // answer 'unknown' — the runner cannot ask, which is not the same as the session being gone.
+  if (!tmuxAllowed(seam)) return Promise.resolve('unknown')
   return new Promise(resolve => {
     execFile('tmux', ['-L', ref.socket, 'has-session', '-t', `=${ref.sessionName}`], { timeout: TMUX_TIMEOUT_MS }, error => {
       if (!error) return resolve('present')
@@ -105,8 +136,8 @@ export function tmuxSessionPresence(ref: TmuxRef): Promise<SessionPresence> {
   })
 }
 
-export async function hasTmuxSession(ref: TmuxRef): Promise<boolean> {
-  return (await tmuxSessionPresence(ref)) === 'present'
+export async function hasTmuxSession(ref: TmuxRef, seam: SpawnSeam): Promise<boolean> {
+  return (await tmuxSessionPresence(ref, seam)) === 'present'
 }
 
 function answered(error: unknown) {
@@ -117,13 +148,19 @@ function answered(error: unknown) {
 // The kill is verified, never assumed: a timed-out or failed kill would leave
 // the command running while its watcher was torn down, so the caller learns
 // whether the session is actually gone.
-export async function killTmuxSession(ref: TmuxRef): Promise<boolean> {
-  const before = await tmuxSessionPresence(ref)
+export async function killTmuxSession(ref: TmuxRef, seam: SpawnSeam): Promise<boolean> {
+  const before = await tmuxSessionPresence(ref, seam)
   if (before === 'absent') return true
   // An unanswered question is not a confirmed kill: the caller keeps watching.
   if (before === 'unknown') return false
-  await runTmux(['-L', ref.socket, 'kill-session', '-t', `=${ref.sessionName}`], process.env)
-  return (await tmuxSessionPresence(ref)) === 'absent'
+  // Teardown, not a new workload: gated like the other control operations, never routed through
+  // the fail-closed audited spawn. A malicious pane must stay terminable when the audit log is
+  // down — a full disk must not become a way to keep a process alive — and the teardown is
+  // accounted for by the kill switch's own durable record and the pane's outcome, not a per-kill
+  // audit that could refuse. A denied policy leaves the session unconfirmed rather than killed.
+  if (!tmuxAllowed(seam)) return false
+  await execTmux(['-L', ref.socket, 'kill-session', '-t', `=${ref.sessionName}`], process.env)
+  return (await tmuxSessionPresence(ref, seam)) === 'absent'
 }
 
 export function tmuxAttachArgs(ref: TmuxRef) {
@@ -136,7 +173,8 @@ export function tmuxAttachArgs(ref: TmuxRef) {
 // `stillWanted` is consulted after the wait, not before it: by the time a queued
 // capture reaches the front, the session that asked for it may be gone, and
 // running it would spend a subprocess on output nobody will read.
-export async function captureTmuxScrollback(ref: TmuxRef, lines: number, stillWanted: () => boolean = () => true): Promise<string | null> {
+export async function captureTmuxScrollback(ref: TmuxRef, lines: number, seam: SpawnSeam, stillWanted: () => boolean = () => true): Promise<string | null> {
+  if (!tmuxAllowed(seam)) return null
   if (!(await acquireCaptureSlot())) return null
   try {
     return stillWanted() ? await runCapture(ref, lines) : null
@@ -181,7 +219,8 @@ export type PaneStatus = { held: boolean; dead: boolean }
 
 // Async for the same reason capture is: this runs on a poll interval, and a
 // slow tmux server must cost one late answer, never a blocked event loop.
-export function paneStatus(ref: TmuxRef): Promise<PaneStatus | null> {
+export function paneStatus(ref: TmuxRef, seam: SpawnSeam): Promise<PaneStatus | null> {
+  if (!tmuxAllowed(seam)) return Promise.resolve(null)
   return new Promise(resolve => {
     execFile('tmux', ['-L', ref.socket, 'display-message', '-p', '-t', paneTarget(ref), '#{pane_in_mode} #{pane_dead}'], { encoding: 'utf8', timeout: TMUX_TIMEOUT_MS }, (error, stdout) => {
       if (error) return resolve(null)
@@ -191,10 +230,25 @@ export function paneStatus(ref: TmuxRef): Promise<PaneStatus | null> {
   })
 }
 
+// The pane process's pid, so its actual working directory can be read back after launch and
+// re-checked against the grant. A control call on an already-authorized session, gated by the
+// cheap `check` like the other polls; null when the pane pid cannot be read.
+export function panePid(ref: TmuxRef, seam: SpawnSeam): Promise<number | null> {
+  if (!tmuxAllowed(seam)) return Promise.resolve(null)
+  return new Promise(resolve => {
+    execFile('tmux', ['-L', ref.socket, 'display-message', '-p', '-t', paneTarget(ref), '#{pane_pid}'], { encoding: 'utf8', timeout: TMUX_TIMEOUT_MS }, (error, stdout) => {
+      if (error) return resolve(null)
+      const pid = Number.parseInt(stdout.trim(), 10)
+      resolve(Number.isInteger(pid) && pid > 0 ? pid : null)
+    })
+  })
+}
+
 // Async because it runs on the message path: repeated SCROLL_RESETs against a
 // wedged server must not stall every stream and heartbeat. The result is
 // honest — a failed cancel must not be reported as a released hold.
-export function exitTmuxCopyMode(ref: TmuxRef): Promise<boolean> {
+export function exitTmuxCopyMode(ref: TmuxRef, seam: SpawnSeam): Promise<boolean> {
+  if (!tmuxAllowed(seam)) return Promise.resolve(false)
   return new Promise(resolve => {
     execFile('tmux', ['-L', ref.socket, 'send-keys', '-t', paneTarget(ref), '-X', 'cancel'], { timeout: TMUX_TIMEOUT_MS }, error => resolve(!error))
   })
@@ -206,6 +260,9 @@ type SocketWatch = {
   inFlight: boolean
   queued: boolean
   observers: Map<string, Set<PaneObserver>>
+  // The seam the poll listing passes: stored here because the poll fires from a timer, detached
+  // from the caller that set the watch up.
+  seam: SpawnSeam
 }
 
 export type PaneObserver = (status: PaneStatus) => void
@@ -215,8 +272,8 @@ const watches = new Map<string, SocketWatch>()
 // One poll per tmux server, not per session: a server with fifty sessions costs
 // one `list-panes` per interval instead of fifty `display-message` processes,
 // which is the difference between a poll and a fork bomb.
-export function watchPane(ref: TmuxRef, intervalMs: number, observer: PaneObserver): () => void {
-  const watch = ensureWatch(ref.socket, intervalMs)
+export function watchPane(ref: TmuxRef, intervalMs: number, observer: PaneObserver, seam: SpawnSeam): () => void {
+  const watch = ensureWatch(ref.socket, intervalMs, seam)
   const observers = watch.observers.get(ref.sessionName) ?? new Set<PaneObserver>()
   observers.add(observer)
   watch.observers.set(ref.sessionName, observers)
@@ -227,7 +284,7 @@ export function paneWatcherCount() {
   return watches.size
 }
 
-function ensureWatch(socket: string, intervalMs: number) {
+function ensureWatch(socket: string, intervalMs: number, seam: SpawnSeam) {
   const existing = watches.get(socket)
   if (existing && existing.intervalMs <= intervalMs) return existing
   if (existing) clearInterval(existing.timer)
@@ -236,6 +293,7 @@ function ensureWatch(socket: string, intervalMs: number) {
     inFlight: false,
     queued: false,
     observers: existing?.observers ?? new Map(),
+    seam,
     timer: setInterval(() => requestPoll(socket), intervalMs),
   }
   watches.set(socket, watch)
@@ -292,7 +350,7 @@ async function runPoll(socket: string) {
   // before it existed, and reporting it as dead would retire a live command
   // the moment it launched.
   const watched = [...watch.observers.keys()]
-  const panes = await listPanes(socket)
+  const panes = await listPanes(socket, watch.seam)
   watch.inFlight = false
   activePolls -= 1
   drainPollQueue()
@@ -306,7 +364,8 @@ async function runPoll(socket: string) {
   }
 }
 
-function listPanes(socket: string): Promise<Map<string, PaneStatus> | null> {
+function listPanes(socket: string, seam: SpawnSeam): Promise<Map<string, PaneStatus> | null> {
+  if (!tmuxAllowed(seam)) return Promise.resolve(null)
   const args = ['-L', socket, 'list-panes', '-a', '-F', '#{session_name}\t#{pane_in_mode}\t#{pane_dead}']
   return new Promise(resolve => {
     execFile('tmux', args, { encoding: 'utf8', timeout: TMUX_TIMEOUT_MS }, (error, stdout) => {

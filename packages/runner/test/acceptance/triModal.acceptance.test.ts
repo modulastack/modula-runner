@@ -20,6 +20,7 @@ import {
 import { StubControlPlane } from '../stubControlPlane.js'
 import { testRunnerInfo, until } from '../helpers.js'
 import { binding, identityWithBinding, token } from './support.js'
+import { permissiveSpawnSeam } from '../spawnSeamSupport.js'
 import {
   allProcessArguments,
   apiKeyBody,
@@ -91,7 +92,7 @@ async function project() {
   const endpoint = await startEndpointServer({ models: [installedModel] })
   servers.push(endpoint)
   const endpoints = new LocalEndpointRegistry([{ endpointId: 'desk-ollama', kind: 'ollama', baseUrl: endpoint.baseUrl }])
-  const capabilities = new CapabilityMonitor({ runtimes, endpoints })
+  const capabilities = new CapabilityMonitor({ seam: permissiveSpawnSeam(), runtimes, endpoints })
   monitors.push(capabilities)
   await capabilities.refresh()
   const keys: ApiKeyStore = createMemoryApiKeyStore()
@@ -105,7 +106,7 @@ async function project() {
   clients.push(client)
   client.connect()
   await until(() => client.isConnected())
-  const host = new TerminalHost(client, { pollMs: 50 })
+  const host = new TerminalHost(client, { seam: permissiveSpawnSeam(), pollMs: 50 })
   hosts.push(host)
   return { root, socket, dumps, resolver, keys, endpoint, plane, host }
 }

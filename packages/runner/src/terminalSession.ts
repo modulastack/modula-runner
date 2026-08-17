@@ -1,5 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { constants as osConstants, tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import * as pty from 'node-pty'
@@ -9,6 +9,8 @@ import {
   exitTmuxCopyMode,
   hasTmuxSession,
   killTmuxSession,
+  panePid,
+  paneStatus,
   tmuxSessionPresence,
   startTmuxSession,
   watchPane,
@@ -18,7 +20,10 @@ import {
   type PaneStatus,
   type TmuxRef,
 } from './tmux.js'
+import { processCwdReadBackAvailable, workingDirectoryOf } from './listeningSockets.js'
 import type { SecretEnv } from './secretEnv.js'
+import { completeDurably, type Authorization, type SpawnSeam } from './spawnSeam.js'
+import type { SpawnOutcome } from './auditLog.js'
 
 export type FlowPolicy = { highWaterBytes: number; lowWaterBytes: number; flushMs: number }
 
@@ -35,6 +40,11 @@ const PRE_INIT_BUFFER_BYTES = 256 * 1024
 // both that and the reset-provoked replay loop with one mechanism.
 const REPLAY_BURST = 3
 const REPLAY_REFILL_MS = 2_000
+// A withheld pane EXIT whose outcome append kept failing is re-driven on this slow cadence until
+// the record is durable — a burst inside `completeDurably` is bounded, but the outcome must survive
+// an outage that outlasts one burst. Paced well above the burst's own retry so an audit outage
+// stays a slow retry, never a tight loop.
+const EXIT_OUTCOME_REDRIVE_MS = 1_000
 
 const EXIT_FILE_ENV = 'MODULA_RUNNER_EXIT_FILE'
 // The wrapper writes the wrapped command's exit code before the tmux session can
@@ -91,6 +101,10 @@ type SessionInit = {
   exitDir?: string
   policy: SessionPolicy
   events: TerminalSessionEvents
+  seam: SpawnSeam
+  // The seam's outcome callback for the pane's logical command, whose lifetime is the session:
+  // called once the session ends so the pane command's admission is answered by its outcome.
+  paneComplete: (outcome: SpawnOutcome) => Promise<void>
 }
 
 const MAX_METADATA_LENGTH = 1024
@@ -163,6 +177,20 @@ export class UnkillableSessionError extends Error {
   }
 }
 
+// A pane that was admitted and launched, then found to have landed outside a live grant, so it
+// was terminated and refused. Distinct from a failed launch: the command ran, so its admission is
+// answered with a terminated outcome and the escape is audited as `path-not-granted`, not
+// `spawn-failed`. A sentinel so the launch teardown records the security refusal rather than the
+// generic failed-launch outcome.
+class PaneLandingRefused extends Error {}
+
+// The outcome recorded for a pane the runner terminated because it landed outside its grant. It
+// ran, so `spawnFailed` would misreport it; the exact delivered signal is not observable once the
+// session is killed through tmux, so the runner's forced termination is recorded as a kill.
+function terminatedPaneOutcome(): SpawnOutcome {
+  return { exitCode: null, signal: osConstants.signals.SIGKILL }
+}
+
 export class TerminalSession {
   readonly id: string
   readonly profile: string
@@ -171,6 +199,10 @@ export class TerminalSession {
   readonly ref: TmuxRef
   private readonly policy: SessionPolicy
   private readonly events: TerminalSessionEvents
+  private readonly seam: SpawnSeam
+  private readonly paneComplete: (outcome: SpawnOutcome) => Promise<void>
+  private paneCompleted = false
+  private exitRedrive: NodeJS.Timeout | undefined
   private readonly exitDir: string | undefined
   private attachPty: pty.IPty | undefined
   private phase: Phase = 'starting'
@@ -231,7 +263,7 @@ export class TerminalSession {
     return this.phase === 'starting' || this.phase === 'streaming' || this.phase === 'killing'
   }
 
-  static async launch(spec: TerminalLaunchSpec, policy: SessionPolicy, events: TerminalSessionEvents) {
+  static async launch(spec: TerminalLaunchSpec, policy: SessionPolicy, events: TerminalSessionEvents, seam: SpawnSeam) {
     // Validated before anything runs: a launch this runner would reject must
     // not leave the command's side effects behind on its way to being refused.
     const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
@@ -239,6 +271,17 @@ export class TerminalSession {
     // Checked here as well as where the file is written, so a refused launch leaves no temp
     // directory and spawns no tmux call on its way out.
     if (spec.secrets) assertInjectableNames(spec.secrets)
+    // The pane's LOGICAL command is the allowlisted unit, gated before any tmux runs: allowing
+    // the tmux wrapper must never implicitly allow an arbitrary command inside it. A refused
+    // command throws before a temp directory or a tmux session exists, and the refusal is
+    // audited like every other runner-owned spawn.
+    const authorized = await seam.authorize({ kind: 'pane', executable: spec.command, cwd: spec.cwd, grantScoped: true })
+    if (authorized.status === 'refused') throw new Error(`command is not on the runner allowlist: ${spec.command}`)
+    const paneComplete = authorized.authorization.complete
+    // The command launches in the RESOLVED real directory the seam authorized, not the caller's
+    // pathname: a symlink swapped between the grant check and the tmux call would otherwise run an
+    // allowlisted command outside the grant.
+    const vettedCwd = authorized.authorization.vetted.cwd
     const exitDir = mkdtempSync(path.join(tmpdir(), 'modula-runner-'))
     const id = randomUUID()
     const ref = { socket: spec.socket ?? worktreeSocket(spec.cwd), sessionName: tmuxSessionName(spec.cwd, id) }
@@ -249,8 +292,10 @@ export class TerminalSession {
       handoff = writeSecretHandoff(exitDir, spec.secrets)
       await startTmuxSession({
         ...ref,
-        cwd: spec.cwd,
+        cwd: vettedCwd,
         file: '/bin/sh',
+        // The seam gates and audits the session's creation — the one tmux call that launches
+        // the pane's command.
         args: ['-c', handoff ? `${SECRET_PRELUDE}${EXIT_WRAPPER}` : EXIT_WRAPPER, spec.command, ...(spec.args ?? [])],
         // Only the PATH of the handoff rides tmux's `-e` arguments, never its contents: a
         // path is not a credential, and this one names a file no other user can open.
@@ -259,11 +304,43 @@ export class TerminalSession {
         // caller's, so `env` cannot redirect the wrapper's reads the way a secret under a
         // reserved name would. A test pins it, because reversing a spread is an easy edit.
         env: { ...spec.env, [EXIT_FILE_ENV]: path.join(exitDir, 'exit-code'), ...(handoff ? { [SECRET_FILE_ENV]: handoff } : {}) },
-      })
-      const session = new TerminalSession({ id, spec: normalized, ref, exitDir, policy, events })
+      }, seam)
+      // Launching in the resolved real directory closes the check-to-spawn window; the pane is
+      // now read back to close what remains — the resolved path can be renamed or replaced, or
+      // its inode moved, between the tmux call and the pane entering it. Where the pane actually
+      // landed is re-checked against the same live grant the admission used, before it is ever
+      // reported ready.
+      if (!(await TerminalSession.paneLandedInsideGrant(ref, authorized.authorization, seam))) throw new PaneLandingRefused()
+      const session = new TerminalSession({ id, spec: normalized, ref, exitDir, policy, events, seam, paneComplete })
       session.attach()
       return session
     } catch (error) {
+      // A pane caught outside its grant is a live process running where it was never authorized,
+      // so it is killed FIRST — before its outcome is recorded — because the teardown must not be
+      // gated on an audit log that may be down; then its admission is answered with a terminated
+      // outcome and the escape is audited as path-not-granted, the same shape a preview refused by
+      // its own read-back records. The credential is cleared first either way.
+      if (error instanceof PaneLandingRefused) {
+        removeHandoff(handoff)
+        const killed = (await killTmuxSession(ref, seam)) || (await killTmuxSession(ref, seam))
+        if (!killed) throw new UnkillableSessionError(ref)
+        try {
+          rmSync(exitDir, { recursive: true, force: true })
+        } catch {}
+        let durable = await completeDurably(paneComplete, terminatedPaneOutcome())
+        await seam.recordRefusal({ kind: 'pane', executable: spec.command, cwd: vettedCwd, grantScoped: true }, 'path-not-granted')
+        // AS-21: the rejection is withheld until the terminated outcome is durable, re-driven on a
+        // slow cadence (unref'd) so a transient audit outage does not strand the launch — it rejects
+        // once the record lands, resuming when the log recovers rather than hanging forever.
+        while (!durable) {
+          await new Promise<void>(resolve => { const t = setTimeout(resolve, EXIT_OUTCOME_REDRIVE_MS); t.unref?.() })
+          durable = await completeDurably(paneComplete, terminatedPaneOutcome())
+        }
+        throw new Error(`command landed outside a granted directory: ${spec.command}`)
+      }
+      // The pane command was admitted but its session could not be brought up, so its admission
+      // is answered as a spawn that did not take — retried through a transient audit failure.
+      let durable = await completeDurably(paneComplete, { spawnFailed: true })
       // The credential goes first, before anything that can throw on the way out. An
       // unconfirmed kill leaves by a path that skips the cleanup below, and that is exactly
       // the case where a plaintext hand-off would be left on disk — the moment the promise
@@ -279,22 +356,61 @@ export class TerminalSession {
       // A session that cannot be confirmed dead keeps its tmux session and its
       // exit file: deleting state a live command still writes to, and reporting
       // the original failure alone, would hide a running process nobody owns.
-      const killed = (await killTmuxSession(ref)) || (await killTmuxSession(ref))
+      const killed = (await killTmuxSession(ref, seam)) || (await killTmuxSession(ref, seam))
       if (!killed) throw new UnkillableSessionError(ref)
       try {
         rmSync(exitDir, { recursive: true, force: true })
       } catch {}
+      // AS-21: the rejection is the acknowledgment, and a caller never sees the launch fail before
+      // the record of why is durable. The rejection is withheld until the outcome is durable,
+      // re-driven on a slow cadence (unref'd) so a transient audit outage does not strand the launch
+      // — it resumes when the log recovers rather than hanging on a promise that never settles; the
+      // audit writer's onFailure marks a persistent outage.
+      while (!durable) {
+        await new Promise<void>(resolve => { const t = setTimeout(resolve, EXIT_OUTCOME_REDRIVE_MS); t.unref?.() })
+        durable = await completeDurably(paneComplete, { spawnFailed: true })
+      }
       throw error
     }
   }
 
+  // The pane's actual working directory, read back after launch and re-checked against the same
+  // live grant the admission used. True when the pane is inside a live grant — or when the platform
+  // exposes no process cwd at all, the documented residual where confinement rests on the
+  // resolved-path spawn alone. False when a platform that CAN answer proves the pane landed outside
+  // its grant, or cannot rule it out while the pane is still alive: unknown-while-alive fails closed
+  // rather than stand in for granted. A pane that has already ended leaves nothing running to
+  // contain, so an unreadable pid/cwd there is the documented fast-exit residual, not a refusal —
+  // the seam contract records it, and a reliable pre-command cwd capture that would close it is
+  // tracked in #16.
+  private static async paneLandedInsideGrant(ref: TmuxRef, authorization: Authorization, seam: SpawnSeam): Promise<boolean> {
+    const verifyLanding = authorization.verifyLanding
+    if (!verifyLanding) return true
+    if (!processCwdReadBackAvailable()) return true
+    const pid = await panePid(ref, seam)
+    if (pid === null) return await TerminalSession.paneAlreadyEnded(ref, seam)
+    const actual = await workingDirectoryOf(pid)
+    if (actual === null) return await TerminalSession.paneAlreadyEnded(ref, seam)
+    return await verifyLanding(actual)
+  }
+
+  // Only an ended pane makes an unreadable cwd harmless: a live pane whose directory cannot be read
+  // is exactly the unknown the read-back must not wave through, so an unanswerable status fails
+  // closed too.
+  private static async paneAlreadyEnded(ref: TmuxRef, seam: SpawnSeam): Promise<boolean> {
+    const status = await paneStatus(ref, seam)
+    return status === null ? false : status.dead
+  }
+
   // Reattach to a tmux session that outlived its host process. The original exit
   // file is gone with the old host, so an adopted session reports a null exit code.
-  static async adopt(ref: TmuxRef, spec: TerminalAdoptSpec, policy: SessionPolicy, events: TerminalSessionEvents) {
+  static async adopt(ref: TmuxRef, spec: TerminalAdoptSpec, policy: SessionPolicy, events: TerminalSessionEvents, seam: SpawnSeam) {
     const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
     assertSessionMetadata(normalized)
-    if (!(await hasTmuxSession(ref))) throw new Error(`no tmux session to adopt: ${ref.sessionName}`)
-    const session = new TerminalSession({ spec: normalized, ref, policy, events })
+    if (!(await hasTmuxSession(ref, seam))) throw new Error(`no tmux session to adopt: ${ref.sessionName}`)
+    // A reattach spawns no command — the pane's command ran under the original launch that
+    // gated it — so there is no fresh admission to answer here.
+    const session = new TerminalSession({ spec: normalized, ref, policy, events, seam, paneComplete: async () => undefined })
     session.attach()
     return session
   }
@@ -311,6 +427,8 @@ export class TerminalSession {
     this.exitDir = init.exitDir
     this.policy = init.policy
     this.events = init.events
+    this.seam = init.seam
+    this.paneComplete = init.paneComplete
   }
 
   isFinished() {
@@ -356,7 +474,7 @@ export class TerminalSession {
     if (!this.live || this.killPending) return
     const resume = this.phase
     this.phase = 'killing'
-    void killTmuxSession(this.ref).then(killed => {
+    void killTmuxSession(this.ref, this.seam).then(killed => {
       if (this.disposed) return
       this.killUnconfirmed = !killed
       if (!killed) {
@@ -412,7 +530,7 @@ export class TerminalSession {
     const previous = this.phase
     if (killSession) {
       this.phase = 'killing'
-      if (!(await killTmuxSession(this.ref))) {
+      if (!(await killTmuxSession(this.ref, this.seam))) {
         this.killUnconfirmed = true
         if (this.phase === 'killing') this.phase = previous
         return false
@@ -422,6 +540,10 @@ export class TerminalSession {
     this.phase = 'disposed'
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = undefined
+    // The withheld-EXIT re-drive stops with disposal: a fatal audit outage stays withheld rather
+    // than resuming after the session is gone, the same posture the audit writer's onFailure marks.
+    if (this.exitRedrive) clearTimeout(this.exitRedrive)
+    this.exitRedrive = undefined
     this.stopPoll()
     // The reference is dropped before the kill so a throwing attachment cannot
     // strand cleanup behind it, or reject out of a shutdown that then never
@@ -458,6 +580,10 @@ export class TerminalSession {
   }
 
   private attach() {
+    // Attaching a viewer spawns a tmux client, so it passes the same gate. In the normal flow
+    // the session's creation already cleared it; this keeps the "every tmux invocation passes
+    // the seam" rule true even if a policy changed between create and attach.
+    if (!this.seam.check('tmux')) return
     const proc = pty.spawn('tmux', tmuxAttachArgs(this.ref), {
       name: 'xterm-256color',
       cols: this.cols,
@@ -484,7 +610,7 @@ export class TerminalSession {
     this.flowPaused = false
     if (this.disposed || this.finished) return
     if (this.exitPending) return this.completeExit()
-    void tmuxSessionPresence(this.ref).then(presence => {
+    void tmuxSessionPresence(this.ref, this.seam).then(presence => {
       if (this.disposed || this.finished || this.exitPending) return
       // An INIT may have re-attached while the question was in flight; a second
       // client would duplicate every byte the first one delivers.
@@ -548,15 +674,53 @@ export class TerminalSession {
     // The ring is emitted exactly once, here: every exit path passes through
     // this point, and it clears itself once delivered.
     this.emitPreInitTail()
-    this.events.send({ type: 'EXIT', ...this.readExit() })
+    // The sequenced EXIT is the operation's acknowledgment, and the pane command's outcome
+    // record must be durable before it goes out: a viewer must not learn the pane ended before
+    // the runner's own log of how. The synchronous state above is settled first so a re-entrant
+    // completeExit returns early while this tail runs.
+    void this.emitExit(this.readExit())
+  }
+
+  private async emitExit(exit: { exitCode: number | null; signal: number | null }) {
+    // The pane command's admission is answered by the session's own end-of-life, since the
+    // command's lifetime is the session's. Once, because every exit path lands here.
+    if (!this.paneCompleted) {
+      const outcome: SpawnOutcome = exit.exitCode !== null ? { exitCode: exit.exitCode, signal: null } : exit.signal !== null ? { exitCode: null, signal: exit.signal } : { spawnFailed: true }
+      // AS-21: the sequenced EXIT is the acknowledgment, and it must not be sent before the pane's
+      // outcome record is durable. A burst inside `completeDurably` just failed, so the EXIT is
+      // withheld and re-driven on a slow cadence until the append recovers — then the outcome
+      // records and the tail below runs. A persistent outage is surfaced by the audit writer's
+      // onFailure and never emits EXIT; disposal stops the re-drive.
+      if (!(await completeDurably(this.paneComplete, outcome))) return this.scheduleExitRedrive(exit)
+      this.paneCompleted = true
+    }
+    if (this.exitRedrive) {
+      clearTimeout(this.exitRedrive)
+      this.exitRedrive = undefined
+    }
+    this.events.send({ type: 'EXIT', ...exit })
     // The end-of-stream is out and the scrollback has been replayed: the dead
     // pane kept alive to carry it can go now.
     if (this.deadPaneKillPending) {
       this.deadPaneKillPending = false
-      void killTmuxSession(this.ref)
+      void killTmuxSession(this.ref, this.seam)
     }
     this.removeExitDir()
     this.events.onExited()
+  }
+
+  // Keeps a withheld EXIT scheduled: one timer re-entering emitExit on a slow cadence, so a log
+  // that recovers after more than one burst records the outcome and releases the EXIT, its cleanup,
+  // and onExited. Not scheduled once disposed — the machinery stops there and the withheld EXIT
+  // stays withheld rather than becoming an acknowledgment with no durable outcome behind it.
+  private scheduleExitRedrive(exit: { exitCode: number | null; signal: number | null }) {
+    if (this.disposed) return
+    if (this.exitRedrive) return
+    this.exitRedrive = setTimeout(() => {
+      this.exitRedrive = undefined
+      void this.emitExit(exit)
+    }, EXIT_OUTCOME_REDRIVE_MS)
+    this.exitRedrive.unref?.()
   }
 
   // A foreground command killed by signal N reports `$? = 128 + N`, which is the
@@ -729,7 +893,7 @@ export class TerminalSession {
     const superseded = this.outputQueue
     this.outputQueue = []
     this.queuedBytes = 0
-    void captureTmuxScrollback(this.ref, this.policy.replayLines, () => !this.disposed && !this.finished)
+    void captureTmuxScrollback(this.ref, this.policy.replayLines, this.seam, () => !this.disposed && !this.finished)
       .then(data => this.emitReplay(data, superseded))
       .then(() => {
         this.replaying = false
@@ -791,7 +955,7 @@ export class TerminalSession {
   private resetScroll() {
     if (this.scrollResetting) return
     this.scrollResetting = true
-    void exitTmuxCopyMode(this.ref).then(ok => {
+    void exitTmuxCopyMode(this.ref, this.seam).then(ok => {
       this.scrollResetting = false
       if (this.disposed) return
       if (!ok) return this.events.send({ type: 'ERROR', message: 'scroll reset failed' })
@@ -806,7 +970,7 @@ export class TerminalSession {
   // and it is how a dead pane — kept by remain-on-exit — turns into EXIT,
   // however fast the command died.
   private startPoll() {
-    this.unwatchPane ??= watchPane(this.ref, this.policy.pollMs, status => this.observePane(status))
+    this.unwatchPane ??= watchPane(this.ref, this.policy.pollMs, status => this.observePane(status), this.seam)
   }
 
   private stopPoll() {

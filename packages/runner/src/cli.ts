@@ -1,5 +1,6 @@
 import { hostname } from 'node:os'
 import type { ApiKeyStore } from './apiKeys.js'
+import type { Grants } from './consent.js'
 import { PairingError, type RunnerIdentity } from './pairing.js'
 import type { PresenceSnapshot } from './presence.js'
 
@@ -139,6 +140,47 @@ export async function runKeyRemoveCommand(argv: readonly string[], context: KeyC
     return { exitCode: 1, output: messageOf(error) }
   }
   return { exitCode: 0, output: `removed ${label} — a pane already running keeps the key it was given; stop it to take the key out of that process` }
+}
+
+// The local grant flow (FR-14): directory consent is added, listed, and revoked from the
+// operator's own terminal and nowhere else — there is no wire path to grant a directory, so a
+// control plane can name one but never authorize one. A grant governs new work; a pane already
+// running was admitted against a live grant and is not reached from here.
+export type GrantCommandContext = {
+  grants: Grants
+}
+
+// `modula-runner grant <dir>`. The path is resolved and stored as its real path, so a later
+// containment check compares real paths and a grant does not silently follow a swapped symlink.
+export async function runGrantAddCommand(argv: readonly string[], context: GrantCommandContext): Promise<CommandResult> {
+  const [dir, ...extra] = argv
+  if (!dir || extra.length > 0) return { exitCode: 2, output: 'usage: modula-runner grant <directory>' }
+  try {
+    const resolved = await context.grants.grant(dir)
+    return { exitCode: 0, output: `granted ${resolved}` }
+  } catch (error) {
+    return { exitCode: 1, output: messageOf(error) }
+  }
+}
+
+// `modula-runner grant list`. The live grants as real paths, plus an honest note where the
+// runner cannot read a running process's cwd back to close the resolve-then-enter window.
+export async function runGrantListCommand(_argv: readonly string[], context: GrantCommandContext): Promise<CommandResult> {
+  const grants = await context.grants.list()
+  const window = context.grants.cwdReadBackAvailable
+    ? ''
+    : '\nnote: this platform cannot read a running process’s working directory back, so a directory swapped after a grant check is not caught'
+  if (grants.length === 0) return { exitCode: 0, output: `no directories granted — add one with: modula-runner grant <directory>${window}` }
+  return { exitCode: 0, output: `${grants.join('\n')}${window}` }
+}
+
+// `modula-runner grant revoke <dir>`. Governs only later admissions — a pane already running is
+// not confined or killed by this, which the message says rather than implying a reach it lacks.
+export async function runGrantRevokeCommand(argv: readonly string[], context: GrantCommandContext): Promise<CommandResult> {
+  const [dir, ...extra] = argv
+  if (!dir || extra.length > 0) return { exitCode: 2, output: 'usage: modula-runner grant revoke <directory>' }
+  await context.grants.revoke(dir)
+  return { exitCode: 0, output: `revoked ${dir} — new work there is refused; a pane already running keeps going until it exits or the kill switch stops it` }
 }
 
 const KEY_ADD_FORM = 'modula-runner key add <label> --provider <name>'

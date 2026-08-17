@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { deterministicWorktreePath, provisionWorktree } from '../src/worktrees.js'
+import { permissiveSpawnSeam } from './spawnSeamSupport.js'
 
 let baseDirs: string[] = []
 
@@ -34,7 +35,7 @@ function createRepos() {
 }
 
 function request(repos: ReturnType<typeof createRepos>, overrides: Partial<Parameters<typeof provisionWorktree>[0]> = {}) {
-  return { repoPath: repos.repoPath, worktreesRoot: repos.worktreesRoot, name: 'lane-1', branch: 'lane/topic-1', ...overrides }
+  return { repoPath: repos.repoPath, worktreesRoot: repos.worktreesRoot, name: 'lane-1', branch: 'lane/topic-1', seam: permissiveSpawnSeam(), ...overrides }
 }
 
 describe('worktree provisioning', () => {
@@ -129,7 +130,7 @@ describe('worktree provisioning', () => {
     git(repos.seed, ['push', repos.origin, 'main:develop'])
     const narrow = path.join(repos.base, 'narrow')
     execFileSync('git', ['clone', '--single-branch', '--branch', 'main', repos.origin, narrow], { stdio: 'ignore' })
-    const result = await provisionWorktree({ repoPath: narrow, worktreesRoot: repos.worktreesRoot, name: 'lane-narrow', branch: 'lane/narrow-1', baseBranch: 'develop' })
+    const result = await provisionWorktree({ repoPath: narrow, worktreesRoot: repos.worktreesRoot, name: 'lane-narrow', branch: 'lane/narrow-1', baseBranch: 'develop', seam: permissiveSpawnSeam() })
     expect(git(result.worktreePath, ['rev-parse', 'HEAD'])).toBe(git(repos.seed, ['rev-parse', 'HEAD']))
   })
 
@@ -175,7 +176,7 @@ describe('worktree provisioning', () => {
     const lane = await provisionWorktree(request(repos))
     // A linked worktree answers --show-toplevel with its own root, so only the
     // git-dir comparison tells it apart from the main checkout.
-    await expect(provisionWorktree({ repoPath: lane.worktreePath, worktreesRoot: repos.worktreesRoot, name: 'lane-2', branch: 'lane/topic-2' }))
+    await expect(provisionWorktree({ repoPath: lane.worktreePath, worktreesRoot: repos.worktreesRoot, name: 'lane-2', branch: 'lane/topic-2', seam: permissiveSpawnSeam() }))
       .rejects.toThrow(/not a linked worktree/)
   })
 

@@ -34,17 +34,68 @@ export {
   type PreviewExit,
   type PreviewHostOptions,
   type PreviewOutcome,
-  type PreviewRecipe,
   type PreviewRecord,
   type PreviewSpec,
 } from './preview.js'
 export {
+  DEFAULT_ALLOWLIST_EXECUTABLES,
+  canonicalAllowlistBytes,
+  decodeSignedAllowlist,
+  loadTrustedAllowlist,
+  signAllowlist,
+  verifyAllowlistSignature,
+  type Allowlist,
+  type AllowlistLoad,
+  type AllowlistRejection,
+  type AllowlistSigningKey,
+  type CommandPolicy,
+  type LoadAllowlistOptions,
+  type PreviewRecipe,
+  type SignedAllowlist,
+  type TrustAnchor,
+} from './allowlist.js'
+export { openAuditLog, type AuditLog, type AuditLogOptions, type AuditRecord, type SpawnOutcome } from './auditLog.js'
+export {
+  activateKillSwitch,
+  type KillOutcome,
+  type KillablePreviews,
+  type KillTargets,
+} from './killSwitch.js'
+export {
+  createGrants,
+  createMemoryGrantStore,
+  isContained,
+  resolveRealPath,
+  type GrantRecord,
+  type Grants,
+  type GrantStore,
+  type GrantsOptions,
+} from './consent.js'
+export {
+  completeDurably,
+  createSpawnSeam,
+  type Authorization,
+  type AuthorizeResult,
+  type ConsentPolicy,
+  type RunResult,
+  type SeamRefusal,
+  type SpawnKind,
+  type SpawnRequest,
+  type SpawnSeam,
+  type SpawnSeamOptions,
+  type VettedSpawn,
+} from './spawnSeam.js'
+export {
+  runGrantAddCommand,
+  runGrantListCommand,
+  runGrantRevokeCommand,
   runKeyAddCommand,
   runKeyListCommand,
   runKeyRemoveCommand,
   runPairCommand,
   runStatusCommand,
   type CommandResult,
+  type GrantCommandContext,
   type KeyCommandContext,
   type PairCommandContext,
 } from './cli.js'
@@ -96,3 +147,22 @@ export {
   type LaunchPlan,
   type LocalModelProfile,
 } from './accessProfiles.js'
+export {
+  detectPreviewContainment,
+  namespaceContainmentAvailable,
+  namespaceHasListener,
+  networkNamespaceOf,
+  passthroughContainment,
+  type ContainedSpawn,
+  type ContainmentDisposition,
+  type ContainmentOptions,
+  type ContainmentStatus,
+  type PreviewContainment,
+} from './previewContainment.js'
+export {
+  REQUIRED_EVIDENCE_CLASSES,
+  aggregateSecurityEvidence,
+  type EvidenceState,
+  type EvidenceVerdict,
+  type SecurityEvidence,
+} from './securityEvidence.js'

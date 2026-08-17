@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'vitest'
 import { PreviewHost, type PreviewOutcome, type PreviewRecipe } from '../../src/index.js'
 import { sleep, until } from '../helpers.js'
+import { grantingSpawnSeam } from '../spawnSeamSupport.js'
 
 const hosts: PreviewHost[] = []
 const temporaryPaths: string[] = []
@@ -39,10 +40,8 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)))
 }
 
 function previewHost(root: string, recipes: Record<string, PreviewRecipe>) {
-  const host = new PreviewHost({
-    allowlist: { recipes, grantedPaths: [root] },
-    readyTimeoutMs: 4_000,
-  })
+  const { seam, consent } = grantingSpawnSeam(recipes, [root])
+  const host = new PreviewHost({ seam, consent, readyTimeoutMs: 4_000 })
   hosts.push(host)
   return host
 }

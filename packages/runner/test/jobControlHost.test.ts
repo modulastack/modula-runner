@@ -6,6 +6,7 @@ import { decodeJobControlServerMessage, jobControlPayload, type JobControlServer
 import { JobControlHost, PreviewHost, RunnerClient } from '../src/index.js'
 import { StubControlPlane } from './stubControlPlane.js'
 import { sleep, testRunnerInfo, until } from './helpers.js'
+import { grantingSpawnSeam } from './spawnSeamSupport.js'
 
 // Not a credential: a fixture value the in-process stub control plane compares against
 // itself. It authenticates nothing outside this test file.
@@ -37,10 +38,8 @@ async function lane(capabilities?: () => RunnerCapabilities | null) {
   planes.push(plane)
   const client = new RunnerClient({ url: plane.url, token: STUB_TOKEN, runner: testRunnerInfo, backoff: { baseMs: 20, capMs: 50 } })
   clients.push(client)
-  const preview = new PreviewHost({
-    allowlist: { recipes: { docs: { command: process.execPath, args: [script] } }, grantedPaths: [root] },
-    readyTimeoutMs: 5_000,
-  })
+  const granting = grantingSpawnSeam({ docs: { command: process.execPath, args: [script] } }, [root])
+  const preview = new PreviewHost({ seam: granting.seam, consent: granting.consent, readyTimeoutMs: 5_000 })
   previews.push(preview)
   const host = new JobControlHost({ client, preview, ...(capabilities ? { capabilities } : {}) })
   client.connect()

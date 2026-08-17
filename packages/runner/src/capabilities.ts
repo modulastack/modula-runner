@@ -13,6 +13,8 @@ import {
   type RuntimeCapability,
 } from '@modulastack/runner-protocol'
 import type { LocalEndpointRegistry } from './localEndpoints.js'
+import type { SpawnOutcome } from './auditLog.js'
+import type { SpawnSeam } from './spawnSeam.js'
 
 // What this machine can actually run, probed rather than assumed, and kept true for as
 // long as the connection lasts.
@@ -36,7 +38,14 @@ export const MAX_PROBE_OUTPUT_BYTES = 64 * 1024
 // schema's floor of 200 ms would make five probes a second a compliant instruction. The
 // heartbeat policy is bounded for that same class of reason; this constant is the answer to
 // the same question one layer down.
-export const CAPABILITY_REFRESH_MS = 2_000
+//
+// Each pass spawns a real probe process per runtime and every such spawn is audited at the seam,
+// so a tight cadence floods the append-only log with liveness records that bury actual events. A
+// capability changes on human-timescale install/login events, and the access resolver re-probes
+// at the moment it spawns — so an advertised capability going stale between passes is corrected
+// on use. The cadence is therefore minutes, not seconds: `current()` serves the last probe
+// continuously while a fresh, audited probe runs infrequently.
+export const CAPABILITY_REFRESH_MS = 60_000
 export const MIN_CAPABILITY_REFRESH_MS = 500
 // Every probe is a subprocess and the pass runs on a cadence, so the fleet is bounded
 // rather than trusted to stay small.
@@ -106,6 +115,9 @@ export const DEFAULT_RUNTIME_CATALOG: readonly RuntimeSpec[] = [
 ]
 
 export type CapabilityMonitorOptions = {
+  // Probing spawns third-party CLIs, so it passes the same allowlist gate every runner-owned
+  // spawn does: a runtime whose command is not allowlisted is not probed and not advertised.
+  seam: SpawnSeam
   runtimes?: readonly RuntimeSpec[]
   endpoints?: LocalEndpointRegistry
   probeTimeoutMs?: number
@@ -120,6 +132,7 @@ export declare interface CapabilityMonitor {
 }
 
 export class CapabilityMonitor extends EventEmitter {
+  private readonly seam: SpawnSeam
   private readonly runtimes: readonly RuntimeSpec[]
   private readonly endpoints: LocalEndpointRegistry | undefined
   private readonly probeTimeoutMs: number
@@ -138,8 +151,9 @@ export class CapabilityMonitor extends EventEmitter {
   // pass that was in flight across either can tell that it no longer owns the cadence.
   private generation = 0
 
-  constructor(options: CapabilityMonitorOptions = {}) {
+  constructor(options: CapabilityMonitorOptions) {
     super()
+    this.seam = options.seam
     const runtimes = options.runtimes ?? []
     // Bounded where it is produced, not only at the validator: a catalog longer than the
     // wire carries would build a snapshot the peer drops whole, and a configuration that
@@ -217,7 +231,7 @@ export class CapabilityMonitor extends EventEmitter {
 
   private async probeAll(): Promise<RunnerCapabilities> {
     const [runtimes, endpoints] = await Promise.all([
-      probeCatalog(this.runtimes, this.probeTimeoutMs),
+      probeCatalog(this.seam, this.runtimes, this.probeTimeoutMs),
       this.endpoints ? this.endpoints.probeAll({ timeoutMs: this.probeTimeoutMs }) : Promise.resolve([]),
     ])
     const snapshot: RunnerCapabilities = { runtimes, endpoints }
@@ -254,21 +268,22 @@ export class CapabilityMonitor extends EventEmitter {
   }
 }
 
-export async function probeRuntime(spec: RuntimeSpec, timeoutMs: number = DEFAULT_PROBE_TIMEOUT_MS): Promise<RuntimeCapability | null> {
+export async function probeRuntime(spec: RuntimeSpec, seam: SpawnSeam, timeoutMs: number = DEFAULT_PROBE_TIMEOUT_MS): Promise<RuntimeCapability | null> {
   assertRuntimeSpec(spec)
-  const version = await runProbe(spec.command, spec.versionArgs, timeoutMs)
+  const version = await runProbe(seam, spec.command, spec.versionArgs, timeoutMs)
   // Absence is how a missing runtime is expressed, so the protocol never has to carry a
-  // vocabulary of every CLI that might exist.
+  // vocabulary of every CLI that might exist. A command the allowlist forbids is absent by the
+  // same token: not probed, not advertised.
   if (version.status === 'missing') return null
   return {
     runtime: spec.runtime,
     version: version.status === 'answered' ? reportedVersion(version.stdout) : null,
-    auth: await authState(spec, timeoutMs),
+    auth: await authState(spec, seam, timeoutMs),
     access: [...spec.access],
   }
 }
 
-async function probeCatalog(specs: readonly RuntimeSpec[], timeoutMs: number): Promise<RuntimeCapability[]> {
+async function probeCatalog(seam: SpawnSeam, specs: readonly RuntimeSpec[], timeoutMs: number): Promise<RuntimeCapability[]> {
   const detected: RuntimeCapability[] = []
   let next = 0
   const worker = async () => {
@@ -277,7 +292,7 @@ async function probeCatalog(specs: readonly RuntimeSpec[], timeoutMs: number): P
       next += 1
       const spec = specs[index]
       if (!spec) return
-      const capability = await probeRuntime(spec, timeoutMs)
+      const capability = await probeRuntime(spec, seam, timeoutMs)
       if (capability) detected[index] = capability
     }
   }
@@ -290,9 +305,9 @@ async function probeCatalog(specs: readonly RuntimeSpec[], timeoutMs: number): P
 // The CLI is asked about itself and only its exit status is read. Its output can carry an
 // account address and an organisation name, which is nothing a capability probe has any
 // business retaining, let alone reporting.
-async function authState(spec: RuntimeSpec, timeoutMs: number): Promise<CliAuthState> {
+async function authState(spec: RuntimeSpec, seam: SpawnSeam, timeoutMs: number): Promise<CliAuthState> {
   if (spec.authArgs === null) return 'unknown'
-  const outcome = await runProbe(spec.command, spec.authArgs, timeoutMs)
+  const outcome = await runProbe(seam, spec.command, spec.authArgs, timeoutMs)
   if (outcome.status !== 'answered') return 'unknown'
   return outcome.exitCode === 0 ? 'authenticated' : 'unauthenticated'
 }
@@ -319,7 +334,26 @@ type ProbeOutcome =
 // its code does not honour, and drives a known binary on a short leash. The risk this
 // function answers is specific to spawning third-party CLIs whose behaviour the runner does
 // not control.
-function runProbe(command: string, args: readonly string[], timeoutMs: number): Promise<ProbeOutcome> {
+// The allowlist gate in front of the probe process. A forbidden command never spawns and reads
+// as `missing`, the same answer an uninstalled one gives, so the interface offers only what the
+// operator's signed allowlist admits. An admitted probe is audited like any runner-owned spawn.
+async function runProbe(seam: SpawnSeam, command: string, args: readonly string[], timeoutMs: number): Promise<ProbeOutcome> {
+  const result = await seam.run(
+    { kind: 'probe', executable: command, args, cwd: tmpdir(), grantScoped: false },
+    async vetted => {
+      const outcome = await runProbeProcess(vetted.command, vetted.args, timeoutMs)
+      return { outcome: probeSpawnOutcome(outcome), value: outcome }
+    },
+  )
+  return result.status === 'refused' ? { status: 'missing' } : result.value
+}
+
+function probeSpawnOutcome(outcome: ProbeOutcome): SpawnOutcome {
+  if (outcome.status === 'answered') return { exitCode: outcome.exitCode, signal: null }
+  return { spawnFailed: true }
+}
+
+function runProbeProcess(command: string, args: readonly string[], timeoutMs: number): Promise<ProbeOutcome> {
   return new Promise(resolve => {
     let child: ChildProcess
     try {

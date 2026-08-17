@@ -19,6 +19,7 @@ import {
 import { StubControlPlane } from '../stubControlPlane.js'
 import { sleep, testRunnerInfo, until } from '../helpers.js'
 import { binding, identityWithBinding, token } from './support.js'
+import { grantingSpawnSeam } from '../spawnSeamSupport.js'
 
 const clients: RunnerClient[] = []
 const planes: StubControlPlane[] = []
@@ -53,10 +54,8 @@ async function harness(presence?: PresenceTracker): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), 'runner-job-control-'))
   temporaryPaths.push(root)
   const fixtures = await previewRecipes(root)
-  const preview = new PreviewHost({
-    allowlist: { recipes: fixtures.recipes, grantedPaths: [root] },
-    readyTimeoutMs: 4_000,
-  })
+  const granting = grantingSpawnSeam(fixtures.recipes, [root])
+  const preview = new PreviewHost({ seam: granting.seam, consent: granting.consent, readyTimeoutMs: 4_000 })
   previews.push(preview)
   const plane = await new StubControlPlane({ token }).start()
   planes.push(plane)

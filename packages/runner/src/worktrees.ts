@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { isSafeIdentifier } from '@modulastack/runner-protocol'
+import type { SpawnSeam } from './spawnSeam.js'
 
 const run = promisify(execFile)
 
@@ -12,6 +13,26 @@ export type WorktreeProvisionRequest = {
   name: string
   branch: string
   baseBranch?: string
+  // Provisioning runs git, so it passes the allowlist gate every runner-owned spawn does: a
+  // control plane that cannot extend the allowlist cannot make the runner run git it forbade.
+  seam: SpawnSeam
+}
+
+type GitOptions = { timeout?: number; encoding?: BufferEncoding }
+
+// The one place worktree provisioning spawns git, so the allowlist gate and the audit record
+// live in a single spot rather than at each of a dozen call sites. A refused git command is a
+// thrown provisioning failure — the caller already treats an unavailable git as fatal.
+async function execGit(seam: SpawnSeam, cwd: string, args: string[], options: GitOptions = {}): Promise<string> {
+  const result = await seam.run(
+    { kind: 'git', executable: 'git', args, cwd, grantScoped: false },
+    async vetted => {
+      const output = await run(vetted.command, [...vetted.args], { cwd, encoding: 'utf8', ...options })
+      return { outcome: { exitCode: 0, signal: null }, value: output.stdout }
+    },
+  )
+  if (result.status === 'refused') throw new Error(`git is not on the runner's command allowlist: ${result.reason}`)
+  return result.value
 }
 
 export type WorktreeProvisionResult = {
@@ -40,7 +61,7 @@ export async function provisionWorktree(request: WorktreeProvisionRequest): Prom
   // its main checkout take different locks and race each other's rollbacks.
   // This orders lanes within one runner; it is not a lock against a second
   // process operating on the same checkout.
-  const checkout = await resolveMainCheckoutCached(request.repoPath)
+  const checkout = await resolveMainCheckoutCached(request.repoPath, request.seam)
   return serializeByRepo(checkout.commonDir, () => provision(request, checkout.repoPath))
 }
 
@@ -49,11 +70,11 @@ export async function provisionWorktree(request: WorktreeProvisionRequest): Prom
 // request racing ahead of the queue's depth limit.
 const checkoutCache = new Map<string, Promise<{ repoPath: string; commonDir: string }>>()
 
-function resolveMainCheckoutCached(repoPath: string) {
+function resolveMainCheckoutCached(repoPath: string, seam: SpawnSeam) {
   const key = path.resolve(repoPath)
   let resolving = checkoutCache.get(key)
   if (!resolving) {
-    resolving = resolveMainCheckout(repoPath)
+    resolving = resolveMainCheckout(repoPath, seam)
     checkoutCache.set(key, resolving)
     // Evict once settled — the cache exists to collapse a concurrent burst into
     // one resolution, not to hold every path the runner ever saw.
@@ -98,18 +119,19 @@ async function queueOnRepo<T>(key: string, task: () => Promise<T>): Promise<T> {
 }
 
 async function provision(request: WorktreeProvisionRequest, repoPath: string): Promise<WorktreeProvisionResult> {
+  const seam = request.seam
   const branch = request.branch.trim()
   // Only an absent base means "the default"; an empty or blank one is a
   // malformed request, and silently provisioning from main would answer a
   // question the caller did not ask.
   const base = request.baseBranch === undefined ? 'main' : request.baseBranch.trim()
-  await validateBranch(repoPath, branch)
+  await validateBranch(seam, repoPath, branch)
   validateBranchName(base)
   const worktreePath = deterministicWorktreePath(request.worktreesRoot, request.name)
-  const listed = await listedWorktrees(repoPath)
+  const listed = await listedWorktrees(seam, repoPath)
   const existing = listed.find(item => samePath(item.path, worktreePath))
-  if (existing) return reusedWorktree(existing, branch)
-  return createWorktree({ repoPath, branch, base, worktreePath, listed })
+  if (existing) return reusedWorktree(seam, existing, branch)
+  return createWorktree(seam, { repoPath, branch, base, worktreePath, listed })
 }
 
 // Worktree names obey the wire's safe-segment rule, so a name that arrived over a
@@ -121,29 +143,29 @@ export function deterministicWorktreePath(worktreesRoot: string, name: string) {
 
 type CreateInput = { repoPath: string; branch: string; base: string; worktreePath: string; listed: ListedWorktree[] }
 
-async function createWorktree(input: CreateInput): Promise<WorktreeProvisionResult> {
+async function createWorktree(seam: SpawnSeam, input: CreateInput): Promise<WorktreeProvisionResult> {
   const { repoPath, branch, base, worktreePath, listed } = input
   if (existsSync(worktreePath)) throw new Error(`lane worktree path already exists: ${worktreePath}`)
   if (listed.some(item => item.branch === branch)) throw new Error(`lane branch is already attached to another worktree: ${branch}`)
-  if (await branchExists(repoPath, branch)) throw new Error(`lane branch already exists without a matching worktree: ${branch}`)
-  await fetchOriginBase(repoPath, base)
-  await ensureOriginBase(repoPath, base)
+  if (await branchExists(seam, repoPath, branch)) throw new Error(`lane branch already exists without a matching worktree: ${branch}`)
+  await fetchOriginBase(seam, repoPath, base)
+  await ensureOriginBase(seam, repoPath, base)
   // Creating the ref is atomic and fails if anyone already holds the name, so
   // succeeding here *is* the ownership proof: everything cleaned up afterwards
   // is provably this attempt's, with no inference from what happens to be
   // registered at the time.
   try {
-    await run('git', ['branch', branch, `origin/${base}`], { cwd: repoPath, timeout: LOCAL_GIT_TIMEOUT_MS })
+    await execGit(seam, repoPath, ['branch', branch, `origin/${base}`], { timeout: LOCAL_GIT_TIMEOUT_MS })
   } catch {
     throw new Error(`lane branch already exists without a matching worktree: ${branch}`)
   }
   let worktreeAdded = false
   try {
-    await run('git', ['worktree', 'add', worktreePath, branch], { cwd: repoPath, timeout: CHECKOUT_GIT_TIMEOUT_MS })
+    await execGit(seam, repoPath, ['worktree', 'add', worktreePath, branch], { timeout: CHECKOUT_GIT_TIMEOUT_MS })
     worktreeAdded = true
-    await ensureCleanWorktree(worktreePath, `provisioned lane worktree is unexpectedly dirty: ${worktreePath}`)
+    await ensureCleanWorktree(seam, worktreePath, `provisioned lane worktree is unexpectedly dirty: ${worktreePath}`)
   } catch (error) {
-    await discardOwnedWorktree(repoPath, branch, worktreePath, worktreeAdded)
+    await discardOwnedWorktree(seam, repoPath, branch, worktreePath, worktreeAdded)
     throw error
   }
   return { branch, worktreePath, reused: false }
@@ -153,25 +175,25 @@ async function createWorktree(input: CreateInput): Promise<WorktreeProvisionResu
 // is only this attempt's if this attempt's `worktree add` is what registered it;
 // a failed add leaves an ambiguous directory that may be a contender's live
 // lane, uncommitted work and all, so it is never force-removed.
-async function discardOwnedWorktree(repoPath: string, branch: string, worktreePath: string, worktreeAdded: boolean) {
+async function discardOwnedWorktree(seam: SpawnSeam, repoPath: string, branch: string, worktreePath: string, worktreeAdded: boolean) {
   // Removing a worktree deletes a checkout — repository-sized work, not a local
   // query — so it gets the checkout timeout; a 5-second bound would strand the
   // path on a large repo and make every retry fail on the leftover directory.
-  if (worktreeAdded) await quietGit(repoPath, ['worktree', 'remove', '--force', worktreePath], CHECKOUT_GIT_TIMEOUT_MS)
-  await quietGit(repoPath, ['worktree', 'prune'])
-  await quietGit(repoPath, ['branch', '-D', branch])
+  if (worktreeAdded) await quietGit(seam, repoPath, ['worktree', 'remove', '--force', worktreePath], CHECKOUT_GIT_TIMEOUT_MS)
+  await quietGit(seam, repoPath, ['worktree', 'prune'])
+  await quietGit(seam, repoPath, ['branch', '-D', branch])
 }
 
-async function quietGit(cwd: string, args: string[], timeout = LOCAL_GIT_TIMEOUT_MS) {
+async function quietGit(seam: SpawnSeam, cwd: string, args: string[], timeout = LOCAL_GIT_TIMEOUT_MS) {
   try {
-    await run('git', args, { cwd, timeout })
+    await execGit(seam, cwd, args, { timeout })
   } catch {}
 }
 
-async function reusedWorktree(worktree: ListedWorktree, expectedBranch: string): Promise<WorktreeProvisionResult> {
+async function reusedWorktree(seam: SpawnSeam, worktree: ListedWorktree, expectedBranch: string): Promise<WorktreeProvisionResult> {
   if (worktree.prunable) throw new Error(`lane worktree registration is stale and must be pruned before reuse: ${worktree.path}`)
   if (worktree.branch !== expectedBranch) throw new Error(`lane worktree path is already registered for ${worktree.branch || 'detached HEAD'}: ${worktree.path}`)
-  await ensureCleanWorktree(worktree.path, `lane worktree has uncommitted changes: ${worktree.path}`)
+  await ensureCleanWorktree(seam, worktree.path, `lane worktree has uncommitted changes: ${worktree.path}`)
   return { branch: expectedBranch, worktreePath: worktree.path, reused: true }
 }
 
@@ -179,20 +201,20 @@ async function reusedWorktree(worktree: ListedWorktree, expectedBranch: string):
 // would nest worktrees and confuse every listing that follows. A linked
 // worktree looks like a repository root to `--show-toplevel`, so the test is
 // whether its git dir *is* the common one.
-async function resolveMainCheckout(repoPath: string) {
+async function resolveMainCheckout(repoPath: string, seam: SpawnSeam) {
   const resolved = path.resolve(repoPath)
-  const root = await git(resolved, ['rev-parse', '--show-toplevel'])
+  const root = await git(seam, resolved, ['rev-parse', '--show-toplevel'])
   if (!samePath(root, resolved)) throw new Error(`main checkout mismatch: expected ${resolved}, got ${root}`)
-  const gitDir = path.resolve(resolved, await git(resolved, ['rev-parse', '--absolute-git-dir']))
-  const commonDir = path.resolve(resolved, await git(resolved, ['rev-parse', '--git-common-dir']))
+  const gitDir = path.resolve(resolved, await git(seam, resolved, ['rev-parse', '--absolute-git-dir']))
+  const commonDir = path.resolve(resolved, await git(seam, resolved, ['rev-parse', '--git-common-dir']))
   if (!samePath(gitDir, commonDir)) throw new Error(`provisioning requires the main checkout, not a linked worktree: ${resolved}`)
   return { repoPath: resolved, commonDir }
 }
 
-async function validateBranch(repoPath: string, branch: string) {
+async function validateBranch(seam: SpawnSeam, repoPath: string, branch: string) {
   let checked = ''
   try {
-    checked = await git(repoPath, ['check-ref-format', '--branch', branch])
+    checked = await git(seam, repoPath, ['check-ref-format', '--branch', branch])
   } catch {
     throw new Error(`invalid git branch name: ${branch}`)
   }
@@ -205,9 +227,9 @@ function validateBranchName(base: string) {
   }
 }
 
-async function branchExists(repoPath: string, branch: string) {
+async function branchExists(seam: SpawnSeam, repoPath: string, branch: string) {
   try {
-    await run('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repoPath, timeout: LOCAL_GIT_TIMEOUT_MS })
+    await execGit(seam, repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { timeout: LOCAL_GIT_TIMEOUT_MS })
     return true
   } catch (error) {
     if (timedOut(error)) throw new Error('unable to check lane branch before provisioning')
@@ -218,29 +240,29 @@ async function branchExists(repoPath: string, branch: string) {
 // The explicit refspec updates the remote-tracking ref in every clone shape:
 // a narrow fetch refspec (single-branch clone) would otherwise leave
 // refs/remotes/origin/<base> stale or absent and provision from an old commit.
-async function fetchOriginBase(repoPath: string, base: string) {
+async function fetchOriginBase(seam: SpawnSeam, repoPath: string, base: string) {
   try {
-    await run('git', ['fetch', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], { cwd: repoPath, timeout: FETCH_GIT_TIMEOUT_MS })
+    await execGit(seam, repoPath, ['fetch', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], { timeout: FETCH_GIT_TIMEOUT_MS })
   } catch {
     throw new Error(`unable to fetch origin/${base} before provisioning`)
   }
 }
 
-async function ensureOriginBase(repoPath: string, base: string) {
+async function ensureOriginBase(seam: SpawnSeam, repoPath: string, base: string) {
   try {
-    await run('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`], { cwd: repoPath, timeout: LOCAL_GIT_TIMEOUT_MS })
+    await execGit(seam, repoPath, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`], { timeout: LOCAL_GIT_TIMEOUT_MS })
   } catch {
     throw new Error(`missing refs/remotes/origin/${base} after fetch`)
   }
 }
 
-async function ensureCleanWorktree(worktreePath: string, message: string) {
-  const dirty = await git(worktreePath, ['status', '--short', '--untracked-files=all'])
+async function ensureCleanWorktree(seam: SpawnSeam, worktreePath: string, message: string) {
+  const dirty = await git(seam, worktreePath, ['status', '--short', '--untracked-files=all'])
   if (dirty) throw new Error(message)
 }
 
-async function listedWorktrees(repoPath: string) {
-  const output = await git(repoPath, ['worktree', 'list', '--porcelain', '-z'], false)
+async function listedWorktrees(seam: SpawnSeam, repoPath: string) {
+  const output = await git(seam, repoPath, ['worktree', 'list', '--porcelain', '-z'], false)
   return output.split('\u0000\u0000').filter(Boolean).map(parseWorktreeBlock)
 }
 
@@ -260,10 +282,10 @@ function fieldValue(lines: string[], name: string) {
   return lines.find(line => line.startsWith(`${name} `))?.slice(name.length + 1).trim()
 }
 
-async function git(cwd: string, args: string[], trim = true) {
+async function git(seam: SpawnSeam, cwd: string, args: string[], trim = true) {
   try {
-    const result = await run('git', args, { cwd, encoding: 'utf8', timeout: LOCAL_GIT_TIMEOUT_MS })
-    return trim ? result.stdout.trim() : result.stdout
+    const stdout = await execGit(seam, cwd, args, { timeout: LOCAL_GIT_TIMEOUT_MS })
+    return trim ? stdout.trim() : stdout
   } catch {
     throw new Error(`git command failed in ${cwd}: git ${args.join(' ')}`)
   }

@@ -23,6 +23,7 @@ import {
   writeStandInRuntime,
   type EndpointServer,
 } from './accessSupport.js'
+import { permissiveSpawnSeam } from '../spawnSeamSupport.js'
 
 const monitors: CapabilityMonitor[] = []
 const servers: EndpointServer[] = []
@@ -71,7 +72,7 @@ async function rig(profiles: readonly LocalModelProfile[], options: { authentica
     { endpointId: 'desk-ollama', kind: 'ollama', baseUrl: endpoint.baseUrl },
     { endpointId: 'desk-compatible', kind: 'openai-compatible', baseUrl: endpoint.baseUrl },
   ])
-  const capabilities = new CapabilityMonitor({ runtimes, endpoints })
+  const capabilities = new CapabilityMonitor({ seam: permissiveSpawnSeam(), runtimes, endpoints })
   monitors.push(capabilities)
   await capabilities.refresh()
   const keys = createMemoryApiKeyStore()

@@ -1,8 +1,12 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { realpath } from 'node:fs/promises'
+import { constants as osConstants } from 'node:os'
 import path from 'node:path'
 import { hasControlCharacter, type RefusalReason } from '@modulastack/runner-protocol'
+import type { PreviewRecipe } from './allowlist.js'
+import type { SpawnOutcome } from './auditLog.js'
+import { namespaceHasListener, networkNamespaceOf, passthroughContainment, type PreviewContainment } from './previewContainment.js'
+import { completeDurably, type ConsentPolicy, type SpawnSeam, type VettedSpawn } from './spawnSeam.js'
 import { descendantsOf, descendantsOfMany, isLoopbackAddress, listeningSocketsFor, listeningSocketsForMany, processGroups, processStartTimes, workingDirectoryOf, type ListeningSocket } from './listeningSockets.js'
 
 // Preview servers and browser-QA targets run beside the operator's browser, so the port is
@@ -25,8 +29,17 @@ const WATCH_INTERVAL_MS = 2_000
 const TERMINATION_ATTEMPTS = 5
 const TERMINATION_POLL_MS = 100
 const DEFAULT_MAX_PREVIEWS = 16
+// How long a containment that claims a network namespace is given to actually move the preview
+// into one before it is judged not to have — after which the host-visible readiness path governs.
+const CONTAINMENT_ISOLATION_MS = 2_000
 const SHUTDOWN_PASSES = 5
 const BLIND_SWEEPS_ALLOWED = 3
+// A withheld exit whose outcome append kept failing is re-driven on this slow cadence until it is
+// durable — a burst inside `completeDurably` is bounded, but the outcome must survive an outage
+// that outlasts one burst. Paced well above the burst's own retry so an audit outage stays a slow
+// retry, never a tight loop; shutdown stops the machinery, and the exit is never emitted until the
+// outcome is durable.
+const EXIT_OUTCOME_REDRIVE_MS = 1_000
 
 export type PreviewSpec = {
   previewId: string
@@ -37,11 +50,8 @@ export type PreviewSpec = {
 // A recipe is the whole command line, held locally. The control plane names one; it never
 // supplies one. Allowlisting an executable while accepting its arguments from the wire is
 // not an allowlist at all — `node` plus a caller-controlled argv is arbitrary execution
-// under the runner user, and no argument blocklist survives contact with an interpreter.
-export type PreviewRecipe = {
-  command: string
-  args: readonly string[]
-}
+// under the runner user, and no argument blocklist survives contact with an interpreter. The
+// type lives with the signed allowlist (`allowlist.ts`), because a recipe is one entry of it.
 
 export type PreviewAllowlist = {
   recipes: Readonly<Record<string, PreviewRecipe>>
@@ -65,7 +75,18 @@ export type PreviewExit = {
 }
 
 export type PreviewHostOptions = {
-  allowlist: PreviewAllowlist
+  // The recipe a preview names is resolved and gated by the seam, not by a second allowlist
+  // held here: one signed source, one choke point. The seam supplies the vetted command and
+  // args and audits the spawn; a recipe it does not hold is refused before a process exists.
+  seam: SpawnSeam
+  // The same consent the seam is built with: the seam does the pre-spawn grant admission, and
+  // the host asks this for the post-spawn read-back, so directory consent is one decision made
+  // in one place rather than a second copy that could drift from the seam's.
+  consent: ConsentPolicy
+  // How the preview process is launched. Absent, previews run directly under detect-and-stop; the
+  // binary injects the network-namespace unit where the host supports it, so off-loopback binds are
+  // contained rather than only detected. One launch seam, chosen once at composition.
+  containment?: PreviewContainment
   readyTimeoutMs?: number
   maxPreviews?: number
 }
@@ -88,8 +109,25 @@ type RunningPreview = PreviewRecord & { child: ChildProcess; blindSweeps?: numbe
 // is exactly the case where a server outlived its wrapper.
 const observedMembers = new WeakMap<ChildProcess, Map<number, string>>()
 
+// Thrown when a preview's outcome could not be made durable before the host tore down. It is a
+// fatal audit state, not a refusal: the caller must see the failure rather than a normal outcome
+// claiming a record that was never written, so it propagates past the catch that would otherwise
+// turn an inspection failure into an ordinary spawn-failed refusal.
+class UndurableOutcomeError extends Error {}
+
+// The outcome of a preview process the runner spawned and then terminated — a failed post-spawn
+// grant recheck, a stop that arrived mid-start. It ran, so `spawnFailed` would misreport it; its
+// real exit or killing signal is recorded, with `spawnFailed` only where the OS reports neither.
+function terminatedOutcome(child: ChildProcess): SpawnOutcome {
+  if (child.exitCode !== null) return { exitCode: child.exitCode, signal: null }
+  const signal = child.signalCode !== null ? osConstants.signals[child.signalCode] : undefined
+  return signal !== undefined ? { exitCode: null, signal } : { spawnFailed: true }
+}
+
 export class PreviewHost extends EventEmitter {
-  private readonly allowlist: PreviewAllowlist
+  private readonly seam: SpawnSeam
+  private readonly consent: ConsentPolicy
+  private readonly containment: PreviewContainment
   private readonly readyTimeoutMs: number
   private readonly maxPreviews: number
   private readonly running = new Map<string, RunningPreview>()
@@ -103,10 +141,20 @@ export class PreviewHost extends EventEmitter {
   private sweeping = false
   private shuttingDown = false
   private shutdownRun: Promise<void> | undefined
+  // The seam's outcome callback per admitted preview, called once the preview's end-of-life is
+  // final so the audit records the outcome, not just the admission.
+  private readonly completions = new Map<string, (outcome: SpawnOutcome) => Promise<void>>()
+  // The re-drive timer for an exit whose outcome append is still failing, keyed by the SPECIFIC
+  // completion callback rather than the previewId: the id is reusable, and a re-drive keyed by it
+  // could complete a later start's spawn. One timer per pending completion, cleared on success or
+  // shutdown.
+  private readonly exitRedrives = new Map<(outcome: SpawnOutcome) => Promise<void>, NodeJS.Timeout>()
 
   constructor(options: PreviewHostOptions) {
     super()
-    this.allowlist = { recipes: { ...options.allowlist.recipes }, grantedPaths: options.allowlist.grantedPaths.map(granted => path.resolve(granted)) }
+    this.seam = options.seam
+    this.consent = options.consent
+    this.containment = options.containment ?? passthroughContainment()
     this.readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS
     this.maxPreviews = options.maxPreviews ?? DEFAULT_MAX_PREVIEWS
   }
@@ -121,19 +169,31 @@ export class PreviewHost extends EventEmitter {
     // The identifier is reserved before the first await. Two adjacent PREVIEW_START frames
     // would otherwise both pass the duplicate check and both spawn.
     const taken = this.reserve(spec.previewId)
-    if (taken) return { status: 'refused', reason: taken }
+    if (taken) return await this.recordPreviewRefusal(spec, spec.cwd, taken)
     let child: ChildProcess | null = null
     let screenedCwd = ''
+    // The post-spawn read-back's grant question, bound to the SAME consent the admission resolved
+    // against. Captured from the authorization rather than answered from a separately-held consent
+    // handle, so a composition supplying two consent instances cannot admit under one grant set and
+    // clear a moved landing under another.
+    let verifyLanding: ((resolvedRealCwd: string) => Promise<boolean>) | undefined
     // Stamped when the process exists, not before. Screening is asynchronous, so a
     // timestamp taken ahead of it lets a readiness poll join a snapshot that was started
     // after the stamp but before the child — a view that cannot contain it, and one poll
     // of the readiness budget spent on an answer that was never possible.
     let spawnedAt = 0
     try {
-      const screened = await this.screen(spec)
-      if (screened.reason || !screened.cwd) return { status: 'refused', reason: screened.reason ?? 'path-not-granted' }
-      screenedCwd = screened.cwd
-      child = this.spawnPreview(spec, screened.cwd)
+      const screened = this.screen(spec)
+      if (screened.reason || !screened.cwd) return await this.recordPreviewRefusal(spec, spec.cwd, screened.reason ?? 'path-not-granted')
+      // The seam decides both the recipe (allowlist) and the cwd (grant, grantScoped true),
+      // resolves the granted real path into `vetted.cwd`, and audits the admission — one gate for
+      // the allowlist and the directory alike. What stays here is the post-spawn read-back below.
+      const authorized = await this.seam.authorize({ kind: 'preview', recipeId: spec.recipe, cwd: screened.cwd, grantScoped: true })
+      if (authorized.status === 'refused') return { status: 'refused', reason: authorized.reason }
+      screenedCwd = authorized.authorization.vetted.cwd
+      verifyLanding = authorized.authorization.verifyLanding
+      this.completions.set(spec.previewId, authorized.authorization.complete)
+      child = await this.spawnPreview(spec.previewId, authorized.authorization.vetted)
       spawnedAt = Date.now()
     } finally {
       if (child === null) {
@@ -143,12 +203,15 @@ export class PreviewHost extends EventEmitter {
         this.cancelled.delete(spec.previewId)
       }
     }
-    if (child === null) return { status: 'refused', reason: 'spawn-failed' }
+    if (child === null) {
+      await this.completeAudit(spec.previewId, { spawnFailed: true })
+      return { status: 'refused', reason: 'spawn-failed' }
+    }
     // Where the process actually landed, not where it was told to go. Resolving the path
     // and handing spawn the resolved one closes most of the window, but the resolved path
     // can itself be replaced between the check and the exec — so the working directory is
     // read back from the running process and re-checked against the grants.
-    if (!(await this.landedInsideGrant(child, screenedCwd))) {
+    if (!(await this.landedInsideGrant(child, screenedCwd, verifyLanding))) {
       // Ownership before teardown, and the latch released either way: this child is never
       // going to be registered, so an exit held for a registration that will not happen is
       // a process object retained for the life of the host.
@@ -166,7 +229,10 @@ export class PreviewHost extends EventEmitter {
       // kill a process nobody asked to stop — the same defect as the cancelled path, in a
       // branch added after it was fixed there.
       this.cancelled.delete(spec.previewId)
-      return { status: 'refused', reason: 'path-not-granted' }
+      await this.completeAudit(spec.previewId, terminatedOutcome(child))
+      // The read-back caught the process running outside its grant — a security refusal, audited
+      // as such on top of the admitted spawn's own terminated outcome.
+      return await this.recordPreviewRefusal(spec, screenedCwd, 'path-not-granted')
     }
     // A stop that arrived while this start was screening wins: the process must not
     // survive a request the control plane already believes was honoured.
@@ -187,6 +253,7 @@ export class PreviewHost extends EventEmitter {
         this.finalized.add(child)
         this.stopping.delete(child)
       }
+      await this.completeAudit(spec.previewId, terminatedOutcome(child))
       return { status: 'refused', reason: 'unknown-preview' }
     }
     // The slot is claimed before the wait so a second start for the same id refuses
@@ -205,8 +272,18 @@ export class PreviewHost extends EventEmitter {
       if (!this.running.has(spec.previewId)) return { status: 'refused', reason: 'spawn-failed' }
     }
     try {
-      return await this.awaitReady(spec.previewId, child, spawnedAt)
-    } catch {
+      const outcome = await this.awaitReady(spec.previewId, child, spawnedAt)
+      // A verification refusal is a security decision — the tree bound off loopback, or held more
+      // than one listener — so it is audited on top of the admitted spawn's outcome. A plain
+      // spawn-failure is not a security refusal and its outcome record already tells the story.
+      if (outcome.status === 'refused' && outcome.reason !== 'spawn-failed') {
+        await this.seam.recordRefusal({ kind: 'preview', recipeId: spec.recipe, cwd: screenedCwd, grantScoped: false, requestId: spec.previewId }, outcome.reason)
+      }
+      return outcome
+    } catch (error) {
+      // A fatal audit state during shutdown is surfaced, never swallowed into a refusal that
+      // claims an outcome nothing recorded.
+      if (error instanceof UndurableOutcomeError) throw error
       // Inspection can fail — an unsupported platform, a missing lsof, an unreadable
       // /proc. An unverified preview must not outlive the refusal that its caller sees.
       return await this.refuse(spec.previewId, child, 'spawn-failed')
@@ -295,6 +372,11 @@ export class PreviewHost extends EventEmitter {
 
   private async runShutdown() {
     this.shuttingDown = true
+    // The re-drive machinery stops with shutdown: a withheld exit stays withheld rather than being
+    // acknowledged without a durable outcome, and the fatal log state is the audit writer's to
+    // surface through onFailure.
+    for (const timer of this.exitRedrives.values()) clearTimeout(timer)
+    this.exitRedrives.clear()
     try {
       for (let pass = 0; pass < SHUTDOWN_PASSES; pass += 1) {
         for (const previewId of this.starting) this.cancelled.add(previewId)
@@ -330,12 +412,21 @@ export class PreviewHost extends EventEmitter {
     return work
   }
 
-  private async screen(spec: PreviewSpec): Promise<{ reason?: RefusalReason; cwd?: string }> {
-    if (!this.allowlist.recipes[spec.recipe]) return { reason: 'not-allowlisted' }
+  // A refusal the preview host itself decides — turned away while shutting down, or rejected
+  // after inspection for binding off loopback — is audited through the seam like the refusals
+  // the seam makes, so every security refusal lands in the log in one form.
+  private async recordPreviewRefusal(spec: PreviewSpec, cwd: string, reason: RefusalReason): Promise<PreviewOutcome> {
+    await this.seam.recordRefusal({ kind: 'preview', recipeId: spec.recipe, cwd, grantScoped: false, requestId: spec.previewId }, reason)
+    return { status: 'refused', reason }
+  }
+
+  private screen(spec: PreviewSpec): { reason?: RefusalReason; cwd?: string } {
+    // Both the allowlist and the grant decisions are the seam's now — `authorize` refuses and
+    // audits an unknown recipe or an ungranted cwd, so the preview surface records them the same
+    // way every runner-owned spawn does. Screening keeps only the cwd's shape, the one check that
+    // has no meaning to resolve against a grant.
     if (hasControlCharacter(spec.cwd)) return { reason: 'not-allowlisted' }
-    const resolved = await this.grantedRealPath(spec.cwd)
-    if (resolved === null) return { reason: 'path-not-granted' }
-    return { cwd: resolved }
+    return { cwd: spec.cwd }
   }
 
   // Containment is decided on real paths, not lexical ones: a symlink inside a granted
@@ -345,7 +436,7 @@ export class PreviewHost extends EventEmitter {
   // Linux exposes a running process's working directory, so the authorization can be
   // checked against where the process is rather than where it was sent. Elsewhere this
   // falls back to the screened path, and the residual is recorded in the seam contract.
-  private async landedInsideGrant(child: ChildProcess, screenedCwd: string) {
+  private async landedInsideGrant(child: ChildProcess, screenedCwd: string, verifyLanding?: (resolvedRealCwd: string) => Promise<boolean>) {
     if (!child.pid) return true
     // Asked of every platform that can answer, not only Linux. Returning true unconditionally
     // elsewhere meant the resolved directory could be swapped between screening and exec on a
@@ -355,48 +446,36 @@ export class PreviewHost extends EventEmitter {
     // unreadable cwd — permissions, I/O, a platform with no mechanism — says nothing about
     // where it is, and reading that as proof is unknown standing in for safe.
     if (actual === null) return child.exitCode !== null || child.signalCode !== null
-    return actual === screenedCwd || (await this.grantedRealPath(actual)) !== null
+    // Re-checked against the SAME consent the admission used, carried on the authorization — never
+    // a separately-held handle, which two consent instances could let diverge. Absent (a
+    // non-grant-scoped admission) there is no grant to escape beyond the resolved path itself.
+    if (actual === screenedCwd) return true
+    return verifyLanding ? await verifyLanding(actual) : false
   }
 
   // Returns the REAL directory to spawn in, not merely a verdict. Handing spawn the
   // caller's original path would let it re-follow a symlink that has been swapped since
   // the check; spawning into the resolved path means the directory that was authorized is
   // the directory that is entered.
-  private async grantedRealPath(cwd: string) {
-    // Unresolvable means ungranted: null flows to a refusal, never to permission.
-    const resolved = await realpath(path.resolve(cwd)).catch(() => null)
-    if (resolved === null) return null
-    // A grant that cannot be resolved cannot contain anything, so it matches nothing.
-    const grants = await Promise.all(this.allowlist.grantedPaths.map(granted => realpath(granted).catch(() => null)))
-    const contained = grants.some(granted => {
-      if (granted === null) return false
-      const relative = path.relative(granted, resolved)
-      return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
-    })
-    return contained ? resolved : null
-  }
-
   // HOST is a hint, not the guarantee: most dev servers honour it, and the ones that do
   // not are caught by verification rather than trusted to have obeyed.
   //
-  // `detached` puts the preview in its own process group. A wrapper command's real server
-  // is a descendant, and signalling only the wrapper would leave that descendant holding
+  // The containment launches the preview in its own process group. A wrapper command's real
+  // server is a descendant, and signalling only the wrapper would leave that descendant holding
   // its socket — so refusing a non-loopback bind has to be able to end the whole tree.
-  private spawnPreview(spec: PreviewSpec, cwd: string) {
-    const recipe = this.allowlist.recipes[spec.recipe]
-    if (!recipe) return null
+  private async spawnPreview(previewId: string, vetted: VettedSpawn) {
     try {
-      const child = spawn(recipe.command, [...recipe.args], {
-        cwd,
+      const child = await this.containment.spawn({
+        command: vetted.command,
+        args: vetted.args,
+        cwd: vetted.cwd,
         env: { ...process.env, HOST: '127.0.0.1' },
-        stdio: 'ignore',
-        detached: true,
       })
       // A command can exit before the awaits between spawn and registration finish. The
       // event is latched so it is not lost: readiness would otherwise poll for the full
       // timeout waiting on a process that was already gone.
-      child.once('exit', (exitCode, signal) => this.recordExit(spec.previewId, child, exitCode, signal))
-      child.once('error', () => this.recordExit(spec.previewId, child, null, null))
+      child.once('exit', (exitCode, signal) => this.recordExit(previewId, child, exitCode, signal))
+      child.once('error', () => this.recordExit(previewId, child, null, null))
       return child
     } catch {
       // spawn rejects some inputs synchronously; a refusal value is the contract here,
@@ -479,12 +558,95 @@ export class PreviewHost extends EventEmitter {
     if (this.finalized.has(child)) return
     this.finalized.add(child)
     if (this.running.size === 0) this.stopWatching()
+    // The exit event is this operation's acknowledgment, and the outcome record must be durable
+    // before it goes out — the control plane must not learn a preview ended before the runner's
+    // own log of how. The synchronous state above is settled first so a duplicate finalize
+    // returns early while this tail runs.
+    void this.emitExit(previewId, exitCode !== null ? { exitCode, signal: null } : signal !== null ? { exitCode: null, signal } : { spawnFailed: true }, exitCode, signal)
+  }
+
+  private async emitExit(previewId: string, outcome: SpawnOutcome, exitCode: number | null, signal: number | null) {
+    const complete = this.completions.get(previewId)
+    this.completions.delete(previewId)
+    if (complete) return await this.driveExit(previewId, complete, outcome, exitCode, signal)
     this.emit('exit', { previewId, exitCode, signal })
+  }
+
+  // Drives ONE specific completion to durability and emits its exit only then. Bound to the exact
+  // callback captured here, never re-looked-up by previewId: a new start can reclaim the id before a
+  // re-drive fires, and completing the wrong spawn — or leaving the new preview without its own
+  // completion — is the race this closes. The completion is not left in `completions` while it
+  // fails; it lives in this closure until it is durable.
+  private async driveExit(previewId: string, complete: (outcome: SpawnOutcome) => Promise<void>, outcome: SpawnOutcome, exitCode: number | null, signal: number | null) {
+    if (!(await completeDurably(complete, outcome))) {
+      // AS-21: the exit notification is the acknowledgment and must not be sent before the outcome
+      // record is durable. A burst inside `completeDurably` just failed, so this completion is
+      // re-driven on a slow cadence until the append recovers — a persistent outage stays observable
+      // through the audit writer's onFailure and never emits an exit; shutdown stops the machinery.
+      this.scheduleExitRedrive(previewId, complete, outcome, exitCode, signal)
+      return
+    }
+    const pending = this.exitRedrives.get(complete)
+    if (pending) {
+      clearTimeout(pending)
+      this.exitRedrives.delete(complete)
+    }
+    this.emit('exit', { previewId, exitCode, signal })
+  }
+
+  // Keeps a withheld exit scheduled: one timer per pending completion re-entering driveExit on a
+  // slow cadence, so a log that recovers after more than one burst eventually records that outcome
+  // exactly once and releases the exit. Not scheduled during shutdown — the machinery stops there
+  // and the withheld exit stays withheld rather than becoming an acknowledgment with no durable
+  // outcome behind it.
+  private scheduleExitRedrive(previewId: string, complete: (outcome: SpawnOutcome) => Promise<void>, outcome: SpawnOutcome, exitCode: number | null, signal: number | null) {
+    if (this.shuttingDown) return
+    if (this.exitRedrives.has(complete)) return
+    const timer = setTimeout(() => {
+      this.exitRedrives.delete(complete)
+      void this.driveExit(previewId, complete, outcome, exitCode, signal)
+    }, EXIT_OUTCOME_REDRIVE_MS)
+    timer.unref?.()
+    this.exitRedrives.set(complete, timer)
+  }
+
+  // Writes the seam's outcome record for an admitted preview that was refused after admission
+  // (a spawn that never took, a teardown after a failed grant recheck), so an admission is
+  // never left without an outcome. The refusal *is* the caller's acknowledgment, so it waits
+  // for the outcome to be durable exactly as an exit does — a caller must not learn the preview
+  // was refused before the runner's own record of why.
+  private async completeAudit(previewId: string, outcome: SpawnOutcome) {
+    const complete = this.completions.get(previewId)
+    if (!complete) return
+    this.completions.delete(previewId)
+    // The refusal is the acknowledgment, and it waits for the outcome to be durable exactly as an
+    // exit does. A persistently unwritable log withholds the refusal (fail closed): the wait keeps
+    // retrying rather than resolving against a record that does not exist, and the audit writer's
+    // onFailure signals the outage. Shutdown releases the wait so it does not hold `stopAll` open
+    // forever — but it must not then resolve a normal refusal claiming an outcome that was never
+    // recorded, so the caller is failed with the audit error rather than acknowledged.
+    // Try at least once even mid-shutdown — a healthy log records the outcome and the refusal
+    // resolves normally. Only a PERSISTENT failure that outlasts the shutdown signal gives up, and
+    // then it is surfaced as a fatal audit state rather than a refusal claiming a record.
+    do {
+      if (await completeDurably(complete, outcome)) return
+    } while (!this.shuttingDown)
+    throw new UndurableOutcomeError('audit durability prevented recording the preview outcome before shutdown')
   }
 
   private async awaitReady(previewId: string, child: ChildProcess, spawnedAt: number): Promise<PreviewOutcome> {
     if (!child.pid) return await this.refuse(previewId, child, 'spawn-failed')
     const owned = () => this.running.get(previewId)?.child === child
+    // A contained preview's readiness is its OWN bind inside the namespace, not the host-loopback
+    // bridge the runner hands the forwarder — the bridge is listening from creation, so waiting on
+    // host listeners alone would report ready before the preview has bound. Wait for the namespace
+    // to hold a listener first, so the reported port is reachable through the forward the moment it
+    // is announced (AS-30). A containment that claimed isolation but did not deliver it falls
+    // through to the host-visible readiness below, where detect-and-stop governs it.
+    if (this.containment.status.disposition === 'network-namespace') {
+      const contained = await awaitContainedReadiness(child.pid, this.readyTimeoutMs, owned)
+      if (contained === 'unbound') return await this.refuse(previewId, child, 'spawn-failed')
+    }
     const first = await waitForListeners(child.pid, this.readyTimeoutMs, owned, spawnedAt)
     // Best effort: a failed walk adds nothing to the record, and the record only grows.
     await rememberMembers(child, await descendantsOf(child.pid).catch(() => []))
@@ -616,6 +778,7 @@ export class PreviewHost extends EventEmitter {
     }
     if (this.running.get(previewId)?.child === child) this.running.delete(previewId)
     this.finalized.add(child)
+    await this.completeAudit(previewId, terminatedOutcome(child))
     return { status: 'refused', reason }
   }
 }
@@ -815,6 +978,35 @@ function anyAlive(pids: Iterable<number>) {
 // can answer for it, and one that began before cannot. Demanding a view newer than the
 // current instant instead would make every poll start its own scan, which is the cost the
 // sharing exists to avoid.
+// Poll the preview's own network namespace until it holds a listener — the contained preview
+// having bound — or the readiness budget runs out. The host-loopback bridge is deliberately not
+// consulted here: it is up from the start, so only the namespace's table distinguishes a bound
+// preview from one still starting.
+// Readiness of a preview a containment CLAIMED to isolate. `bound`: it runs in its own namespace
+// and has bound there. `unbound`: it is isolated but never bound within the budget. `uncontained`:
+// it never entered a namespace of its own — a containment that claimed isolation but did not
+// deliver it — so the host-visible readiness path, where detect-and-stop governs it, is the right
+// judge. The distinction matters because only a listener in the preview's OWN namespace is the
+// preview: during `unshare` startup the child is briefly still in the runner's namespace, where the
+// host's listeners (including the very port the preview will later claim) are visible.
+async function awaitContainedReadiness(pid: number, timeoutMs: number, stillWanted: () => boolean): Promise<'bound' | 'unbound' | 'uncontained'> {
+  const runnerNamespace = networkNamespaceOf('self')
+  const deadline = Date.now() + timeoutMs
+  const isolationDeadline = Date.now() + CONTAINMENT_ISOLATION_MS
+  let sawIsolated = false
+  while (Date.now() < deadline) {
+    if (!stillWanted()) return 'unbound'
+    if (networkNamespaceOf(pid) !== runnerNamespace) {
+      sawIsolated = true
+      if (namespaceHasListener(pid)) return 'bound'
+    } else if (!sawIsolated && Date.now() > isolationDeadline) {
+      return 'uncontained'
+    }
+    await delay(READY_POLL_MS)
+  }
+  return sawIsolated ? 'unbound' : 'uncontained'
+}
+
 async function waitForListeners(pid: number, timeoutMs: number, stillWanted: () => boolean, spawnedAt: number) {
   const deadline = Date.now() + timeoutMs
   let interval = READY_POLL_MS

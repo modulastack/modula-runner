@@ -13,6 +13,7 @@ import {
 import { StubControlPlane } from '../stubControlPlane.js'
 import { testRunnerInfo, until } from '../helpers.js'
 import { binding, token } from './support.js'
+import { permissiveSpawnSeam } from '../spawnSeamSupport.js'
 
 const planes: StubControlPlane[] = []
 const clients: RunnerClient[] = []
@@ -58,7 +59,7 @@ describe('AC-1 and AC-6 co-resident journey', () => {
     client.connect()
     await until(() => client.isConnected())
 
-    const host = new TerminalHost(client, { pollMs: 50 })
+    const host = new TerminalHost(client, { seam: permissiveSpawnSeam(), pollMs: 50 })
     hosts.push(host)
     const pane = await host.launch({
       command: '/bin/sh',

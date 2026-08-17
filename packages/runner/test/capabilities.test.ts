@@ -7,9 +7,15 @@ import {
   CapabilityMonitor,
   DEFAULT_RUNTIME_CATALOG,
   MIN_CAPABILITY_REFRESH_MS,
-  probeRuntime,
+  probeRuntime as probeRuntimeRaw,
   type RuntimeSpec,
 } from '../src/capabilities.js'
+import { permissiveSpawnSeam } from './spawnSeamSupport.js'
+
+// Probing now passes the spawn seam; these tests exercise probe behavior, not the allowlist, so
+// a permissive seam stands in and the call sites stay unchanged.
+const seam = permissiveSpawnSeam()
+const probeRuntime = (spec: RuntimeSpec, timeoutMs?: number) => probeRuntimeRaw(spec, seam, timeoutMs)
 import { sleep, until } from './helpers.js'
 
 // Stand-in executables throughout, never a real CLI: a suite that passes only on a machine
@@ -217,17 +223,17 @@ describe('runtime probes', () => {
   it('refuses a catalog entry that could not be advertised or could not be run', () => {
     const runtime = standIn(workspace())
 
-    expect(() => new CapabilityMonitor({ runtimes: [runtime.spec({ runtime: 'not a name' })] })).toThrow(/safe identifier/)
-    expect(() => new CapabilityMonitor({ runtimes: [runtime.spec({ access: [] })] })).toThrow(/at least one access mode/)
-    expect(() => new CapabilityMonitor({ runtimes: [runtime.spec({ keyVariable: 'not a variable' })] })).toThrow(/environment variable name/)
-    expect(() => new CapabilityMonitor({ runtimes: [runtime.spec(), runtime.spec()] })).toThrow(/unique/)
+    expect(() => new CapabilityMonitor({ seam, runtimes: [runtime.spec({ runtime: 'not a name' })] })).toThrow(/safe identifier/)
+    expect(() => new CapabilityMonitor({ seam, runtimes: [runtime.spec({ access: [] })] })).toThrow(/at least one access mode/)
+    expect(() => new CapabilityMonitor({ seam, runtimes: [runtime.spec({ keyVariable: 'not a variable' })] })).toThrow(/environment variable name/)
+    expect(() => new CapabilityMonitor({ seam, runtimes: [runtime.spec(), runtime.spec()] })).toThrow(/unique/)
   })
 })
 
 describe('the capability monitor', () => {
   it('has no snapshot until a probe lands, then holds the last one', async () => {
     const runtime = standIn(workspace())
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()] })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
 
     expect(monitor.snapshot()).toBeNull()
     const probed = await monitor.refresh()
@@ -238,7 +244,7 @@ describe('the capability monitor', () => {
 
   it('shares one pass between concurrent callers rather than spawning two fleets', async () => {
     const runtime = standIn(workspace())
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()] })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
 
     await Promise.all([monitor.refresh(), monitor.refresh(), monitor.refresh()])
 
@@ -248,7 +254,7 @@ describe('the capability monitor', () => {
   it('announces a change and stays quiet when nothing changed', async () => {
     const root = workspace()
     const runtime = standIn(root)
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()] })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
     const announced: unknown[] = []
     monitor.on('capabilities', capabilities => announced.push(capabilities))
 
@@ -262,7 +268,7 @@ describe('the capability monitor', () => {
     const runtime = standIn(workspace())
     // Below the floor on purpose: the cadence is the runner's, and a caller asking for
     // five probes a second gets the floor instead.
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()], refreshMs: 1 })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()], refreshMs: 1 })
 
     monitor.start()
     await until(() => runtime.invocations().length >= 2)
@@ -290,7 +296,7 @@ describe('the capability monitor', () => {
   it('leaves no second cadence behind when it is stopped mid-pass and started again', async () => {
     const runtime = standIn(workspace(), { hangs: true })
     const scheduled = cadenceSchedules()
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()], probeTimeoutMs: 300, refreshMs: CADENCE_MS })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()], probeTimeoutMs: 300, refreshMs: CADENCE_MS })
 
     monitor.start()
     // The only window where this can go wrong: the reschedule sits on the far side of an
@@ -312,7 +318,7 @@ describe('the capability monitor', () => {
 
   it('keeps announcing to the listeners that work, and retries the one that did not', async () => {
     const runtime = standIn(workspace())
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()] })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
     const healthy: unknown[] = []
     let throwUntilSecondTry = 2
     monitor.on('capabilities', () => {
@@ -333,7 +339,7 @@ describe('the capability monitor', () => {
 
   it('keeps answering for the machine even while a listener never stops throwing', async () => {
     const runtime = standIn(workspace())
-    const monitor = new CapabilityMonitor({ runtimes: [runtime.spec()] })
+    const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
     monitor.on('capabilities', () => {
       throw new Error('this subscriber is never coming back')
     })
@@ -350,7 +356,7 @@ describe('the capability monitor', () => {
   })
 
   it('probes nothing it was not given, so an installed CLI is not an ambient dependency', async () => {
-    expect(await new CapabilityMonitor().refresh()).toEqual({ runtimes: [], endpoints: [] })
+    expect(await new CapabilityMonitor({ seam }).refresh()).toEqual({ runtimes: [], endpoints: [] })
   })
 })
 

@@ -18,6 +18,7 @@ import {
 import { StubControlPlane } from '../stubControlPlane.js'
 import { sleep, testRunnerInfo, until } from '../helpers.js'
 import { binding, identityWithBinding, token } from './support.js'
+import { permissiveSpawnSeam } from '../spawnSeamSupport.js'
 import {
   killTmuxServer,
   startBlackHoleServer,
@@ -61,8 +62,8 @@ function registryFor(server: EndpointServer) {
   return new LocalEndpointRegistry([{ endpointId: 'desk-ollama', kind: 'ollama', baseUrl: server.baseUrl }])
 }
 
-function watch(options: ConstructorParameters<typeof CapabilityMonitor>[0]) {
-  const monitor = new CapabilityMonitor(options)
+function watch(options: Omit<ConstructorParameters<typeof CapabilityMonitor>[0], 'seam'>) {
+  const monitor = new CapabilityMonitor({ seam: permissiveSpawnSeam(), ...options })
   monitors.push(monitor)
   return monitor
 }

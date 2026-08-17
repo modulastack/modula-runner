@@ -14,13 +14,19 @@ import {
   LocalEndpointRegistry,
   PreviewHost,
   createPairedClient,
-  probeRuntime,
+  probeRuntime as probeRuntimeRaw,
   type RunnerClient,
   type RuntimeSpec,
 } from '../../src/index.js'
 import { StubControlPlane } from '../stubControlPlane.js'
 import { testRunnerInfo, until } from '../helpers.js'
 import { binding, identityWithBinding, token } from './support.js'
+import { grantingSpawnSeam, permissiveSpawnSeam } from '../spawnSeamSupport.js'
+
+// The allowlist gate is exercised in the security-floor suite; here a permissive seam stands in
+// so probe and capability behavior stay the subject, and the call sites read unchanged.
+const permissiveSeam = permissiveSpawnSeam()
+const probeRuntime = (spec: RuntimeSpec, timeoutMs?: number) => probeRuntimeRaw(spec, permissiveSeam, timeoutMs)
 import { startEndpointServer, temporaryRoot, writeStandInRuntime, type EndpointServer } from './accessSupport.js'
 
 const clients: RunnerClient[] = []
@@ -65,8 +71,8 @@ function spec(command: string, overrides: Partial<RuntimeSpec> = {}): RuntimeSpe
   }
 }
 
-function monitor(options: ConstructorParameters<typeof CapabilityMonitor>[0]) {
-  const created = new CapabilityMonitor(options)
+function monitor(options: Omit<ConstructorParameters<typeof CapabilityMonitor>[0], 'seam'>) {
+  const created = new CapabilityMonitor({ seam: permissiveSeam, ...options })
   monitors.push(created)
   return created
 }
@@ -258,7 +264,8 @@ describe('FR-10 the advertisement rides job-control, not hello', () => {
     clients.push(client)
     client.connect()
     await until(() => client.isConnected())
-    const preview = new PreviewHost({ allowlist: { recipes: {}, grantedPaths: [] } })
+    const granting = grantingSpawnSeam()
+    const preview = new PreviewHost({ seam: granting.seam, consent: granting.consent })
     const host = new JobControlHost({ client, preview })
     const channel = host.open()
     await until(() => plane.opens.includes(channel.id))

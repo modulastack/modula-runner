@@ -120,6 +120,15 @@ type SocketRow = { address: string; port: number; inode: string; protocol: 'tcp'
 // through lsof. Returning null means "could not determine" and never "it is fine" — the
 // caller refuses on null, because an unverifiable directory is exactly the case a grant
 // check exists to catch.
+// Whether this platform exposes a running process's working directory at all — Linux through
+// `/proc`, macOS through `lsof`. Kept beside `workingDirectoryOf` because it must name exactly the
+// platforms that function can answer for: a read-back caller fails closed on an unknown landing
+// where the mechanism EXISTS, but keeps the documented residual where it does not, and telling
+// those two apart from a bare `null` is impossible without this.
+export function processCwdReadBackAvailable(): boolean {
+  return process.platform === 'linux' || process.platform === 'darwin'
+}
+
 export async function workingDirectoryOf(pid: number): Promise<string | null> {
   // Null means undetermined; the caller refuses on null rather than allowing.
   // Null means undetermined, and the caller refuses on null rather than allowing.
