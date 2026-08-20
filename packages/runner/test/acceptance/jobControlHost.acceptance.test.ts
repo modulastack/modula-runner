@@ -26,6 +26,7 @@ const planes: StubControlPlane[] = []
 const previews: PreviewHost[] = []
 const trackers: PresenceTracker[] = []
 const temporaryPaths: string[] = []
+const responseTimeoutMs = 10_000
 
 afterEach(async () => {
   for (const tracker of trackers) tracker.stop()
@@ -80,7 +81,10 @@ function serverMessages(value: Harness) {
 async function request(value: Harness, requestMessage: JobControlClientMessage) {
   const before = serverMessages(value).length
   value.plane.sendToRunner(value.channelId, jobControlPayload(requestMessage))
-  await until(() => serverMessages(value).slice(before).some(message => answers(message, requestMessage)))
+  await until(
+    () => serverMessages(value).slice(before).some(message => answers(message, requestMessage)),
+    responseTimeoutMs,
+  )
   return serverMessages(value).slice(before).filter(message => answers(message, requestMessage))
 }
 

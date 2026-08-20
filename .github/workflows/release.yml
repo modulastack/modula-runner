@@ -1,0 +1,1414 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      recovery_tag:
+        description: Exact existing release tag to recover or verify
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  selector:
+    name: Select protected release mode
+    runs-on: ubuntu-24.04
+    environment: immutable-release
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.target.outputs.mode }}
+      release_id: ${{ steps.target.outputs.release_id }}
+      origin_run: ${{ steps.target.outputs.origin_run }}
+      origin_attempt: ${{ steps.target.outputs.origin_attempt }}
+      origin_sha: ${{ steps.target.outputs.origin_sha }}
+      artifact_id: ${{ steps.target.outputs.artifact_id }}
+      artifact_digest: ${{ steps.target.outputs.artifact_digest }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag belongs to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          test "$tag_commit" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+
+      - name: Select publish, draft-resume, or immutable-recovery mode
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          RECOVERY_TAG: ${{ inputs.recovery_tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "modulastack/modula-runner"
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          gh_version="$(gh --version | awk 'NR==1 {print $3}')"
+          dpkg --compare-versions "$gh_version" ge 2.97.0
+
+          case "$GITHUB_EVENT_NAME" in
+            push) test -z "$RECOVERY_TAG" ;;
+            workflow_dispatch) test "$RECOVERY_TAG" = "$GITHUB_REF_NAME" ;;
+            *) exit 1 ;;
+          esac
+
+          pages="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          matches="$(jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]' <<<"$pages")"
+          count="$(jq 'length' <<<"$matches")"
+          test "$count" -le 1
+
+          if test "$count" -eq 0; then
+            test "$GITHUB_EVENT_NAME" = push
+            echo "mode=publish" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_id="$(jq -r '.[0].id' <<<"$matches")"
+          state="$(jq -r '.[0] | [.draft,.prerelease,.immutable] | @tsv' <<<"$matches")"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          if test "$state" = $'false\tfalse\ttrue'; then
+            echo "mode=recover" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          test "$state" = $'true\tfalse\tfalse'
+          if test "$GITHUB_EVENT_NAME" != workflow_dispatch; then
+            echo "draft release requires a fresh workflow_dispatch at the exact tag" >&2
+            exit 1
+          fi
+          body="$(jq -r '.[0].body // ""' <<<"$matches")"
+          test "$(grep -oF '<!-- modula-runner-recovery:v1 ' <<<"$body" | wc -l)" -eq 1
+          origin="$(jq -r '.[0].body | capture(
+            "<!-- modula-runner-recovery:v1 run_id=(?<run>[0-9]+) attempt=(?<attempt>[0-9]+) sha=(?<sha>[0-9a-f]{40}) artifact_id=(?<artifact>[0-9]+) artifact_digest=(?<digest>sha256:[0-9a-f]{64}) -->"
+          ) | [.run,.attempt,.sha,.artifact,.digest] | @tsv' <<<"$matches")"
+          IFS=$'\t' read -r origin_run origin_attempt origin_sha artifact_id artifact_digest <<<"$origin"
+          test "$origin_sha" = "$GITHUB_SHA"
+          test "$origin_run" != "$GITHUB_RUN_ID"
+          test "$origin_attempt" -ge 1
+          {
+            echo "mode=resume"
+            echo "origin_run=$origin_run"
+            echo "origin_attempt=$origin_attempt"
+            echo "origin_sha=$origin_sha"
+            echo "artifact_id=$artifact_id"
+            echo "artifact_digest=$artifact_digest"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Unprivileged build and current audit
+    needs: selector
+    if: >-
+      ${{
+        needs.selector.result == 'success' &&
+        (needs.selector.outputs.mode == 'publish' || needs.selector.outputs.mode == 'resume')
+      }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.preserved-build.outputs.artifact-id }}
+      artifact_digest: ${{ steps.preserved-build.outputs.artifact-digest }}
+      artifact_name: ${{ steps.build-evidence.outputs.artifact_name }}
+      package_digest: ${{ steps.build-evidence.outputs.package_digest }}
+      audit_attempt: ${{ steps.current-audit.outputs.run_attempt }}
+    steps:
+      - name: Check out the event commit for the unprivileged build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the immutable build source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install the declared Node toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify the toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_node="v$(tr -d '[:space:]' < .nvmrc)"
+          expected_npm="$(node -p "require('./package.json').packageManager.replace('npm@', '')")"
+          test "$(node --version)" = "$expected_node"
+          test "$(npm --version)" = "$expected_npm"
+          test "$(dirname "$(command -v node)")" = "$(dirname "$(command -v npm)")"
+
+      - name: Validate lock integrity before dependency execution
+        run: node scripts/supply-chain.mjs lock
+
+      - name: Install the locked dependency tree without release authority
+        run: npm ci
+
+      - name: Re-evaluate the current production vulnerability policy
+        id: current-audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run supply-chain:audit
+          npm run supply-chain:seeded-red
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Run the deterministic gate with preview containment
+        if: needs.selector.outputs.mode == 'publish'
+        shell: bash
+        run: |
+          set -euo pipefail
+          key=kernel.apparmor_restrict_unprivileged_userns
+
+          test "$(id -u)" -ne 0
+          for tool in sudo sysctl unshare ip; do
+            command -v "$tool" >/dev/null
+          done
+
+          original="$(sysctl -n "$key")"
+          case "$original" in 0|1) ;; *) exit 1 ;; esac
+
+          restore_userns_policy() {
+            sudo -n sysctl -q -w "$key=$original"
+            test "$(sysctl -n "$key")" = "$original"
+          }
+          trap restore_userns_policy EXIT
+
+          sudo -n sysctl -q -w "$key=0"
+          test "$(sysctl -n "$key")" = 0
+          unshare --user --map-root-user --net -- sh -c 'ip link set lo up'
+
+          npm run gate
+
+      - name: Preserve one of exactly two byte-for-byte package builds
+        if: needs.selector.outputs.mode == 'publish'
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run release:reproducible -- --output dist/release
+          version="$(node -p "require('./packages/runner/package.json').version")"
+          artifact="$GITHUB_WORKSPACE/dist/release/modula-runner-${version}.tgz"
+          test -f "$artifact"
+          (cd dist/release && sha256sum --strict --check SHA256SUMS)
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "digest=$(sha256sum "$artifact" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Gate the locked production dependency tree
+        if: needs.selector.outputs.mode == 'publish'
+        id: supply-chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run supply-chain:gate
+          sbom="$GITHUB_WORKSPACE/dist/release/modula-runner.cdx.json"
+          test -f "$sbom"
+          (cd dist/release && sha256sum --strict --check SHA256SUMS)
+          echo "sbom=$sbom" >> "$GITHUB_OUTPUT"
+
+      - name: Install the CycloneDX validator for the unprivileged build
+        if: needs.selector.outputs.mode == 'publish'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/cyclonedx-cli"
+          mkdir -p "$install_dir"
+          gh release download v0.30.0 \
+            --repo CycloneDX/cyclonedx-cli \
+            --pattern cyclonedx-linux-x64 \
+            --dir "$install_dir"
+          validator="$install_dir/cyclonedx-linux-x64"
+          echo "f89876326620f5fc78a9b27cc1af57d6ed13d019aab87490e1246a44a910babb  $validator" \
+            | sha256sum --check
+          chmod +x "$validator"
+          echo "CYCLONEDX_CLI=$validator" >> "$GITHUB_ENV"
+
+      - name: Validate the unprivileged CycloneDX SBOM
+        if: needs.selector.outputs.mode == 'publish'
+        run: >-
+          "$CYCLONEDX_CLI" validate
+          --input-file "${{ steps.supply-chain.outputs.sbom }}"
+          --input-format json
+          --input-version v1_5
+          --fail-on-errors
+
+      - name: Generate release notes without publication authority
+        if: needs.selector.outputs.mode == 'publish'
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$GITHUB_WORKSPACE/dist/release/RELEASE_NOTES.md"
+          node scripts/release.mjs notes --output "$notes"
+          test -s "$notes"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare exact unsigned build evidence
+        if: needs.selector.outputs.mode == 'publish'
+        id: build-evidence
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+          SBOM: ${{ steps.supply-chain.outputs.sbom }}
+          NOTES: ${{ steps.notes.outputs.notes }}
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/build-evidence"
+          rm -rf -- "$directory"
+          mkdir -- "$directory"
+          sources=(
+            "$ARTIFACT"
+            "$SBOM"
+            "$GITHUB_WORKSPACE/dist/release/SHA256SUMS"
+            "$GITHUB_WORKSPACE/dist/release/audit-summary.json"
+            "$NOTES"
+          )
+          assets='[]'
+          for source in "${sources[@]}"; do
+            name="$(basename "$source")"
+            cp -- "$source" "$directory/$name"
+            digest="$(sha256sum "$directory/$name" | cut -d' ' -f1)"
+            size="$(stat -c '%s' "$directory/$name")"
+            assets="$(jq --arg name "$name" --arg digest "$digest" --argjson size "$size" \
+              '. + [{name:$name,size:$size,sha256:$digest}]' <<<"$assets")"
+          done
+          package_digest="$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow ".github/workflows/release.yml" \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg packageDigest "$package_digest" \
+            --argjson assets "$assets" \
+            '{version:1,kind:"unsigned-build-evidence",repository:$repository,
+              workflow:$workflow,tag:$tag,sha:$sha,runId:$run,runAttempt:$attempt,
+              packageDigest:$packageDigest,assets:$assets}' \
+            > "$directory/BUILD-EVIDENCE-MANIFEST.json"
+          test "$(jq '.assets | length' "$directory/BUILD-EVIDENCE-MANIFEST.json")" -eq 5
+          artifact_name="modula-runner-build-${GITHUB_REF_NAME}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "directory=$directory"
+            echo "artifact_name=$artifact_name"
+            echo "package_digest=$package_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Preserve the unprivileged build evidence
+        if: needs.selector.outputs.mode == 'publish'
+        id: preserved-build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.build-evidence.outputs.artifact_name }}
+          path: ${{ steps.build-evidence.outputs.directory }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publisher:
+    name: Sign, attest, and publish preserved bytes
+    needs: [selector, build]
+    if: >-
+      ${{
+        always() && !cancelled() &&
+        needs.selector.result == 'success' &&
+        needs.build.result == 'success' &&
+        (needs.selector.outputs.mode == 'publish' || needs.selector.outputs.mode == 'resume')
+      }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Validate the privileged publication boundary
+        id: boundary
+        shell: bash
+        env:
+          MODE: ${{ needs.selector.outputs.mode }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          BUILD_AUDIT_ATTEMPT: ${{ needs.build.outputs.audit_attempt }}
+          BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          BUILD_ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          BUILD_ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+          BUILD_PACKAGE_DIGEST: ${{ needs.build.outputs.package_digest }}
+        run: |
+          set -euo pipefail
+          test "$BUILD_RESULT" = success
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          test "$BUILD_AUDIT_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          case "$MODE" in
+            publish)
+              test "$GITHUB_EVENT_NAME" = push
+              [[ "$BUILD_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+              expected_name="modula-runner-build-${GITHUB_REF_NAME}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+              test "$BUILD_ARTIFACT_NAME" = "$expected_name"
+              case "$BUILD_ARTIFACT_DIGEST" in
+                sha256:[0-9a-f][0-9a-f]*) artifact_digest="$BUILD_ARTIFACT_DIGEST" ;;
+                [0-9a-f][0-9a-f]*) artifact_digest="sha256:$BUILD_ARTIFACT_DIGEST" ;;
+                *) exit 1 ;;
+              esac
+              [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$BUILD_PACKAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+              echo "artifact_digest=$artifact_digest" >> "$GITHUB_OUTPUT"
+              ;;
+            resume)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Verify the publisher GitHub CLI security floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh_version="$(gh --version | awk 'NR==1 {print $3}')"
+          dpkg --compare-versions "$gh_version" ge 2.97.0
+
+      - name: Preflight the current build artifact identity
+        if: needs.selector.outputs.mode == 'publish'
+        id: build-artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ steps.boundary.outputs.artifact_digest }}
+          ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          attempt_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}")"
+          jq -e \
+            --argjson run "$GITHUB_RUN_ID" \
+            --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson repository_id "$GITHUB_REPOSITORY_ID" \
+            '.id==$run and .run_attempt==$attempt and .head_sha==$sha and
+             .event=="push" and .path==".github/workflows/release.yml" and
+             .repository.full_name==$repository and .head_repository.full_name==$repository and
+             .repository.id==$repository_id and .head_repository.id==$repository_id and
+             .status=="in_progress" and .conclusion==null' \
+            <<<"$attempt_json" >/dev/null
+          artifact_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")"
+          jq -e \
+            --argjson id "$ARTIFACT_ID" \
+            --arg name "$ARTIFACT_NAME" \
+            --arg digest "$ARTIFACT_DIGEST" \
+            --argjson run "$GITHUB_RUN_ID" \
+            --argjson repository "$GITHUB_REPOSITORY_ID" \
+            --arg sha "$GITHUB_SHA" \
+            '.id==$id and .name==$name and .expired==false and
+             (.size_in_bytes>0 and .size_in_bytes<=209715200) and
+             .digest==$digest and .workflow_run.id==$run and .workflow_run.head_sha==$sha and
+             .workflow_run.repository_id==$repository and
+             .workflow_run.head_repository_id==$repository' \
+            <<<"$artifact_json" >/dev/null
+          echo "archive_size=$(jq -r '.size_in_bytes' <<<"$artifact_json")" >> "$GITHUB_OUTPUT"
+
+      - name: Install the CycloneDX validator for publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/cyclonedx-cli"
+          mkdir -p "$install_dir"
+          gh release download v0.30.0 \
+            --repo CycloneDX/cyclonedx-cli \
+            --pattern cyclonedx-linux-x64 \
+            --dir "$install_dir"
+          validator="$install_dir/cyclonedx-linux-x64"
+          echo "f89876326620f5fc78a9b27cc1af57d6ed13d019aab87490e1246a44a910babb  $validator" \
+            | sha256sum --check
+          chmod +x "$validator"
+          echo "CYCLONEDX_CLI=$validator" >> "$GITHUB_ENV"
+
+      - name: Install Cosign for publication
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Verify the publication Cosign installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign_path="$(command -v cosign)"
+          test "$(sha256sum "$cosign_path" | cut -d' ' -f1)" = \
+            "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
+
+      - name: Download the exact unprivileged build archive
+        if: needs.selector.outputs.mode == 'publish'
+        id: download-build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          path: ${{ runner.temp }}/build-download
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Validate and extract the unprivileged build evidence
+        if: needs.selector.outputs.mode == 'publish'
+        id: build-evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ steps.boundary.outputs.artifact_digest }}
+          ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+          ARTIFACT_SIZE: ${{ steps.build-artifact.outputs.archive_size }}
+          BUILD_PACKAGE_DIGEST: ${{ needs.build.outputs.package_digest }}
+          DOWNLOAD_PATH: ${{ runner.temp }}/build-download
+        run: |
+          set -euo pipefail
+          attempt_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}")"
+          jq -e \
+            --argjson run "$GITHUB_RUN_ID" \
+            --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson repository_id "$GITHUB_REPOSITORY_ID" \
+            '.id==$run and .run_attempt==$attempt and .head_sha==$sha and
+             .event=="push" and .path==".github/workflows/release.yml" and
+             .repository.full_name==$repository and .head_repository.full_name==$repository and
+             .repository.id==$repository_id and .head_repository.id==$repository_id and
+             .status=="in_progress" and .conclusion==null' \
+            <<<"$attempt_json" >/dev/null
+
+          [[ "$ARTIFACT_SIZE" =~ ^[1-9][0-9]*$ ]]
+          test "$ARTIFACT_SIZE" -le 209715200
+          artifact_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")"
+          jq -e \
+            --argjson id "$ARTIFACT_ID" \
+            --arg name "$ARTIFACT_NAME" \
+            --arg digest "$ARTIFACT_DIGEST" \
+            --argjson size "$ARTIFACT_SIZE" \
+            --argjson run "$GITHUB_RUN_ID" \
+            --argjson repository "$GITHUB_REPOSITORY_ID" \
+            --arg sha "$GITHUB_SHA" \
+            '.id==$id and .name==$name and .expired==false and .size_in_bytes==$size and
+             .digest==$digest and .workflow_run.id==$run and .workflow_run.head_sha==$sha and
+             .workflow_run.repository_id==$repository and
+             .workflow_run.head_repository_id==$repository' \
+            <<<"$artifact_json" >/dev/null
+
+          mapfile -d '' archives < <(find "$DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 -type f -print0)
+          test "${#archives[@]}" -eq 1
+          test -z "$(find "$DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+          archive="${archives[0]}"
+          test "$(stat -c '%s' "$archive")" -eq "$ARTIFACT_SIZE"
+          test "sha256:$(sha256sum "$archive" | cut -d' ' -f1)" = "$ARTIFACT_DIGEST"
+
+          directory="$RUNNER_TEMP/validated-build-evidence"
+          rm -rf -- "$directory"
+          mkdir -- "$directory"
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$archive" "$directory" "$version" <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import tarfile
+          import zipfile
+
+          archive_path, output, version = sys.argv[1:]
+          package = f"modula-runner-{version}.tgz"
+          limits = {
+              package: 100 * 1024 * 1024,
+              "modula-runner.cdx.json": 50 * 1024 * 1024,
+              "SHA256SUMS": 1024 * 1024,
+              "audit-summary.json": 5 * 1024 * 1024,
+              "RELEASE_NOTES.md": 1024 * 1024,
+              "BUILD-EVIDENCE-MANIFEST.json": 1024 * 1024,
+          }
+          with zipfile.ZipFile(archive_path) as source:
+              entries = source.infolist()
+              names = [entry.filename for entry in entries]
+              if len(names) != len(set(names)) or set(names) != set(limits):
+                  raise SystemExit("build archive member contract failed")
+              for entry in entries:
+                  name = entry.filename
+                  mode = entry.external_attr >> 16
+                  if (name != PurePosixPath(name).name or "\\" in name or entry.is_dir() or
+                          entry.flag_bits & 1 or entry.file_size <= 0 or
+                          entry.file_size > limits[name] or
+                          stat.S_IFMT(mode) not in (0, stat.S_IFREG)):
+                      raise SystemExit("build archive member safety failed")
+                  destination = os.path.join(output, name)
+                  with source.open(entry) as reader, open(destination, "xb") as writer:
+                      shutil.copyfileobj(reader, writer, 1024 * 1024)
+                  if os.path.getsize(destination) != entry.file_size:
+                      raise SystemExit("build archive member size failed")
+
+          package_path = os.path.join(output, package)
+          package_tar = os.path.join(output, ".validated-package.tar")
+          lock_name = "package/npm-shrinkwrap.json"
+          required = {
+              "package/package.json",
+              "package/packages/protocol/package.json",
+              "package/packages/runner/package.json",
+              "package/BUILD-METADATA.json",
+              lock_name,
+          }
+          members = set()
+          documents = {}
+          lock_digest = None
+          total = 0
+          try:
+              decompressed = 0
+              with gzip.open(package_path, "rb") as compressed, open(package_tar, "xb") as raw:
+                  while chunk := compressed.read(1024 * 1024):
+                      decompressed += len(chunk)
+                      if decompressed > 160 * 1024 * 1024:
+                          raise SystemExit("release package decompression limit failed")
+                      raw.write(chunk)
+              with tarfile.open(package_tar, "r:") as packed:
+                  for count, member in enumerate(packed, start=1):
+                      name = member.name.rstrip("/")
+                      if count > 512 or name in members:
+                          raise SystemExit("release package member count contract failed")
+                      path = PurePosixPath(member.name)
+                      if (path.is_absolute() or ".." in path.parts or "\\" in member.name or
+                              not (member.isfile() or member.isdir())):
+                          raise SystemExit("release package member safety failed")
+                      if "/src/" in f"/{member.name}" or "/test/" in f"/{member.name}":
+                          raise SystemExit("release package contains development sources")
+                      if member.size < 0 or member.size > 50 * 1024 * 1024 or \
+                              total + member.size > 150 * 1024 * 1024:
+                          raise SystemExit("release package size contract failed")
+                      members.add(name)
+                      total += member.size
+                      if name in required and name != lock_name:
+                          reader = packed.extractfile(member)
+                          if reader is None or member.size > 20 * 1024 * 1024:
+                              raise SystemExit("release package JSON contract failed")
+                          documents[name] = json.load(reader)
+                      elif name == lock_name:
+                          reader = packed.extractfile(member)
+                          if reader is None:
+                              raise SystemExit("release lockfile is missing")
+                          digest = hashlib.sha256()
+                          while chunk := reader.read(1024 * 1024):
+                              digest.update(chunk)
+                          lock_digest = digest.hexdigest()
+          finally:
+              if os.path.exists(package_tar):
+                  os.remove(package_tar)
+          if not required.issubset(members):
+              raise SystemExit("release package member contract failed")
+
+          manifests = [documents[name] for name in sorted(required) if name.endswith("package.json")]
+          if any("scripts" in manifest or "devDependencies" in manifest for manifest in manifests):
+              raise SystemExit("release package manifest contains build fields")
+          if any(manifest.get("version") != version for manifest in manifests):
+              raise SystemExit("release package version contract failed")
+          metadata = documents["package/BUILD-METADATA.json"]
+          expected = {
+              "artifact": "modula-runner",
+              "version": version,
+              "expectedTag": f"v{version}",
+              "toolchain": {"node": "22.22.3", "npm": "10.9.8"},
+          }
+          if any(metadata.get(key) != value for key, value in expected.items()):
+              raise SystemExit("release build metadata contract failed")
+          if lock_digest != metadata.get("lockfileSha256"):
+              raise SystemExit("release lockfile digest contract failed")
+          PY
+
+          manifest="$directory/BUILD-EVIDENCE-MANIFEST.json"
+          expected=(
+            "modula-runner-${version}.tgz"
+            "modula-runner.cdx.json"
+            "SHA256SUMS"
+            "audit-summary.json"
+            "RELEASE_NOTES.md"
+          )
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg packageDigest "$BUILD_PACKAGE_DIGEST" \
+            '.version==1 and .kind=="unsigned-build-evidence" and
+             .repository==$repository and .workflow==".github/workflows/release.yml" and
+             .tag==$tag and .sha==$sha and .runId==$run and .runAttempt==$attempt and
+             .packageDigest==$packageDigest and (.assets | length)==5' \
+            "$manifest" >/dev/null
+          diff -u \
+            <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort) \
+            <(jq -r '.assets[].name' "$manifest" | LC_ALL=C sort)
+          for name in "${expected[@]}"; do
+            source="$directory/$name"
+            test -s "$source"
+            size="$(stat -c '%s' "$source")"
+            digest="$(sha256sum "$source" | cut -d' ' -f1)"
+            test "$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
+              "$manifest")" -eq 1
+            jq -e --arg name "$name" --arg digest "$digest" --argjson size "$size" \
+              '.assets[] | select(.name==$name) | .sha256==$digest and .size==$size' \
+              "$manifest" >/dev/null
+          done
+          artifact="$directory/modula-runner-${version}.tgz"
+          sbom="$directory/modula-runner.cdx.json"
+          test "$(sha256sum "$artifact" | cut -d' ' -f1)" = "$BUILD_PACKAGE_DIGEST"
+          (cd "$directory" && sha256sum --strict --check SHA256SUMS)
+          jq -e '.production.blocked==[] and
+            (.developmentOnly.blocking==false) and
+            (.waiversApplied | type)=="array"' "$directory/audit-summary.json" >/dev/null
+          grep -F "@refs/tags/$GITHUB_REF_NAME" "$directory/RELEASE_NOTES.md" >/dev/null
+          grep -F "commit=$GITHUB_SHA" "$directory/RELEASE_NOTES.md" >/dev/null
+          {
+            echo "directory=$directory"
+            echo "artifact=$artifact"
+            echo "sbom=$sbom"
+            echo "notes=$directory/RELEASE_NOTES.md"
+            echo "package_digest=$BUILD_PACKAGE_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate the preserved CycloneDX SBOM
+        if: needs.selector.outputs.mode == 'publish'
+        run: >-
+          "$CYCLONEDX_CLI" validate
+          --input-file "${{ steps.build-evidence.outputs.sbom }}"
+          --input-format json
+          --input-version v1_5
+          --fail-on-errors
+
+      - name: Sign and verify the preserved package and SBOM
+        if: needs.selector.outputs.mode == 'publish'
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.build-evidence.outputs.artifact }}
+          SBOM: ${{ steps.build-evidence.outputs.sbom }}
+          CERTIFICATE_IDENTITY_REGEXP: '^https://github\.com/modulastack/modula-runner/\.github/workflows/release\.yml@refs/tags/v[^/]*$'
+          CERTIFICATE_OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
+        run: |
+          set -euo pipefail
+          for subject in "$ARTIFACT" "$SBOM"; do
+            cosign sign-blob --yes \
+              --oidc-provider github-actions \
+              --bundle "${subject}.sigstore.json" \
+              "$subject"
+            cosign verify-blob "$subject" \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+              --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"
+          done
+          tampered="$(mktemp "$RUNNER_TEMP/tampered-package.XXXXXX.tgz")"
+          trap 'rm -f "$tampered"' EXIT
+          cp "$ARTIFACT" "$tampered"
+          printf '\0' >> "$tampered"
+          if cosign verify-blob "$tampered" \
+            --bundle "${ARTIFACT}.sigstore.json" \
+            --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"; then
+            echo "tampered artifact unexpectedly verified" >&2
+            exit 1
+          fi
+
+      - name: Attest the preserved release package provenance
+        if: needs.selector.outputs.mode == 'publish'
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.build-evidence.outputs.artifact }}
+
+      - name: Prepare recoverable signed release evidence
+        if: needs.selector.outputs.mode == 'publish'
+        id: recovery-evidence
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.build-evidence.outputs.artifact }}
+          SBOM: ${{ steps.build-evidence.outputs.sbom }}
+          NOTES: ${{ steps.build-evidence.outputs.notes }}
+          PROVENANCE_SOURCE: ${{ steps.provenance.outputs.bundle-path }}
+          COMPARED_PACKAGE_DIGEST: ${{ steps.build-evidence.outputs.package_digest }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          directory="$RUNNER_TEMP/recovery-evidence"
+          rm -rf -- "$directory"
+          mkdir -- "$directory"
+          provenance="$directory/modula-runner-${version}.provenance.sigstore.json"
+          cp -- "$PROVENANCE_SOURCE" "$provenance"
+          sources=(
+            "$ARTIFACT"
+            "${ARTIFACT}.sigstore.json"
+            "$SBOM"
+            "${SBOM}.sigstore.json"
+            "$(dirname "$ARTIFACT")/SHA256SUMS"
+            "$provenance"
+          )
+          assets='[]'
+          for source in "${sources[@]}"; do
+            name="$(basename "$source")"
+            if test "$source" != "$directory/$name"; then cp -- "$source" "$directory/$name"; fi
+            digest="$(sha256sum "$directory/$name" | cut -d' ' -f1)"
+            size="$(stat -c '%s' "$directory/$name")"
+            assets="$(jq --arg name "$name" --arg digest "$digest" --argjson size "$size" \
+              '. + [{name:$name,size:$size,sha256:$digest}]' <<<"$assets")"
+          done
+          cp -- "$NOTES" "$directory/RELEASE_NOTES.md"
+          test "$(sha256sum "$directory/modula-runner-${version}.tgz" | cut -d' ' -f1)" = \
+            "$COMPARED_PACKAGE_DIGEST"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow ".github/workflows/release.yml" \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg packageDigest "$COMPARED_PACKAGE_DIGEST" \
+            --argjson assets "$assets" \
+            '{version:1,repository:$repository,workflow:$workflow,tag:$tag,sha:$sha,
+              runId:$run,runAttempt:$attempt,packageDigest:$packageDigest,assets:$assets}' \
+            > "$directory/RECOVERY-MANIFEST.json"
+          test "$(jq '.assets | length' "$directory/RECOVERY-MANIFEST.json")" -eq 6
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve the signed evidence for draft recovery
+        if: needs.selector.outputs.mode == 'publish'
+        id: preserved
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: modula-runner-${{ github.ref_name }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.recovery-evidence.outputs.directory }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Restore the originating signed release evidence
+        if: needs.selector.outputs.mode == 'resume'
+        id: restored
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          TAG: ${{ github.ref_name }}
+          ORIGIN_RUN: ${{ needs.selector.outputs.origin_run }}
+          ORIGIN_ATTEMPT: ${{ needs.selector.outputs.origin_attempt }}
+          ORIGIN_SHA: ${{ needs.selector.outputs.origin_sha }}
+          ARTIFACT_ID: ${{ needs.selector.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.selector.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ORIGIN_RUN" =~ ^[0-9]+$ ]]
+          [[ "$ORIGIN_ATTEMPT" =~ ^[0-9]+$ ]]
+          [[ "$ORIGIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          artifact_name="modula-runner-${TAG}-run-${ORIGIN_RUN}-attempt-${ORIGIN_ATTEMPT}"
+          artifact_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")"
+          jq -e \
+            --argjson id "$ARTIFACT_ID" \
+            --arg name "$artifact_name" \
+            --arg digest "$ARTIFACT_DIGEST" \
+            --argjson run "$ORIGIN_RUN" \
+            --argjson repository "$GITHUB_REPOSITORY_ID" \
+            --arg sha "$ORIGIN_SHA" \
+            '.id==$id and .name==$name and .expired==false and
+             (.size_in_bytes>0 and .size_in_bytes<=209715200) and
+             .digest==$digest and .workflow_run.id==$run and .workflow_run.head_sha==$sha and
+             .workflow_run.repository_id==$repository and
+             .workflow_run.head_repository_id==$repository' \
+            <<<"$artifact_json" >/dev/null
+          archive_size="$(jq -r '.size_in_bytes' <<<"$artifact_json")"
+          attempt_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGIN_RUN}/attempts/${ORIGIN_ATTEMPT}")"
+          jq -e \
+            --argjson run "$ORIGIN_RUN" \
+            --argjson attempt "$ORIGIN_ATTEMPT" \
+            --arg sha "$ORIGIN_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson repository_id "$GITHUB_REPOSITORY_ID" \
+            '.id==$run and .run_attempt==$attempt and .head_sha==$sha and
+             .event=="push" and .path==".github/workflows/release.yml" and
+             .repository.full_name==$repository and .head_repository.full_name==$repository and
+             .repository.id==$repository_id and .head_repository.id==$repository_id and
+             .status=="completed" and
+             (.conclusion=="failure" or .conclusion=="cancelled" or
+              .conclusion=="timed_out" or .conclusion=="action_required" or
+              .conclusion=="stale")' \
+            <<<"$attempt_json" >/dev/null
+
+          archive="$RUNNER_TEMP/recovery-${ARTIFACT_ID}.zip"
+          directory="$RUNNER_TEMP/restored-release-evidence"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > "$archive"
+          test "$(stat -c '%s' "$archive")" -eq "$archive_size"
+          test "sha256:$(sha256sum "$archive" | cut -d' ' -f1)" = "$ARTIFACT_DIGEST"
+          rm -rf -- "$directory"
+          mkdir -- "$directory"
+          version="${TAG#v}"
+          python3 - "$archive" "$directory" "$version" <<'PY'
+          import os
+          from pathlib import PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, output, version = sys.argv[1:]
+          limits = {
+              f"modula-runner-{version}.tgz": 100 * 1024 * 1024,
+              f"modula-runner-{version}.tgz.sigstore.json": 10 * 1024 * 1024,
+              "modula-runner.cdx.json": 50 * 1024 * 1024,
+              "modula-runner.cdx.json.sigstore.json": 10 * 1024 * 1024,
+              "SHA256SUMS": 1024 * 1024,
+              f"modula-runner-{version}.provenance.sigstore.json": 20 * 1024 * 1024,
+              "RECOVERY-MANIFEST.json": 1024 * 1024,
+              "RELEASE_NOTES.md": 1024 * 1024,
+          }
+          with zipfile.ZipFile(archive_path) as source:
+              entries = source.infolist()
+              names = [entry.filename for entry in entries]
+              if len(names) != len(set(names)) or set(names) != set(limits):
+                  raise SystemExit("recovery archive member contract failed")
+              for entry in entries:
+                  name = entry.filename
+                  mode = entry.external_attr >> 16
+                  if (name != PurePosixPath(name).name or "\\" in name or entry.is_dir() or
+                          entry.flag_bits & 1 or entry.file_size <= 0 or
+                          entry.file_size > limits[name] or
+                          stat.S_IFMT(mode) not in (0, stat.S_IFREG)):
+                      raise SystemExit("recovery archive member safety failed")
+                  destination = os.path.join(output, name)
+                  with source.open(entry) as reader, open(destination, "xb") as writer:
+                      shutil.copyfileobj(reader, writer, 1024 * 1024)
+                  if os.path.getsize(destination) != entry.file_size:
+                      raise SystemExit("recovery archive member size failed")
+          PY
+
+          manifest="$directory/RECOVERY-MANIFEST.json"
+          expected=(
+            "modula-runner-${version}.tgz"
+            "modula-runner-${version}.tgz.sigstore.json"
+            "modula-runner.cdx.json"
+            "modula-runner.cdx.json.sigstore.json"
+            "SHA256SUMS"
+            "modula-runner-${version}.provenance.sigstore.json"
+          )
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$TAG" \
+            --arg sha "$ORIGIN_SHA" \
+            --arg run "$ORIGIN_RUN" \
+            --arg attempt "$ORIGIN_ATTEMPT" \
+            '.version==1 and .repository==$repository and
+             .workflow==".github/workflows/release.yml" and .tag==$tag and .sha==$sha and
+             .runId==$run and .runAttempt==$attempt and
+             (.packageDigest | test("^[0-9a-f]{64}$")) and (.assets | length)==6' \
+            "$manifest" >/dev/null
+          diff -u \
+            <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort) \
+            <(jq -r '.assets[].name' "$manifest" | LC_ALL=C sort)
+          for name in "${expected[@]}"; do
+            source="$directory/$name"
+            test -s "$source"
+            size="$(stat -c '%s' "$source")"
+            digest="$(sha256sum "$source" | cut -d' ' -f1)"
+            test "$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
+              "$manifest")" -eq 1
+            jq -e --arg name "$name" --arg digest "$digest" --argjson size "$size" \
+              '.assets[] | select(.name==$name) | .sha256==$digest and .size==$size' \
+              "$manifest" >/dev/null
+          done
+          test "$(sha256sum "$directory/modula-runner-${version}.tgz" | cut -d' ' -f1)" = \
+            "$(jq -r '.packageDigest' "$manifest")"
+          {
+            echo "directory=$directory"
+            echo "artifact=$directory/modula-runner-${version}.tgz"
+            echo "sbom=$directory/modula-runner.cdx.json"
+            echo "provenance=$directory/modula-runner-${version}.provenance.sigstore.json"
+            echo "notes=$directory/RELEASE_NOTES.md"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the restored draft evidence
+        if: needs.selector.outputs.mode == 'resume'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          TAG: ${{ github.ref_name }}
+          ARTIFACT: ${{ steps.restored.outputs.artifact }}
+          SBOM: ${{ steps.restored.outputs.sbom }}
+          PROVENANCE: ${{ steps.restored.outputs.provenance }}
+          CERTIFICATE_OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
+        run: |
+          set -euo pipefail
+          directory="$(dirname "$ARTIFACT")"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+          (cd "$directory" && sha256sum --strict --check SHA256SUMS)
+          for subject in "$ARTIFACT" "$SBOM"; do
+            cosign verify-blob "$subject" \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"
+          done
+          gh attestation verify "$ARTIFACT" --repo "$GITHUB_REPOSITORY" \
+            --bundle "$PROVENANCE" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity "$identity" \
+            --cert-oidc-issuer "$CERTIFICATE_OIDC_ISSUER" \
+            --source-ref "refs/tags/$TAG" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+          "$CYCLONEDX_CLI" validate \
+            --input-file "$SBOM" \
+            --input-format json \
+            --input-version v1_5 \
+            --fail-on-errors
+
+      - name: Re-resolve the protected release tag before publication
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          refs="$(git ls-remote --exit-code "$remote" \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<<"$refs")"
+          peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<<"$refs")"
+          test -n "$direct"
+          remote_commit="${peeled:-$direct}"
+          test "$remote_commit" = "$GITHUB_SHA"
+
+      - name: Create or resume the verified immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          TAG: ${{ github.ref_name }}
+          MODE: ${{ needs.selector.outputs.mode }}
+          PUBLISH_DIRECTORY: ${{ steps.recovery-evidence.outputs.directory }}
+          RESUME_DIRECTORY: ${{ steps.restored.outputs.directory }}
+          EXISTING_RELEASE_ID: ${{ needs.selector.outputs.release_id }}
+          PUBLISH_ARTIFACT_ID: ${{ steps.preserved.outputs.artifact-id }}
+          PUBLISH_ARTIFACT_DIGEST: ${{ steps.preserved.outputs.artifact-digest }}
+          RESUME_ARTIFACT_ID: ${{ needs.selector.outputs.artifact_id }}
+          RESUME_ARTIFACT_DIGEST: ${{ needs.selector.outputs.artifact_digest }}
+          RESUME_ORIGIN_RUN: ${{ needs.selector.outputs.origin_run }}
+          RESUME_ORIGIN_ATTEMPT: ${{ needs.selector.outputs.origin_attempt }}
+          CERTIFICATE_OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          case "$MODE" in
+            publish)
+              directory="$PUBLISH_DIRECTORY"
+              origin_run="$GITHUB_RUN_ID"
+              origin_attempt="$GITHUB_RUN_ATTEMPT"
+              artifact_id="$PUBLISH_ARTIFACT_ID"
+              artifact_digest="$PUBLISH_ARTIFACT_DIGEST"
+              ;;
+            resume)
+              directory="$RESUME_DIRECTORY"
+              origin_run="$RESUME_ORIGIN_RUN"
+              origin_attempt="$RESUME_ORIGIN_ATTEMPT"
+              artifact_id="$RESUME_ARTIFACT_ID"
+              artifact_digest="$RESUME_ARTIFACT_DIGEST"
+              ;;
+            *) exit 1 ;;
+          esac
+          if [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]; then
+            artifact_digest="sha256:$artifact_digest"
+          fi
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$artifact_id" =~ ^[0-9]+$ ]]
+
+          names=(
+            "modula-runner-${version}.tgz"
+            "modula-runner-${version}.tgz.sigstore.json"
+            "modula-runner.cdx.json"
+            "modula-runner.cdx.json.sigstore.json"
+            "SHA256SUMS"
+            "modula-runner-${version}.provenance.sigstore.json"
+          )
+          sources=()
+          for name in "${names[@]}"; do
+            test -s "$directory/$name"
+            sources+=("$directory/$name")
+          done
+          notes="$directory/RELEASE_NOTES.md"
+          manifest="$directory/RECOVERY-MANIFEST.json"
+          test -s "$notes"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$TAG" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$origin_run" \
+            --arg attempt "$origin_attempt" \
+            '.version==1 and .repository==$repository and
+             .workflow==".github/workflows/release.yml" and .tag==$tag and .sha==$sha and
+             .runId==$run and .runAttempt==$attempt and
+             (.packageDigest | test("^[0-9a-f]{64}$")) and (.assets | length)==6' \
+            "$manifest" >/dev/null
+          for source in "${sources[@]}"; do
+            name="$(basename "$source")"
+            digest="$(sha256sum "$source" | cut -d' ' -f1)"
+            size="$(stat -c '%s' "$source")"
+            test "$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
+              "$manifest")" -eq 1
+            jq -e --arg name "$name" --arg digest "$digest" --argjson size "$size" \
+              '.assets[] | select(.name==$name) | .sha256==$digest and .size==$size' \
+              "$manifest" >/dev/null
+          done
+          test "$(sha256sum "$directory/modula-runner-${version}.tgz" | cut -d' ' -f1)" = \
+            "$(jq -r '.packageDigest' "$manifest")"
+          marker="<!-- modula-runner-recovery:v1 run_id=${origin_run} attempt=${origin_attempt} sha=${GITHUB_SHA} artifact_id=${artifact_id} artifact_digest=${artifact_digest} -->"
+          expected_body="$(cat "$notes")"$'\n\n'"$marker"
+
+          if test "$MODE" = publish; then
+            artifact_name="modula-runner-${TAG}-run-${origin_run}-attempt-${origin_attempt}"
+            preserved="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}")"
+            jq -e \
+              --argjson id "$artifact_id" \
+              --arg name "$artifact_name" \
+              --arg digest "$artifact_digest" \
+              --argjson run "$origin_run" \
+              --argjson repository "$GITHUB_REPOSITORY_ID" \
+              --arg sha "$GITHUB_SHA" \
+              '.id==$id and .name==$name and .expired==false and .size_in_bytes>0 and
+               .digest==$digest and .workflow_run.id==$run and .workflow_run.head_sha==$sha and
+               .workflow_run.repository_id==$repository and
+               .workflow_run.head_repository_id==$repository' \
+              <<<"$preserved" >/dev/null
+          fi
+
+          if test "$MODE" = publish; then
+            payload="$(jq -n \
+              --arg tag "$TAG" \
+              --arg sha "$GITHUB_SHA" \
+              --arg name "$TAG" \
+              --arg body "$expected_body" \
+              '{tag_name:$tag,target_commitish:$sha,name:$name,body:$body,
+                draft:true,prerelease:false,generate_release_notes:false}')"
+            release_json="$(gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/releases" --input - <<<"$payload")"
+            release_id="$(jq -r '.id' <<<"$release_json")"
+          else
+            release_id="$EXISTING_RELEASE_ID"
+            release_json="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          fi
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+
+          validate_draft() {
+            jq -e \
+              --argjson id "$release_id" \
+              --arg tag "$TAG" \
+              --arg sha "$GITHUB_SHA" \
+              --arg name "$TAG" \
+              --arg body "$expected_body" \
+              '.id==$id and .tag_name==$tag and .target_commitish==$sha and .name==$name and
+               .body==$body and .draft==true and .prerelease==false and .immutable==false' \
+              <<<"$release_json" >/dev/null
+            upload_url="$(jq -r '.upload_url' <<<"$release_json")"
+            [[ "$upload_url" == "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets"* ]]
+            for actual in $(jq -r '.assets[].name' <<<"$release_json"); do
+              case " ${names[*]} " in *" $actual "*) ;; *) return 1 ;; esac
+            done
+          }
+          validate_complete_assets() {
+            test "$(jq '.assets | length' <<<"$release_json")" -eq 6
+            for index in "${!names[@]}"; do
+              name="${names[$index]}"
+              source="${sources[$index]}"
+              expected_digest="sha256:$(sha256sum "$source" | cut -d' ' -f1)"
+              test "$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
+                <<<"$release_json")" -eq 1
+              jq -e \
+                --arg name "$name" \
+                --arg digest "$expected_digest" \
+                '.assets[] | select(.name==$name) |
+                 .state=="uploaded" and .size>0 and .digest==$digest' \
+                <<<"$release_json" >/dev/null
+            done
+          }
+          validate_draft
+
+          existing="$RUNNER_TEMP/existing-draft-${release_id}"
+          mkdir -- "$existing"
+          missing=()
+          for index in "${!names[@]}"; do
+            name="${names[$index]}"
+            source="${sources[$index]}"
+            count="$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
+              <<<"$release_json")"
+            case "$count" in
+              0) missing+=("$source") ;;
+              1)
+                asset="$(jq -c --arg name "$name" '.assets[] | select(.name==$name)' \
+                  <<<"$release_json")"
+                expected_digest="sha256:$(sha256sum "$source" | cut -d' ' -f1)"
+                jq -e \
+                  --arg digest "$expected_digest" \
+                  '.state=="uploaded" and .size>0 and .digest==$digest' \
+                  <<<"$asset" >/dev/null
+                asset_id="$(jq -r '.id' <<<"$asset")"
+                gh api -H 'Accept: application/octet-stream' \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                  > "$existing/$name"
+                cmp -- "$source" "$existing/$name"
+                ;;
+              *) exit 1 ;;
+            esac
+          done
+
+          upload_url="$(jq -r '.upload_url' <<<"$release_json")"
+          upload_path="${upload_url#https://uploads.github.com/}"
+          upload_path="${upload_path%%\{*}"
+          for source in "${missing[@]}"; do
+            name="$(basename "$source")"
+            encoded="$(jq -rn --arg value "$name" '$value | @uri')"
+            gh api --hostname uploads.github.com --method POST \
+              -H 'Content-Type: application/octet-stream' \
+              --input "$source" "${upload_path}?name=${encoded}" >/dev/null
+          done
+
+          release_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          validate_draft
+          validate_complete_assets
+
+          artifact="$directory/modula-runner-${version}.tgz"
+          sbom="$directory/modula-runner.cdx.json"
+          provenance="$directory/modula-runner-${version}.provenance.sigstore.json"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+          (cd "$directory" && sha256sum --strict --check SHA256SUMS)
+          for subject in "$artifact" "$sbom"; do
+            cosign verify-blob "$subject" \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"
+          done
+          gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+            --bundle "$provenance" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity "$identity" \
+            --cert-oidc-issuer "$CERTIFICATE_OIDC_ISSUER" \
+            --source-ref "refs/tags/$TAG" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+          "$CYCLONEDX_CLI" validate \
+            --input-file "$sbom" \
+            --input-format json \
+            --input-version v1_5 \
+            --fail-on-errors
+
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          refs="$(git ls-remote --exit-code "$remote" \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<<"$refs")"
+          peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<<"$refs")"
+          test "${peeled:-$direct}" = "$GITHUB_SHA"
+
+          release_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          validate_draft
+          validate_complete_assets
+          published="$(printf '{"draft":false}\n' | gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --input -)"
+          jq -e \
+            --argjson id "$release_id" \
+            --arg tag "$TAG" \
+            '.id==$id and .tag_name==$tag and .draft==false and
+             .prerelease==false and .immutable==true' \
+            <<<"$published" >/dev/null
+          gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"
+          for source in "${sources[@]}"; do
+            gh release verify-asset "$TAG" "$source" --repo "$GITHUB_REPOSITORY"
+          done
+          final="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          jq -e '.draft==false and .prerelease==false and .immutable==true and
+            (.assets | length)==6' <<<"$final" >/dev/null
+
+  terminal:
+    name: Fail-closed terminal release verification
+    needs: [selector, build, publisher]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Validate the complete release job-result matrix
+        id: matrix
+        shell: bash
+        env:
+          MODE: ${{ needs.selector.outputs.mode }}
+          SELECTOR_RESULT: ${{ needs.selector.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISHER_RESULT: ${{ needs.publisher.result }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            recover)
+              test "$SELECTOR_RESULT" = success
+              test "$BUILD_RESULT" = skipped
+              test "$PUBLISHER_RESULT" = skipped
+              ;;
+            publish|resume)
+              test "$SELECTOR_RESULT" = success
+              test "$BUILD_RESULT" = success
+              test "$PUBLISHER_RESULT" = success
+              ;;
+            *) exit 1 ;;
+          esac
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the terminal GitHub CLI security floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh_version="$(gh --version | awk 'NR==1 {print $3}')"
+          dpkg --compare-versions "$gh_version" ge 2.97.0
+
+      - name: Install the CycloneDX validator for terminal verification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/cyclonedx-cli"
+          mkdir -p "$install_dir"
+          gh release download v0.30.0 \
+            --repo CycloneDX/cyclonedx-cli \
+            --pattern cyclonedx-linux-x64 \
+            --dir "$install_dir"
+          validator="$install_dir/cyclonedx-linux-x64"
+          echo "f89876326620f5fc78a9b27cc1af57d6ed13d019aab87490e1246a44a910babb  $validator" \
+            | sha256sum --check
+          chmod +x "$validator"
+          echo "CYCLONEDX_CLI=$validator" >> "$GITHUB_ENV"
+
+      - name: Install Cosign for terminal verification
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Verify the terminal Cosign installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign_path="$(command -v cosign)"
+          test "$(sha256sum "$cosign_path" | cut -d' ' -f1)" = \
+            "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
+
+      - name: Re-resolve the protected release tag for terminal verification
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          refs="$(git ls-remote --exit-code "$remote" \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<<"$refs")"
+          peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<<"$refs")"
+          test -n "$direct"
+          test "${peeled:-$direct}" = "$GITHUB_SHA"
+
+      - name: Verify the immutable release independently
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          TAG: ${{ github.ref_name }}
+          CERTIFICATE_OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          artifact="modula-runner-${version}.tgz"
+          sbom="modula-runner.cdx.json"
+          provenance="modula-runner-${version}.provenance.sigstore.json"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+          expected=(
+            "$artifact"
+            "${artifact}.sigstore.json"
+            "$sbom"
+            "${sbom}.sigstore.json"
+            "SHA256SUMS"
+            "$provenance"
+          )
+
+          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,isImmutable \
+            --jq '[.tagName,.isDraft,.isPrerelease,.isImmutable] | @tsv')"
+          test "$state" = "$TAG"$'\tfalse\tfalse\ttrue'
+          gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"
+          diff -u \
+            <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort) \
+            <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | LC_ALL=C sort)
+
+          directory="$(mktemp -d "$RUNNER_TEMP/release-verification.XXXXXX")"
+          trap 'rm -rf "$directory"' EXIT
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$directory"
+          for name in "${expected[@]}"; do
+            test -s "$directory/$name"
+            gh release verify-asset "$TAG" "$directory/$name" --repo "$GITHUB_REPOSITORY"
+          done
+          (cd "$directory" && sha256sum --strict --check SHA256SUMS)
+          for subject in "$artifact" "$sbom"; do
+            cosign verify-blob "$directory/$subject" \
+              --bundle "$directory/$subject.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"
+          done
+          gh attestation verify "$directory/$artifact" --repo "$GITHUB_REPOSITORY" \
+            --bundle "$directory/$provenance" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity "$identity" \
+            --cert-oidc-issuer "$CERTIFICATE_OIDC_ISSUER" \
+            --source-ref "refs/tags/$TAG" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+          "$CYCLONEDX_CLI" validate \
+            --input-file "$directory/$sbom" \
+            --input-format json \
+            --input-version v1_5 \
+            --fail-on-errors

@@ -1,6 +1,8 @@
 {
   "name": "modula-runner-workspace",
+  "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "workspaces": [
     "packages/protocol",
@@ -9,14 +11,25 @@
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "npm@10.9.8",
+  "volta": {
+    "node": "22.22.3",
+    "npm": "10.9.8"
+  },
   "scripts": {
-    "build": "npm run build -w packages/protocol",
+    "build": "npm run build -w packages/protocol && npm run build -w packages/runner",
     "typecheck": "npm run build && npm run typecheck -w packages/runner",
     "test": "npm run build && vitest run",
-    "gate": "npm run typecheck && vitest run"
+    "gate": "npm run typecheck && vitest run",
+    "release:build": "node scripts/release.mjs build",
+    "release:reproducible": "node scripts/release.mjs reproducible",
+    "supply-chain:audit": "node scripts/supply-chain.mjs live-audit",
+    "supply-chain:gate": "node scripts/supply-chain.mjs gate",
+    "supply-chain:seeded-red": "node scripts/supply-chain.mjs seed-known-vulnerability"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "semver": "7.7.4",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   }

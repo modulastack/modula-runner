@@ -42,6 +42,27 @@ for disclosure · an **independent third-party security audit of the runner and 
 protocol is a hard gate before general availability**, recurring on major protocol
 revisions.
 
+## Verify a release
+
+Every published `v*` release carries a package, CycloneDX SBOM, keyless Sigstore bundles, checksums,
+and GitHub-hosted SLSA provenance. Pin verification to the exact workflow and tag:
+
+```bash
+tag=v0.1.0
+version="${tag#v}"
+identity="https://github.com/modulastack/modula-runner/.github/workflows/release.yml@refs/tags/$tag"
+gh release download "$tag" --repo modulastack/modula-runner --dir release
+(cd release && sha256sum --check SHA256SUMS)
+cosign verify-blob "release/modula-runner-${version}.tgz" \
+  --bundle "release/modula-runner-${version}.tgz.sigstore.json" \
+  --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Follow [`docs/release-verification.md`](docs/release-verification.md) to verify immutable assets,
+provenance, the matching public GitHub tag, the SBOM, and an independent rebuild. Verification requires
+GitHub CLI 2.97.0+ and Cosign 3.1.3+.
+
 ## Install & pairing
 
 Coming with the first packaged release: install script, then `modula-runner pair <code>`.

@@ -20,6 +20,18 @@ public issue for a suspected vulnerability.
   with the issue credited to the reporter (unless you prefer anonymity).
 - No legal action for good-faith research within the scope of this repository.
 
+## Release dependency waivers
+
+A release blocks on production High or Critical advisories. An exception must be committed in
+[`security/vulnerability-waivers.json`](security/vulnerability-waivers.json) and identify one exact
+GHSA, CVE alias, package, locked version, lockfile node, and severity. It must also state why the
+advisory is unexploitable in this runner or has no available fix, plus an exclusive UTC expiry date.
+The GHSA/CVE pair must also appear in
+[`security/advisory-aliases.json`](security/advisory-aliases.json) with its exact official GitHub
+advisory URL and the date a reviewer verified the aliases. Expired, malformed, duplicate, broad,
+unused, or unverified-pair waivers fail the release gate. Development-only findings remain visible in
+the audit summary but do not block a release.
+
 ## Scope notes
 
 - The runner never handles your CLI subscription tokens — reports demonstrating access to
