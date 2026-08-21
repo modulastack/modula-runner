@@ -6,32 +6,31 @@ commit, and so is this plan.
 
 ## Now
 
-- **Security invariants, tested** — the next slice: the command allowlist as a signed,
-  locally-editable file the control plane cannot extend, per-directory consent, the kill
-  switch, an append-only local audit log, and the test asserting the binary never opens a
-  CLI auth path. It is also where preview containment lands — today a preview that binds off
-  your loopback is found and stopped, and an OS containment unit is what would stop it
-  happening at all. *Not started.*
+- **Runner verification and pre-audit** — CP-1 through CP-6 implementation is on `main`.
+  The next slice is the missing black-box layer: approve the execution plan in
+  [`docs/frd-runner-verification.md`](docs/frd-runner-verification.md), package a real
+  `modula-runner` executable, exercise A1–A6 through that executable, run the physical
+  second-machine and hosted-control-plane journeys, then perform the whole-runner internal
+  security audit.
+- **Close the artifact/operator gap before those journeys.** CP-6 currently produces a
+  reproducible library package and release evidence, but `packages/runner/package.json`
+  exposes no `bin` entry and no clean-machine operator install path. Command handlers and
+  checkpoint acceptance tests are landed; an installed operator-facing process is not.
 
-Landed so far: the seam contract ([`docs/runner-seam.md`](docs/runner-seam.md), reconciled
-in [`docs/seam-reconciliation.md`](docs/seam-reconciliation.md)); the versioned protocol
-schema ([`packages/protocol`](packages/protocol/SCHEMA.md)) including terminal and
-job-control channel payload semantics; the outbound-only WebSocket client with reconnect
-continuity; the pty host — agent commands in per-worktree tmux sessions bound to terminal
-channels, with scrollback replay, resize, reattach, an acknowledged flow-control window,
-and deterministic worktree provisioning; and pairing, presence and preview adjacency —
-`modula-runner pair <code>` binding a machine and minting a per-runner token into an
-encrypted local store, that token authenticating the socket and nothing else, revocation
-ending the binding rather than being retried, presence riding the negotiated heartbeat so
-offline is visible within the timeout window, and preview servers whose real listening
-sockets are checked before their port is reported and for as long as they run, so one that
-strays off loopback is stopped rather than served; and tri-modal model access
-([`docs/model-access.md`](docs/model-access.md)) — subscription CLIs, API keys in the
-runner's encrypted store injected into a process's environment and into no argument vector
-anywhere in the chain, and local models behind any OpenAI-compatible endpoint with Ollama as
-the reference integration, plus a capability advertisement that tells the interface what
-this machine can actually run without telling it where anything lives — all tested against a
-stub control plane ([`packages/runner`](packages/runner)).
+Landed so far: the seam contract and versioned protocol; outbound-only WSS reconnect
+continuity; pty/tmux hosting and deterministic worktrees; pairing, presence, and preview
+adjacency; tri-modal model access; the signed local allowlist, per-directory consent, kill
+switch, append-only audit evidence, credential and auth-path protections, and preview
+containment; plus the pinned release workflow, reproducible package proof, vulnerability
+policy, CycloneDX SBOM reconciliation, Sigstore/provenance wiring, immutable-publication
+checks, and independent verification runbook. The full local gate currently covers these
+surfaces; it is not a substitute for the assembled CLI journeys below.
+
+Release implementation is not release authorization. No tag or release has been executed.
+The clean-execution rule in [issue #23](https://forge.modulastack.com/ModulaStack/modula-runner/issues/23),
+the dev-shadowed peer rule in [issue #24](https://forge.modulastack.com/ModulaStack/modula-runner/issues/24),
+repository protections, the exclusive-writer publication window, and the audit gates remain
+required before a real release.
 
 ## The split
 
@@ -49,13 +48,14 @@ The path to a runner that executes real jobs against a hosted control plane:
       capability handshake so the UI only offers what your machine actually has. Keys enter
       through the local CLI and never a browser page, because the runner opens no inbound
       port; see *Now* for what landed
-- [ ] **Security invariants, tested** — command allowlist (signed, locally editable,
-      never remotely extendable), per-directory consent, kill switch, append-only local
-      audit log, and the test asserting the binary never opens CLI auth paths. Also where
-      preview containment lands: today a preview that binds off your loopback is found and
-      stopped, and an OS containment unit is what would stop it happening at all
-- [ ] **Release engineering** — signed binaries (Sigstore), SBOM per release,
-      reproducible builds as a stated goal
+- [x] **Security invariants, tested** — signed locally editable allowlist, per-directory
+      consent, kill switch, durable append-only audit evidence, no CLI-auth-path guarantee,
+      credential boundaries, and namespace-backed preview containment with explicit
+      detect-and-stop degradation
+- [x] **Release engineering implementation** — pinned toolchain, reproducible library
+      package, vulnerability and waiver policy, CycloneDX SBOM, Sigstore/provenance and
+      immutable-publication workflow, plus independent verification. No real release has
+      been authorized or executed, and executable/installer packaging remains below
 
 **Stop-gate before general availability:** an independent third-party security audit of
 the runner and pairing protocol — findings triaged, highs fixed, report published in this
@@ -64,16 +64,21 @@ repository. Recurs on major protocol revisions.
 ## Pre-audit verification
 
 Before that external audit, the split earns two internal passes: the runner exercised end to
-end through its CLI the way an operator uses it, and an adversarial general and security review
-at higher capability than it was built with. Both are scoped in
-[`docs/frd-runner-verification.md`](docs/frd-runner-verification.md); their findings feed back
-into the security and release slices, and then the external audit begins.
+end through its installed CLI the way an operator uses it, and an adversarial general and
+security review at higher capability than it was built with. Both are scoped in the still-draft
+[`docs/frd-runner-verification.md`](docs/frd-runner-verification.md).
+
+The checkpoint implementation prerequisite is now satisfied. Execution is not: first approve
+that plan and resolve its assumption that a packaged `modula-runner` executable already
+exists; then implement A1–A6, run the physical second-machine and real-control-plane gates,
+and complete the internal audit. Findings feed back into the security and release boundaries
+before the external audit begins.
 
 ## After the split
 
 Future work, each item becoming its own spec before it's built:
 
-- [ ] Install script and a packaged self-host quickstart (`modula-runner pair <code>`)
+- [ ] Installer and self-host quickstart for the verified packaged CLI (`modula-runner pair <code>`)
 - [ ] Desktop shell pairing — the co-resident wrap of the same seam
 - [ ] Windows support (ConPTY; v1 targets macOS + Linux)
 - [ ] End-to-end encryption of terminal streams (protocol frames are designed
