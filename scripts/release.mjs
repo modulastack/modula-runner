@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto'
-import { cp, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { realpathSync, statSync } from 'node:fs'
+import { cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { reportFailure, runProcess } from './cli-process.mjs'
 
@@ -11,12 +12,12 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const defaultOutput = join(root, 'dist', 'release')
 
 function run(command, args, options = {}) {
-  const { capture = false, ...spawnOptions } = options
-  return runProcess(command, args, { cwd: root, capture, ...spawnOptions }).trim()
+  const { capture = false, cwd = root, ...spawnOptions } = options
+  return runProcess(command, args, { cwd, capture, ...spawnOptions }).trim()
 }
 
-async function readJson(path) {
-  return JSON.parse(await readFile(join(root, path), 'utf8'))
+async function readJson(path, projectRoot = root) {
+  return JSON.parse(await readFile(join(projectRoot, path), 'utf8'))
 }
 
 async function sha256(path) {
@@ -31,10 +32,10 @@ function stripBuildFields(manifest) {
   return release
 }
 
-async function releaseVersion() {
-  const workspace = await readJson('package.json')
-  const runner = await readJson('packages/runner/package.json')
-  const protocol = await readJson('packages/protocol/package.json')
+async function releaseVersion(projectRoot = root) {
+  const workspace = await readJson('package.json', projectRoot)
+  const runner = await readJson('packages/runner/package.json', projectRoot)
+  const protocol = await readJson('packages/protocol/package.json', projectRoot)
   const versions = [workspace.version, runner.version, protocol.version]
   if (new Set(versions).size !== 1) {
     throw new Error(`workspace versions differ: root ${workspace.version}, runner ${runner.version}, protocol ${protocol.version}`)
@@ -42,12 +43,12 @@ async function releaseVersion() {
   return runner.version
 }
 
-async function validateToolchain() {
-  const expectedNode = (await readFile(join(root, '.nvmrc'), 'utf8')).trim()
-  const rootPackage = await readJson('package.json')
+async function validateToolchain(projectRoot = root, environment = process.env) {
+  const expectedNode = (await readFile(join(projectRoot, '.nvmrc'), 'utf8')).trim()
+  const rootPackage = await readJson('package.json', projectRoot)
   const expectedNpm = rootPackage.packageManager?.replace(/^npm@/, '')
   const actualNode = process.version.replace(/^v/, '')
-  const actualNpm = run('npm', ['--version'], { capture: true })
+  const actualNpm = run('npm', ['--version'], { capture: true, cwd: projectRoot, env: environment })
   if (actualNode !== expectedNode) throw new Error(`Node ${expectedNode} required; found ${actualNode}`)
   if (!expectedNpm || actualNpm !== expectedNpm) {
     throw new Error(`npm ${expectedNpm ?? '(unconfigured)'} required; found ${actualNpm}`)
@@ -55,15 +56,22 @@ async function validateToolchain() {
   return { node: expectedNode, npm: expectedNpm }
 }
 
-function validateReleaseRef(version) {
-  const ref = process.env.GITHUB_REF_NAME
+function validateReleaseRef(version, environment = process.env) {
+  const ref = environment.GITHUB_REF_NAME
   if (ref && ref !== `v${version}`) throw new Error(`tag ${ref} does not match package version v${version}`)
 }
 
-async function copyPackage(packageName, staging) {
-  const source = join(root, 'packages', packageName)
+async function releasePreflight(projectRoot = root, environment = process.env) {
+  const toolchain = await validateToolchain(projectRoot, environment)
+  const version = await releaseVersion(projectRoot)
+  validateReleaseRef(version, environment)
+  return { toolchain, version }
+}
+
+async function copyPackage(packageName, staging, projectRoot) {
+  const source = join(projectRoot, 'packages', packageName)
   const target = join(staging, 'packages', packageName)
-  const manifest = stripBuildFields(await readJson(`packages/${packageName}/package.json`))
+  const manifest = stripBuildFields(await readJson(`packages/${packageName}/package.json`, projectRoot))
   delete manifest.private
   await mkdir(target, { recursive: true })
   await writeFile(join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
@@ -74,28 +82,29 @@ async function copyPackage(packageName, staging) {
   }
 }
 
-async function stageRelease(staging, version, toolchain) {
-  const rootPackage = stripBuildFields(await readJson('package.json'))
+async function stageRelease(staging, version, toolchain, projectRoot) {
+  const rootPackage = stripBuildFields(await readJson('package.json', projectRoot))
   await mkdir(staging, { recursive: true })
   await writeFile(join(staging, 'package.json'), `${JSON.stringify({ ...rootPackage, version }, null, 2)}\n`)
-  await copyFile(join(root, 'package-lock.json'), join(staging, 'npm-shrinkwrap.json'))
-  await copyFile(join(root, 'README.md'), join(staging, 'README.md'))
-  await copyFile(join(root, 'LICENSE'), join(staging, 'LICENSE'))
-  await copyPackage('protocol', staging)
-  await copyPackage('runner', staging)
-  const lockfileSha256 = await sha256(join(root, 'package-lock.json'))
+  await copyFile(join(projectRoot, 'package-lock.json'), join(staging, 'npm-shrinkwrap.json'))
+  await copyFile(join(projectRoot, 'README.md'), join(staging, 'README.md'))
+  await copyFile(join(projectRoot, 'LICENSE'), join(staging, 'LICENSE'))
+  await copyPackage('protocol', staging, projectRoot)
+  await copyPackage('runner', staging, projectRoot)
+  const lockfileSha256 = await sha256(join(projectRoot, 'package-lock.json'))
   const metadata = { artifact: 'modula-runner', version, expectedTag: `v${version}`, toolchain, lockfileSha256 }
   await writeFile(join(staging, 'BUILD-METADATA.json'), `${JSON.stringify(metadata, null, 2)}\n`)
 }
 
-async function packRelease(staging, output, version) {
-  await mkdir(output, { recursive: true })
-  const packedOutput = await mkdtemp(join(tmpdir(), 'modula-runner-pack-'))
+async function packRelease(staging, output, version, context) {
+  const { projectRoot, environment, temporaryRoot } = context
+  await Promise.all([mkdir(output, { recursive: true }), mkdir(temporaryRoot, { recursive: true })])
+  const packedOutput = await mkdtemp(join(temporaryRoot, 'modula-runner-pack-'))
   const artifact = join(output, `modula-runner-${version}.tgz`)
   try {
     const packed = run('npm', [
       'pack', '--silent', '--ignore-scripts', '--pack-destination', packedOutput, staging,
-    ], { capture: true }).split('\n').at(-1)
+    ], { capture: true, cwd: projectRoot, env: environment }).split('\n').at(-1)
     if (!packed) throw new Error('npm pack did not report an artifact')
     await copyFile(join(packedOutput, basename(packed)), artifact)
   } finally {
@@ -106,26 +115,31 @@ async function packRelease(staging, output, version) {
   return artifact
 }
 
-async function buildRelease(output, compile = true) {
-  const toolchain = await validateToolchain()
-  const version = await releaseVersion()
-  validateReleaseRef(version)
+async function buildRelease(output, compile = true, options = {}) {
+  const context = {
+    projectRoot: options.projectRoot ?? root,
+    environment: options.environment ?? process.env,
+    temporaryRoot: options.temporaryRoot ?? tmpdir(),
+  }
+  const { toolchain, version } = options.preflight ??
+    await releasePreflight(context.projectRoot, context.environment)
   if (compile) {
     await Promise.all([
-      rm(join(root, 'packages', 'protocol', 'dist'), { recursive: true, force: true }),
-      rm(join(root, 'packages', 'runner', 'dist'), { recursive: true, force: true }),
+      rm(join(context.projectRoot, 'packages', 'protocol', 'dist'), { recursive: true, force: true }),
+      rm(join(context.projectRoot, 'packages', 'runner', 'dist'), { recursive: true, force: true }),
     ])
-    run('npm', ['run', 'build'])
+    run('npm', ['run', 'build'], { cwd: context.projectRoot, env: context.environment })
   }
   await mkdir(output, { recursive: true })
   await Promise.all([
     rm(join(output, `modula-runner-${version}.tgz`), { force: true }),
     rm(join(output, 'SHA256SUMS'), { force: true }),
   ])
-  const staging = await mkdtemp(join(tmpdir(), 'modula-runner-release-'))
+  await mkdir(context.temporaryRoot, { recursive: true })
+  const staging = await mkdtemp(join(context.temporaryRoot, 'modula-runner-release-'))
   try {
-    await stageRelease(staging, version, toolchain)
-    return await packRelease(staging, output, version)
+    await stageRelease(staging, version, toolchain, context.projectRoot)
+    return await packRelease(staging, output, version, context)
   } finally {
     await rm(staging, { recursive: true, force: true })
   }
@@ -202,11 +216,163 @@ async function preserveComparedArtifact(source, output, digest) {
   return artifact
 }
 
+function escapesDirectory(directory, target) {
+  const boundary = relative(directory, target)
+  return boundary === '..' || boundary.startsWith(`..${sep}`) || isAbsolute(boundary)
+}
+
+async function validateTrackedPath(path) {
+  const source = join(root, path)
+  const kind = await lstat(source)
+  if (kind.isSymbolicLink()) {
+    const link = await readlink(source)
+    if (isAbsolute(link)) throw new Error(`tracked symlink ${path} must be relative`)
+    if (escapesDirectory(root, resolve(dirname(source), link))) {
+      throw new Error(`tracked symlink ${path} escapes source boundary`)
+    }
+  }
+  let target
+  try {
+    target = realpathSync(source)
+  } catch {
+    const label = kind.isSymbolicLink() ? 'tracked symlink' : 'tracked path'
+    throw new Error(`${label} ${path} has no source target`)
+  }
+  if (escapesDirectory(realpathSync(root), target)) {
+    const label = kind.isSymbolicLink() ? 'tracked symlink' : 'tracked path'
+    throw new Error(`${label} ${path} escapes source boundary`)
+  }
+}
+
+async function copyTrackedPath(destination, path) {
+  const output = join(destination, path)
+  await mkdir(dirname(output), { recursive: true })
+  await cp(join(root, path), output, { recursive: true, verbatimSymlinks: true })
+}
+
+async function copyTrackedSource(destination) {
+  const paths = runProcess('git', ['ls-files', '-z', '--cached'], { cwd: root, capture: true })
+    .split('\0').filter(Boolean)
+  if (paths.length === 0) throw new Error('reproducible build has no tracked source inputs')
+  await Promise.all(paths.map(validateTrackedPath))
+  await Promise.all(paths.map(path => copyTrackedPath(destination, path)))
+}
+
+function isDependencyBinPath(path) {
+  return basename(path).toLowerCase() === '.bin' &&
+    basename(dirname(path)).toLowerCase() === 'node_modules'
+}
+
+function inheritedBuildPath() {
+  const seen = new Set()
+  return Object.entries(process.env)
+    .filter(([key, value]) => key.toLowerCase() === 'path' && typeof value === 'string')
+    .flatMap(([, value]) => value.split(delimiter))
+    .filter(path => path.length > 0 && isAbsolute(path))
+    .flatMap(path => {
+      try {
+        const canonical = normalize(realpathSync(path))
+        return statSync(canonical).isDirectory() ? [canonical] : []
+      } catch {
+        return []
+      }
+    })
+    .filter(path => {
+      const identity = process.platform === 'win32' ? path.toLowerCase() : path
+      if (isDependencyBinPath(path) || seen.has(identity)) return false
+      seen.add(identity)
+      return true
+    })
+    .join(delimiter)
+}
+
+const isolatedEnvironmentKeys = new Set([
+  'agent_toolsdirectory', 'home', 'npm_config_cache', 'path', 'temp', 'tmp', 'tmpdir',
+  'xdg_cache_home', 'xdg_config_home', 'xdg_data_home', 'xdg_runtime_dir', 'xdg_state_home',
+])
+
+const ciIdentityKeys = new Set([
+  'github_actions', 'github_event_name', 'github_ref', 'github_ref_name', 'github_ref_type',
+  'github_sha', 'runner_arch', 'runner_environment', 'runner_os',
+])
+
+function inheritEnvironmentKey(key) {
+  const normalized = key.toLowerCase()
+  if (isolatedEnvironmentKeys.has(normalized)) return false
+  if (!normalized.startsWith('github_') && !normalized.startsWith('runner_')) return true
+  return ciIdentityKeys.has(normalized) || normalized.startsWith('github_repository') ||
+    normalized.startsWith('github_run_') || normalized.startsWith('github_workflow')
+}
+
+function hasEnvironmentKey(name) {
+  return Object.keys(process.env).some(key => key.toLowerCase() === name)
+}
+
+function inheritedBuildEnvironment() {
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => {
+    return inheritEnvironmentKey(key)
+  }))
+  const path = inheritedBuildPath()
+  if (!path) throw new Error('reproducible build has no trusted executable path')
+  return { ...environment, PATH: path }
+}
+
+async function isolatedBuildContext(workspace, label, sourceSnapshot) {
+  const boundary = join(workspace, label)
+  const projectRoot = join(boundary, 'source')
+  const temporaryRoot = join(boundary, 'tmp')
+  const home = join(boundary, 'home')
+  const npmCache = join(boundary, 'npm-cache')
+  const toolCache = join(boundary, 'tool-cache')
+  const runtimeDirectory = join(boundary, 'xdg-runtime')
+  await Promise.all([
+    cp(sourceSnapshot, projectRoot, { recursive: true, verbatimSymlinks: true }),
+    mkdir(temporaryRoot, { recursive: true }),
+    mkdir(home, { recursive: true }),
+    mkdir(npmCache, { recursive: true }),
+    mkdir(toolCache, { recursive: true }),
+    mkdir(runtimeDirectory, { recursive: true, mode: 0o700 }),
+  ])
+  const environment = {
+    ...inheritedBuildEnvironment(),
+    HOME: home,
+    TMPDIR: temporaryRoot,
+    TMP: temporaryRoot,
+    TEMP: temporaryRoot,
+    XDG_CACHE_HOME: join(home, '.cache'),
+    XDG_CONFIG_HOME: join(home, '.config'),
+    XDG_DATA_HOME: join(home, '.local', 'share'),
+    XDG_STATE_HOME: join(home, '.local', 'state'),
+    XDG_RUNTIME_DIR: runtimeDirectory,
+    npm_config_cache: npmCache,
+    NPM_CONFIG_CACHE: npmCache,
+    ...(hasEnvironmentKey('github_workspace') ? { GITHUB_WORKSPACE: projectRoot } : {}),
+    ...(hasEnvironmentKey('runner_workspace') ? { RUNNER_WORKSPACE: boundary } : {}),
+    ...(hasEnvironmentKey('runner_temp') ? { RUNNER_TEMP: temporaryRoot } : {}),
+    ...(hasEnvironmentKey('runner_tool_cache') ? { RUNNER_TOOL_CACHE: toolCache } : {}),
+    ...(hasEnvironmentKey('agent_toolsdirectory') ? { AGENT_TOOLSDIRECTORY: toolCache } : {}),
+  }
+  return { projectRoot, temporaryRoot, environment }
+}
+
+async function buildIsolatedRelease(context, output) {
+  await releasePreflight(context.projectRoot, context.environment)
+  run('npm', ['ci'], { cwd: context.projectRoot, env: context.environment })
+  const preflight = await releasePreflight(context.projectRoot, context.environment)
+  return buildRelease(output, true, { ...context, preflight })
+}
+
 async function verifyReproducible(output) {
   const workspace = await mkdtemp(join(tmpdir(), 'modula-runner-reproducible-'))
   try {
-    const first = await buildRelease(join(workspace, 'first'))
-    const second = await buildRelease(join(workspace, 'second'))
+    const sourceSnapshot = join(workspace, 'tracked-source')
+    await copyTrackedSource(sourceSnapshot)
+    const contexts = await Promise.all([
+      isolatedBuildContext(workspace, 'first-build', sourceSnapshot),
+      isolatedBuildContext(workspace, 'second-build', sourceSnapshot),
+    ])
+    const first = await buildIsolatedRelease(contexts[0], join(workspace, 'first-artifact'))
+    const second = await buildIsolatedRelease(contexts[1], join(workspace, 'second-artifact'))
     const digest = await compareArtifacts(first, second)
     const artifact = await preserveComparedArtifact(first, output, digest)
     console.log(`reproducible ${digest}  ${artifact}`)

@@ -170,34 +170,60 @@ function validateDependencyGraph(sbom) {
   for (const ref of refs) if (!graphRefs.has(ref)) throw new Error(`dependency graph omits ${ref}`)
 }
 
-function resolveDependencyPath(packages, fromPath, name) {
+function resolvedDependencyPath(packages, fromPath, name) {
   let directory = fromPath
-  while (directory) {
-    const candidate = `${directory}/node_modules/${name}`
-    if (packages[candidate]) return packages[candidate].link ? packages[candidate].resolved : candidate
+  while (true) {
+    const candidate = directory ? `${directory}/node_modules/${name}` : `node_modules/${name}`
+    const entry = packages[candidate]
+    if (entry) return entry.link ? entry.resolved : candidate
+    if (!directory) return undefined
     const marker = directory.lastIndexOf('/node_modules/')
-    if (marker >= 0) directory = directory.slice(0, marker)
-    else directory = ''
+    directory = marker >= 0 ? directory.slice(0, marker) : ''
   }
-  const rootCandidate = `node_modules/${name}`
-  if (!packages[rootCandidate]) throw new Error(`${fromPath} depends on unresolved ${name}`)
-  return packages[rootCandidate].link ? packages[rootCandidate].resolved : rootCandidate
 }
 
-function expectedDependencyPaths(lock, path) {
+function resolveDependencyPath(packages, fromPath, name) {
+  const target = resolvedDependencyPath(packages, fromPath, name)
+  if (!target) throw new Error(`${fromPath} depends on unresolved ${name}`)
+  return target
+}
+
+function validatePeerPlacement(lock, path, name) {
+  if (isInstalledPackagePath(path) && lock.packages[`${path}/node_modules/${name}`]) {
+    throw new Error(`${path} has peer-local dependency ${name}`)
+  }
+}
+
+function expectedPeerDependencyPaths(lock, path, productionPaths) {
+  const entry = lock.packages[path]
+  return Object.keys(entry.peerDependencies ?? {}).flatMap(name => {
+    const target = resolvedDependencyPath(lock.packages, path, name)
+    if (!target) {
+      if (entry.peerDependenciesMeta?.[name]?.optional === true) return []
+      throw new Error(`${path} depends on unresolved peer ${name}`)
+    }
+    validatePeerPlacement(lock, path, name)
+    return productionPaths.has(target) ? [target] : []
+  })
+}
+
+function expectedDependencyPaths(lock, path, productionPaths) {
   const entry = lock.packages[path]
   const names = new Set([
     ...Object.keys(entry.dependencies ?? {}),
     ...Object.keys(entry.optionalDependencies ?? {}),
   ])
-  return [...names].map(name => resolveDependencyPath(lock.packages, path, name)).sort()
+  const direct = [...names].map(name => resolveDependencyPath(lock.packages, path, name))
+  return [...new Set([...direct, ...expectedPeerDependencyPaths(lock, path, productionPaths)])].sort()
 }
 
 function validateLockEdges(sbom, lock, byPath) {
   const graph = new Map(sbom.dependencies.map(item => [item.ref, item.dependsOn ?? []]))
-  for (const path of expectedComponentPaths(lock)) {
+  const componentPaths = expectedComponentPaths(lock)
+  const productionPaths = new Set(componentPaths)
+  for (const path of componentPaths) {
     const component = byPath.get(path)
-    const expected = expectedDependencyPaths(lock, path).map(target => {
+    const expected = expectedDependencyPaths(lock, path, productionPaths).map(target => {
       const dependency = byPath.get(target)
       if (!dependency) throw new Error(`${path} depends on omitted production component ${target}`)
       return dependency['bom-ref']
@@ -227,6 +253,13 @@ function validateSubjectReachability(sbom) {
   if (reachable.size !== graph.size) throw new Error('SBOM contains a component unreachable from its subject')
 }
 
+function validateSbomGenerator(sbom, npmVersion) {
+  const npmTool = sbom.metadata.tools?.find(tool => tool?.vendor === 'npm' && tool?.name === 'cli')
+  if (!npmVersion || npmTool?.version !== npmVersion) {
+    throw new Error('SBOM generator differs from the pinned npm version')
+  }
+}
+
 async function validateSbom(sbom, lock, projectRoot) {
   if (sbom.bomFormat !== 'CycloneDX' || sbom.specVersion !== '1.5') {
     throw new Error('SBOM must be CycloneDX 1.5')
@@ -239,8 +272,7 @@ async function validateSbom(sbom, lock, projectRoot) {
   }
   const rootManifest = await readJson(join(projectRoot, 'package.json'))
   const npmVersion = rootManifest.packageManager?.replace(/^npm@/, '')
-  const npmTool = sbom.metadata.tools?.find(tool => tool?.vendor === 'npm' && tool?.name === 'cli')
-  if (!npmVersion || npmTool?.version !== npmVersion) throw new Error('SBOM generator differs from the pinned npm version')
+  validateSbomGenerator(sbom, npmVersion)
   if (sbom.metadata.component.name !== rootManifest.name) throw new Error('SBOM subject name differs from root manifest')
   const componentPaths = sbom.components.map(component => packagePath(component))
   if (componentPaths.some(path => typeof path !== 'string') ||
@@ -260,12 +292,15 @@ async function validateSbom(sbom, lock, projectRoot) {
   validateSubjectReachability(sbom)
 }
 
-async function generateSbom(projectRoot, output, lock) {
-  const raw = run('npm', [
+function npmSbom(projectRoot) {
+  return parseJson(run('npm', [
     'sbom', '--package-lock-only', '--workspace=packages/runner', '--omit=dev',
     '--sbom-format=cyclonedx', '--sbom-type=library',
-  ], projectRoot)
-  const sbom = parseJson(raw, 'npm SBOM output')
+  ], projectRoot), 'npm SBOM output')
+}
+
+async function generateSbom(projectRoot, output, lock) {
+  const sbom = npmSbom(projectRoot)
   await canonicalizeSbom(sbom, projectRoot)
   await validateSbom(sbom, lock, projectRoot)
   await mkdir(dirname(output), { recursive: true })
@@ -275,6 +310,8 @@ async function generateSbom(projectRoot, output, lock) {
 
 async function validateSbomFile(projectRoot, input) {
   const lock = await validateLock(projectRoot)
+  const npmVersion = (await readJson(join(projectRoot, 'package.json'))).packageManager?.replace(/^npm@/, '')
+  validateSbomGenerator(npmSbom(projectRoot), npmVersion)
   await validateSbom(await readJson(input), lock, projectRoot)
 }
 

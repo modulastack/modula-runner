@@ -24,6 +24,80 @@ function runSupplyChain(args: string[], env: NodeJS.ProcessEnv = process.env) {
   })
 }
 
+type SbomComponent = {
+  'bom-ref': string
+  properties?: Array<{ name: string, value: string }>
+}
+
+type SbomDependency = { ref: string, dependsOn?: string[] }
+type TestSbom = { components: SbomComponent[], dependencies: SbomDependency[] }
+
+function sbomRefAtPath(sbom: TestSbom, path: string) {
+  const component = sbom.components.find(item => item.properties?.some(
+    property => property.name === 'cdx:npm:package:path' && property.value === path,
+  ))
+  if (!component) throw new Error(`fixture SBOM has no component at ${path}`)
+  return component['bom-ref']
+}
+
+function sbomTargetsAtPath(sbom: TestSbom, path: string) {
+  const ref = sbomRefAtPath(sbom, path)
+  const dependency = sbom.dependencies.find(item => item.ref === ref)
+  if (!dependency) throw new Error(`fixture SBOM has no dependency entry for ${path}`)
+  return dependency.dependsOn ?? []
+}
+
+async function mutateLock(workspace: string, mutation: (lock: Record<string, any>) => void) {
+  const path = join(workspace, 'package-lock.json')
+  const lock = JSON.parse(await readFile(path, 'utf8'))
+  mutation(lock)
+  await writeFile(path, JSON.stringify(lock))
+}
+
+async function mutateRootManifest(workspace: string, mutation: (manifest: Record<string, any>) => void) {
+  const path = join(workspace, 'package.json')
+  const manifest = JSON.parse(await readFile(path, 'utf8'))
+  mutation(manifest)
+  await writeFile(path, JSON.stringify(manifest))
+}
+
+async function expectSbomAccepted(workspace: string, label: string) {
+  const output = join(workspace, `${label}.cdx.json`)
+  const generated = runSupplyChain(['sbom', '--root', workspace, '--output', output])
+  expect(generated.status, generated.stderr).toBe(0)
+  const validated = runSupplyChain(['validate-sbom', '--root', workspace, '--input', output])
+  expect(validated.status, validated.stderr).toBe(0)
+}
+
+async function expectMissingEdgeRejected(
+  workspace: string,
+  sbom: TestSbom,
+  sourcePath: string,
+  targetRef: string,
+) {
+  const tampered = structuredClone(sbom)
+  const sourceRef = sbomRefAtPath(tampered, sourcePath)
+  const dependency = tampered.dependencies.find(item => item.ref === sourceRef)
+  if (!dependency) throw new Error(`fixture SBOM has no dependency entry for ${sourcePath}`)
+  dependency.dependsOn = (dependency.dependsOn ?? []).filter(ref => ref !== targetRef)
+  const input = join(workspace, `missing-${sourcePath.replaceAll('/', '-')}.json`)
+  await writeFile(input, JSON.stringify(tampered))
+  const result = runSupplyChain(['validate-sbom', '--root', workspace, '--input', input])
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain(`${sourcePath} SBOM edges differ from package-lock.json`)
+}
+
+async function expectInvalidPeerSemanticsRejected(
+  workspace: string,
+  input: string,
+  mutation: (lock: Record<string, any>) => void,
+) {
+  await mutateLock(workspace, mutation)
+  const result = runSupplyChain(['validate-sbom', '--root', workspace, '--input', input])
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('npm failed with exit 1')
+}
+
 async function temporaryWorkspace() {
   const target = await mkdtemp(join(tmpdir(), 'modula-runner-supply-test-'))
   workspaces.push(target)
@@ -187,6 +261,79 @@ describe('release supply-chain gate', () => {
       (dependency: { ref: string }) => dependency.ref === sbom.metadata.component['bom-ref'],
     )
     expect(subject.dependsOn).toEqual(['modula-runner@0.1.0'])
+  })
+
+  it('reconciles installed, optional, absent, and omitted peer edges', async () => {
+    const workspace = await temporaryWorkspace()
+    await mutateLock(workspace, lock => {
+      const nodePty = lock.packages['node_modules/node-pty']
+      nodePty.peerDependencies = { ws: '^8', vitest: '^3' }
+      const ws = lock.packages['node_modules/ws']
+      ws.peerDependencies['node-addon-api'] = '^7'
+      ws.peerDependenciesMeta['node-addon-api'] = { optional: true }
+    })
+    const output = join(workspace, 'peer-edges.cdx.json')
+    const generated = runSupplyChain(['sbom', '--root', workspace, '--output', output])
+    expect(generated.status, generated.stderr).toBe(0)
+    const sbom = JSON.parse(await readFile(output, 'utf8')) as TestSbom
+
+    expect(sbomTargetsAtPath(sbom, 'node_modules/node-pty').sort()).toEqual([
+      'node-addon-api@7.1.1', 'ws@8.21.3',
+    ])
+    expect(sbomTargetsAtPath(sbom, 'node_modules/ws')).toEqual(['node-addon-api@7.1.1'])
+    expect(sbom.components.some(component => component['bom-ref'] === 'vitest@3.2.7')).toBe(false)
+    expect(JSON.stringify(sbom)).not.toContain('bufferutil@')
+    expect(JSON.stringify(sbom)).not.toContain('utf-8-validate@')
+
+    await expectMissingEdgeRejected(workspace, sbom, 'node_modules/node-pty', 'ws@8.21.3')
+    await expectMissingEdgeRejected(workspace, sbom, 'node_modules/ws', 'node-addon-api@7.1.1')
+
+    await expectInvalidPeerSemanticsRejected(workspace, output, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '^9', vitest: '^3' }
+    })
+    await expectInvalidPeerSemanticsRejected(workspace, output, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '^8', vitest: '^3' }
+      lock.packages['node_modules/ws'].peerDependencies['node-addon-api'] = '^8'
+    })
+    await expectInvalidPeerSemanticsRejected(workspace, output, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies.vitest = '^4'
+      lock.packages['node_modules/ws'].peerDependencies['node-addon-api'] = '^7'
+    })
+
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '^9' }
+      lock.packages['node_modules/node-pty'].acceptDependencies = { ws: '^8' }
+    })
+    expect(runSupplyChain(['validate-sbom', '--root', workspace, '--input', output]).status).toBe(0)
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: 'latest' }
+      delete lock.packages['node_modules/node-pty'].acceptDependencies
+    })
+    expect(runSupplyChain(['validate-sbom', '--root', workspace, '--input', output]).status).toBe(0)
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: 'npm:ws@^9' }
+    })
+    const aliasMismatch = runSupplyChain(['validate-sbom', '--root', workspace, '--input', output])
+    expect(aliasMismatch.status).toBe(1)
+    expect(aliasMismatch.stderr).toContain('npm failed with exit 1')
+
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '' }
+    })
+    await expectSbomAccepted(workspace, 'empty-peer-wildcard')
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '^9' }
+      lock.packages['node_modules/node-pty'].acceptDependencies = { ws: '' }
+    })
+    await expectSbomAccepted(workspace, 'empty-accepted-wildcard')
+    await mutateLock(workspace, lock => {
+      lock.packages['node_modules/node-pty'].peerDependencies = { ws: '^9' }
+      delete lock.packages['node_modules/node-pty'].acceptDependencies
+    })
+    await mutateRootManifest(workspace, manifest => {
+      manifest.overrides = { 'node-pty': { ws: '^8' } }
+    })
+    await expectSbomAccepted(workspace, 'root-semver-override')
   })
 
   it('rejects duplicate package paths before subject or graph trust', async () => {

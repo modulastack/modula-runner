@@ -19,9 +19,11 @@ eliminate a check/create race.
 
 After approval, dependency installation, the current vulnerability policy, acceptance tests, and the
 two compared package builds run in a fresh read-only job with no release, OIDC, or attestation
-authority. That job checks out the immutable event SHA and asserts its working tree is at that commit
-before dependency execution. A separate publisher VM does not check out or execute project code. It
-validates the exact raw Actions archive, exact REST/download size, internal manifest, checksums,
+authority. The comparison snapshots tracked source before either build starts, then gives each build
+its own source tree, dependency installation, npm cache, home/cache directory, temporary directory,
+and generated output. That job checks out the immutable event SHA and asserts its working tree is at
+that commit before dependency execution. A separate publisher VM does not check out or execute project
+code. It validates the exact raw Actions archive, exact REST/download size, internal manifest, checksums,
 stream-bounded package members, and SBOM before signing the preserved compared bytes. Every fresh job
 checks the required GitHub CLI security floor
 before using it. A final read-only job fail-closes the complete job-result matrix and independently
@@ -58,18 +60,19 @@ On a clean checkout of the release tag:
 nvm install
 nvm use
 npm --version  # must match package.json#packageManager exactly
-npm ci
-npm run release:reproducible
+npm run release:reproducible  # performs two isolated npm ci/build/pack passes
 (cd dist/release && sha256sum --check SHA256SUMS)
 ```
 
 `release:build` compiles both workspaces and creates
 `dist/release/modula-runner-<version>.tgz`. The package contains compiled runner and protocol
 workspaces, the lockfile as `npm-shrinkwrap.json`, license, README, and deterministic build metadata.
-It contains no tests or TypeScript source. `release:reproducible` performs exactly two clean
-build/staging/packing passes, fails unless their package bytes match, and preserves the first compared
-package plus its checksum as the canonical release output. The release workflow never requests a
-third package build.
+It contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
+source before either comparison begins, performs exactly two independently isolated
+install/build/staging/packing passes, fails unless their package bytes match, and preserves the first
+compared package plus its checksum as the canonical release output. Untracked files, an existing
+`node_modules`, and build caches in the caller's checkout are not copied into either boundary. The
+release workflow never requests a third package build.
 
 The release workflow also checks that the tag is exactly `v<package-version>` and that the tagged
 commit belongs to `main`. A local build outside GitHub may be untagged so changes can be validated

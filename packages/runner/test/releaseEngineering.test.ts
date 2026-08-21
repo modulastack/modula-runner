@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
-import { appendFile, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const root = process.cwd()
@@ -28,6 +28,51 @@ function runRelease(args: string[], env: NodeJS.ProcessEnv = process.env) {
 
 function artifactPath(output: string) {
   return join(output, `modula-runner-${packageVersion}.tgz`)
+}
+
+const isolatedReleaseFixturePaths = [
+  '.nvmrc', 'package.json', 'package-lock.json', 'README.md', 'LICENSE',
+  'packages/protocol/package.json', 'packages/protocol/README.md', 'packages/protocol/SCHEMA.md',
+  'packages/runner/package.json', 'scripts/cli-process.mjs', 'scripts/release.mjs',
+]
+
+async function copyReleaseFixtureFile(source: string, path: string) {
+  const target = join(source, path)
+  await mkdir(dirname(target), { recursive: true })
+  await copyFile(join(root, path), target)
+}
+
+async function isolatedReleaseFixture(name: string) {
+  const fixture = join(workspace, name)
+  const source = join(fixture, 'source')
+  const bin = join(fixture, 'bin')
+  const output = join(fixture, 'output')
+  await Promise.all([
+    mkdir(source, { recursive: true }),
+    mkdir(bin, { recursive: true }),
+    mkdir(output, { recursive: true }),
+    ...isolatedReleaseFixturePaths.map(path => copyReleaseFixtureFile(source, path)),
+  ])
+  for (const args of [['init', '--quiet'], ['add', '.']]) {
+    const result = spawnSync('git', args, { cwd: source, encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(`fixture git ${args[0]} failed`)
+  }
+  return { fixture, source, bin, output }
+}
+
+function runFixtureRelease(
+  fixture: Awaited<ReturnType<typeof isolatedReleaseFixture>>,
+  environment: NodeJS.ProcessEnv,
+) {
+  return spawnSync(
+    process.execPath,
+    [join(fixture.source, 'scripts', 'release.mjs'), 'reproducible', '--output', fixture.output],
+    {
+      cwd: fixture.source,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fixture.bin}:${process.env.PATH}`, ...environment },
+    },
+  )
 }
 
 function archivedJson(artifact: string, path: string) {
@@ -95,68 +140,368 @@ describe('release engineering', () => {
     expect(runRelease(['compare', firstArtifact, secondArtifact]).status).toBe(0)
   })
 
-  it('publishes one of exactly two compared stateful builds', async () => {
-    const fixture = join(workspace, 'stateful-reproducibility-fixture')
-    const bin = join(fixture, 'bin')
-    const output = join(fixture, 'output')
-    const count = join(fixture, 'pack-count')
-    await Promise.all([
-      mkdir(bin, { recursive: true }),
-      mkdir(join(fixture, 'scripts'), { recursive: true }),
-      mkdir(join(fixture, 'packages', 'protocol'), { recursive: true }),
-      mkdir(join(fixture, 'packages', 'runner'), { recursive: true }),
-      mkdir(output, { recursive: true }),
-    ])
-    for (const path of [
-      '.nvmrc', 'package.json', 'package-lock.json', 'README.md', 'LICENSE',
-      'packages/protocol/package.json', 'packages/protocol/README.md', 'packages/protocol/SCHEMA.md',
-      'packages/runner/package.json', 'scripts/cli-process.mjs', 'scripts/release.mjs',
-    ]) {
-      await copyFile(join(root, path), join(fixture, path))
-    }
-    await writeFile(join(output, 'keep.txt'), 'caller owned\n')
-    await writeFile(join(bin, 'npm'), `#!/bin/sh
-if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
+  it('publishes one of exactly two independently isolated builds', async () => {
+    const fixture = await isolatedReleaseFixture('isolated-reproducibility-fixture')
+    const count = join(fixture.fixture, 'pack-count')
+    const isolationLog = join(fixture.fixture, 'isolation-log')
+    const toolchainLog = join(fixture.fixture, 'toolchain-log')
+    await writeFile(join(fixture.output, 'keep.txt'), 'caller owned\n')
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version; then
+  printf 'checked\\n' >> "$TOOLCHAIN_LOG"
+  printf '10.9.8\\n'; exit 0
+fi
+if test "$1" = ci; then
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \
+    "$PWD" "$npm_config_cache" "$NPM_CONFIG_CACHE" "$TMPDIR" "$HOME" \
+    "$GITHUB_WORKSPACE" "$RUNNER_WORKSPACE" "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" \
+    "$AGENT_TOOLSDIRECTORY" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" \
+    "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$GITHUB_ENV" "$GITHUB_OUTPUT" \
+    "$GITHUB_PATH" "$GITHUB_STEP_SUMMARY" "$GITHUB_STATE" "$GITHUB_EVENT_PATH" \
+    "$GITHUB_ARTIFACTS" "$GITHUB_ARTIFACTS_LIST" "$GITHUB_ACTION_PATH" \
+    "$GITHUB_REF_NAME" >> "$ISOLATION_LOG"
+  exit 0
+fi
 if test "$1 $2" = 'run build'; then
   mkdir -p packages/protocol/dist packages/runner/dist
-  printf 'export {}\\n' > packages/protocol/dist/index.js
-  printf 'export {}\\n' > packages/runner/dist/index.js
+  printf 'A' > packages/protocol/dist/index.js
+  printf 'A' > packages/runner/dist/index.js
   exit 0
 fi
 if test "$1" = pack; then
-  destination=
-  previous=
+  destination=; staging=; previous=
   for argument in "$@"; do
     if test "$previous" = --pack-destination; then destination="$argument"; fi
-    previous="$argument"
+    previous="$argument"; staging="$argument"
   done
-  current=0
-  if test -f "$PACK_COUNT"; then current="$(cat "$PACK_COUNT")"; fi
-  current=$((current + 1))
-  printf '%s\\n' "$current" > "$PACK_COUNT"
-  value=A
-  if test "$current" -gt 2; then value=B; fi
-  printf '%s' "$value" > "$destination/modula-runner-workspace-0.1.0.tgz"
-  printf 'modula-runner-workspace-0.1.0.tgz\\n'
-  exit 0
+  current=0; if test -f "$PACK_COUNT"; then current="$(cat "$PACK_COUNT")"; fi
+  printf '%s\\n' "$((current + 1))" > "$PACK_COUNT"
+  cat "$staging/packages/runner/dist/index.js" > "$destination/modula-runner-workspace-0.1.0.tgz"
+  printf 'modula-runner-workspace-0.1.0.tgz\\n'; exit 0
 fi
 exit 64
 `)
-    await chmod(join(bin, 'npm'), 0o755)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
 
-    const result = spawnSync(
-      process.execPath,
-      [join(fixture, 'scripts', 'release.mjs'), 'reproducible', '--output', output],
-      {
-        cwd: fixture,
-        encoding: 'utf8',
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, PACK_COUNT: count },
-      },
-    )
+    const result = runFixtureRelease(fixture, {
+      PACK_COUNT: count,
+      ISOLATION_LOG: isolationLog,
+      TOOLCHAIN_LOG: toolchainLog,
+      NPM_CONFIG_CACHE: join(fixture.fixture, 'inherited-shared-cache'),
+      GITHUB_WORKSPACE: join(fixture.fixture, 'shared-workspace'),
+      RUNNER_WORKSPACE: join(fixture.fixture, 'shared-runner-workspace'),
+      RUNNER_TEMP: join(fixture.fixture, 'shared-runner-temp'),
+      RUNNER_TOOL_CACHE: join(fixture.fixture, 'shared-tool-cache'),
+      AGENT_TOOLSDIRECTORY: join(fixture.fixture, 'shared-agent-tools'),
+      GITHUB_ENV: join(fixture.fixture, 'github-env'),
+      GITHUB_OUTPUT: join(fixture.fixture, 'github-output'),
+      GITHUB_PATH: join(fixture.fixture, 'github-path'),
+      GITHUB_STEP_SUMMARY: join(fixture.fixture, 'github-summary'),
+      GITHUB_STATE: join(fixture.fixture, 'github-state'),
+      GITHUB_EVENT_PATH: join(fixture.fixture, 'event.json'),
+      GITHUB_ARTIFACTS: join(fixture.fixture, 'github-artifacts'),
+      GITHUB_ARTIFACTS_LIST: join(fixture.fixture, 'github-artifacts-list'),
+      GITHUB_ACTION_PATH: join(fixture.fixture, 'github-action'),
+      GITHUB_REF_NAME: `v${packageVersion}`,
+    })
     expect(result.status).toBe(0)
     expect(await readFile(count, 'utf8')).toBe('2\n')
-    expect(await readFile(join(output, `modula-runner-${packageVersion}.tgz`), 'utf8')).toBe('A')
-    expect(await readFile(join(output, 'keep.txt'), 'utf8')).toBe('caller owned\n')
+    expect((await readFile(toolchainLog, 'utf8')).trim().split('\n')).toHaveLength(4)
+    const boundaries = (await readFile(isolationLog, 'utf8')).trim().split('\n')
+      .map(line => line.split('|'))
+    expect(boundaries).toHaveLength(2)
+    for (const index of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]) {
+      expect(new Set(boundaries.map(parts => parts[index])).size).toBe(2)
+    }
+    for (const index of [15, 16, 17, 18, 19, 20, 21, 22, 23]) {
+      expect(boundaries.every(parts => parts[index] === '')).toBe(true)
+    }
+    expect(boundaries.every(parts => parts[24] === `v${packageVersion}`)).toBe(true)
+    expect(await readFile(artifactPath(fixture.output), 'utf8')).toBe('A')
+    expect(await readFile(join(fixture.output, 'keep.txt'), 'utf8')).toBe('caller owned\n')
+  })
+
+  it('does not execute caller checkout bins inside isolated builds', async () => {
+    const fixture = await isolatedReleaseFixture('caller-bin-isolation-fixture')
+    const callerBin = join(fixture.fixture, 'caller', 'node_modules', '.bin')
+    const callerAlias = join(fixture.fixture, 'build-tools')
+    const callerLog = join(fixture.fixture, 'caller-bin-log')
+    const pathLog = join(fixture.fixture, 'path-log')
+    await mkdir(callerBin, { recursive: true })
+    await symlink(callerBin, callerAlias, 'dir')
+    await writeFile(join(callerBin, 'fixture-build'), `#!/bin/sh
+printf 'called\\n' >> "$CALLER_BIN_LOG"
+mkdir -p packages/protocol/dist packages/runner/dist
+printf 'caller owned' > packages/protocol/dist/index.js
+printf 'caller owned' > packages/runner/dist/index.js
+`)
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
+if test "$1" = ci; then
+  printf '%s|%s|%s\\n' "$PATH" "$Path" "$pAtH" >> "$PATH_LOG"
+  exit 0
+fi
+if test "$1 $2" = 'run build'; then
+  PATH="$PWD/node_modules/.bin:$PATH" fixture-build
+  exit $?
+fi
+if test "$1" = pack; then
+  destination=; staging=; previous=
+  for argument in "$@"; do
+    if test "$previous" = --pack-destination; then destination="$argument"; fi
+    previous="$argument"; staging="$argument"
+  done
+  cat "$staging/packages/runner/dist/index.js" > "$destination/modula-runner-workspace-0.1.0.tgz"
+  printf 'modula-runner-workspace-0.1.0.tgz\\n'; exit 0
+fi
+exit 64
+`)
+    await Promise.all([
+      chmod(join(callerBin, 'fixture-build'), 0o755),
+      chmod(join(fixture.bin, 'npm'), 0o755),
+    ])
+
+    const result = runFixtureRelease(fixture, {
+      CALLER_BIN_LOG: callerLog,
+      PATH_LOG: pathLog,
+      PATH: ['', fixture.bin, callerAlias, `${callerAlias}/`, 'relative/bin', fixture.bin, process.env.PATH ?? '']
+        .join(delimiter),
+      Path: callerAlias,
+      pAtH: [callerAlias, 'relative/bin'].join(delimiter),
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('npm failed with exit 127')
+    const pathFields = (await readFile(pathLog, 'utf8')).trim().split('|')
+    expect(pathFields).toHaveLength(3)
+    const [upperPath = '', mixedPath = '', alternatePath = ''] = pathFields
+    const inheritedPaths = upperPath.split(delimiter)
+    expect(inheritedPaths.every(path => isAbsolute(path))).toBe(true)
+    expect(new Set(inheritedPaths).size).toBe(inheritedPaths.length)
+    expect(inheritedPaths.some(path => {
+      return basename(path).toLowerCase() === '.bin' &&
+        basename(dirname(path)).toLowerCase() === 'node_modules'
+    })).toBe(false)
+    expect(mixedPath).toBe('')
+    expect(alternatePath).toBe('')
+    await expect(readFile(callerLog)).rejects.toThrow()
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
+  })
+
+  it('rejects state shared through tracked symlink rewrites', async () => {
+    const fixture = await isolatedReleaseFixture('tracked-symlink-fixture')
+    const stateDirectory = join(fixture.source, 'fixture-state')
+    const nonceCount = join(fixture.fixture, 'nonce-count')
+    await mkdir(stateDirectory)
+    await writeFile(join(stateDirectory, 'value'), '')
+    await symlink('value', join(stateDirectory, 'link'))
+    const tracked = spawnSync('git', ['add', 'fixture-state'], { cwd: fixture.source, encoding: 'utf8' })
+    expect(tracked.status, tracked.stderr).toBe(0)
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version || test "$1" = ci; then
+  if test "$1" = --version; then printf '10.9.8\\n'; fi
+  exit 0
+fi
+if test "$1 $2" = 'run build'; then
+  state=fixture-state/link
+  if ! test -s "$state"; then
+    current=0; if test -f "$NONCE_COUNT"; then current="$(cat "$NONCE_COUNT")"; fi
+    current=$((current + 1)); printf '%s\\n' "$current" > "$NONCE_COUNT"
+    printf '%s' "$current" > "$state"
+  fi
+  mkdir -p packages/protocol/dist packages/runner/dist
+  cp "$state" packages/protocol/dist/index.js
+  cp "$state" packages/runner/dist/index.js
+  exit 0
+fi
+if test "$1" = pack; then
+  destination=; staging=; previous=
+  for argument in "$@"; do
+    if test "$previous" = --pack-destination; then destination="$argument"; fi
+    previous="$argument"; staging="$argument"
+  done
+  cat "$staging/packages/runner/dist/index.js" > "$destination/modula-runner-workspace-0.1.0.tgz"
+  printf 'modula-runner-workspace-0.1.0.tgz\\n'; exit 0
+fi
+exit 64
+`)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
+
+    const result = runFixtureRelease(fixture, { NONCE_COUNT: nonceCount })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('artifact mismatch')
+    expect(await readFile(nonceCount, 'utf8')).toBe('2\n')
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
+  })
+
+  it('rejects tracked symlinks that escape the source boundary', async () => {
+    const fixture = await isolatedReleaseFixture('escaping-symlink-fixture')
+    await writeFile(join(fixture.fixture, 'outside'), 'caller owned\n')
+    await symlink('../outside', join(fixture.source, 'escape-link'))
+    const tracked = spawnSync('git', ['add', 'escape-link'], { cwd: fixture.source, encoding: 'utf8' })
+    expect(tracked.status, tracked.stderr).toBe(0)
+
+    const result = runFixtureRelease(fixture, {})
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('tracked symlink escape-link escapes source boundary')
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
+  })
+
+  it('rejects tracked leaves beneath escaping ancestor symlinks', async () => {
+    const fixture = await isolatedReleaseFixture('ancestor-symlink-fixture')
+    const trackedDirectory = join(fixture.source, 'tracked-parent')
+    const externalDirectory = join(fixture.fixture, 'external-parent')
+    const installMarker = join(fixture.fixture, 'install-marker')
+    await mkdir(trackedDirectory)
+    await writeFile(join(trackedDirectory, 'value'), 'tracked\n')
+    const tracked = spawnSync('git', ['add', 'tracked-parent/value'], {
+      cwd: fixture.source,
+      encoding: 'utf8',
+    })
+    expect(tracked.status, tracked.stderr).toBe(0)
+    await mkdir(externalDirectory)
+    await writeFile(join(externalDirectory, 'value'), 'external\n')
+    await rm(trackedDirectory, { recursive: true })
+    await symlink(externalDirectory, trackedDirectory, 'dir')
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
+if test "$1" = ci; then printf 'installed\\n' > "$INSTALL_MARKER"; exit 0; fi
+exit 64
+`)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
+
+    const result = runFixtureRelease(fixture, { INSTALL_MARKER: installMarker })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('tracked path tracked-parent/value escapes source boundary')
+    await expect(readFile(installMarker)).rejects.toThrow()
+  })
+
+  it('rejects absolute tracked symlink text inside the source tree', async () => {
+    const fixture = await isolatedReleaseFixture('absolute-symlink-fixture')
+    const state = join(fixture.source, 'absolute-state')
+    await writeFile(state, 'shared\n')
+    await symlink(state, join(fixture.source, 'absolute-link'))
+    const tracked = spawnSync('git', ['add', 'absolute-link', 'absolute-state'], {
+      cwd: fixture.source,
+      encoding: 'utf8',
+    })
+    expect(tracked.status, tracked.stderr).toBe(0)
+
+    const result = runFixtureRelease(fixture, {})
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('tracked symlink absolute-link must be relative')
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
+  })
+
+  it('rejects an invalid release before dependency installation', async () => {
+    const fixture = await isolatedReleaseFixture('preinstall-release-preflight-fixture')
+    const installMarker = join(fixture.fixture, 'install-marker')
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
+if test "$1" = ci; then printf 'installed\\n' > "$INSTALL_MARKER"; exit 0; fi
+exit 64
+`)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
+
+    const result = runFixtureRelease(fixture, {
+      GITHUB_REF_NAME: 'v9.9.9',
+      INSTALL_MARKER: installMarker,
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('does not match package version')
+    await expect(readFile(installMarker)).rejects.toThrow()
+  })
+
+  it('revalidates release inputs after dependency installation', async () => {
+    const fixture = await isolatedReleaseFixture('postinstall-release-preflight-fixture')
+    const packCount = join(fixture.fixture, 'pack-count')
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
+if test "$1" = ci; then
+  node -e "const fs=require('node:fs'); const p='packages/runner/package.json'; const m=JSON.parse(fs.readFileSync(p)); m.version='9.9.9'; fs.writeFileSync(p, JSON.stringify(m))"
+  exit 0
+fi
+if test "$1 $2" = 'run build'; then
+  mkdir -p packages/protocol/dist packages/runner/dist
+  printf 'A' > packages/protocol/dist/index.js
+  printf 'A' > packages/runner/dist/index.js
+  exit 0
+fi
+if test "$1" = pack; then
+  printf 'packed\\n' >> "$PACK_COUNT"
+  destination=; staging=; previous=
+  for argument in "$@"; do
+    if test "$previous" = --pack-destination; then destination="$argument"; fi
+    previous="$argument"; staging="$argument"
+  done
+  cat "$staging/packages/runner/dist/index.js" > "$destination/modula-runner-workspace-0.1.0.tgz"
+  printf 'modula-runner-workspace-0.1.0.tgz\\n'; exit 0
+fi
+exit 64
+`)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
+
+    const result = runFixtureRelease(fixture, { PACK_COUNT: packCount })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('workspace versions differ')
+    await expect(readFile(packCount)).rejects.toThrow()
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
+  })
+
+  it('rejects nondeterminism memoized outside dist', async () => {
+    const fixture = await isolatedReleaseFixture('memoized-nondeterminism-fixture')
+    const nonceCount = join(fixture.fixture, 'nonce-count')
+    const cacheLog = join(fixture.fixture, 'cache-log')
+    const inheritedCache = join(fixture.fixture, 'inherited-shared-cache')
+    await mkdir(inheritedCache)
+    await writeFile(join(inheritedCache, 'sentinel'), 'parent owned\n')
+    await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
+if test "$1" = --version || test "$1" = ci; then
+  if test "$1" = --version; then printf '10.9.8\\n'; fi
+  exit 0
+fi
+if test "$1 $2" = 'run build'; then
+  effective_cache="$(env | awk -F= 'tolower($1) == "npm_config_cache" { sub(/^[^=]*=/, ""); value=$0 } END { print value }')"
+  printf '%s\\n' "$effective_cache" >> "$CACHE_LOG"
+  mkdir -p "$effective_cache" packages/protocol/dist packages/runner/dist
+  if ! test -f "$effective_cache/value"; then
+    current=0; if test -f "$NONCE_COUNT"; then current="$(cat "$NONCE_COUNT")"; fi
+    current=$((current + 1)); printf '%s\\n' "$current" > "$NONCE_COUNT"
+    printf '%s' "$current" > "$effective_cache/value"
+  fi
+  cp "$effective_cache/value" packages/protocol/dist/index.js
+  cp "$effective_cache/value" packages/runner/dist/index.js
+  exit 0
+fi
+if test "$1" = pack; then
+  destination=; staging=; previous=
+  for argument in "$@"; do
+    if test "$previous" = --pack-destination; then destination="$argument"; fi
+    previous="$argument"; staging="$argument"
+  done
+  cat "$staging/packages/runner/dist/index.js" > "$destination/modula-runner-workspace-0.1.0.tgz"
+  printf 'modula-runner-workspace-0.1.0.tgz\\n'; exit 0
+fi
+exit 64
+`)
+    await chmod(join(fixture.bin, 'npm'), 0o755)
+
+    const result = runFixtureRelease(fixture, {
+      CACHE_LOG: cacheLog,
+      NONCE_COUNT: nonceCount,
+      npm_config_cache: join(fixture.fixture, 'inherited-lowercase-cache'),
+      NPM_CONFIG_CACHE: join(fixture.fixture, 'inherited-uppercase-cache'),
+      Npm_Config_Cache: inheritedCache,
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('artifact mismatch')
+    expect(await readFile(nonceCount, 'utf8')).toBe('2\n')
+    const effectiveCaches = (await readFile(cacheLog, 'utf8')).trim().split('\n')
+    expect(effectiveCaches).toHaveLength(2)
+    expect(new Set(effectiveCaches).size).toBe(2)
+    expect(effectiveCaches).not.toContain(inheritedCache)
+    expect(await readFile(join(inheritedCache, 'sentinel'), 'utf8')).toBe('parent owned\n')
+    await expect(readFile(join(inheritedCache, 'value'))).rejects.toThrow()
+    await expect(readFile(artifactPath(fixture.output))).rejects.toThrow()
   })
 
   it('preserves caller-owned files in the output directory', async () => {
