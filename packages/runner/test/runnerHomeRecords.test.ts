@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  allowlistKeyId,
   createMemoryApiKeyStore,
   openRunnerHomeRecords,
   signAllowlist,
@@ -56,14 +57,15 @@ function memoryStorage(initial: Partial<Record<RunnerHomeRecord, unknown>> = {})
 
 function signedPolicy(): { revision: number; allowlist: SignedAllowlist; trustAnchors: TrustAnchor[] } {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
-  const keyId = 'operator'
+  const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString()
+  const keyId = allowlistKeyId(publicPem)
   return {
     revision: 1,
     allowlist: signAllowlist(
       { executables: ['git', 'tmux'], recipes: {} },
       { keyId, privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString() },
     ),
-    trustAnchors: [{ keyId, publicKey: publicKey.export({ type: 'spki', format: 'pem' }).toString() }],
+    trustAnchors: [{ keyId, publicKey: publicPem }],
   }
 }
 

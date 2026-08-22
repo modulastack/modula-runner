@@ -35,6 +35,11 @@ import type {
   SessionReceiptStorage,
 } from './sessionLaunch.js'
 
+export type RunnerPolicyRecordInitialization =
+  | { status: 'initialized'; policy: RunnerPolicySnapshot }
+  | { status: 'exists' }
+  | { status: 'failed'; code: RunnerHomeFailure }
+
 export type RunnerHomeRecordComponents = {
   pairing: PairingContractStore
   keys: ApiKeyStore
@@ -43,6 +48,34 @@ export type RunnerHomeRecordComponents = {
 export type RunnerHomeRecordsOptions = RunnerHomeRecordComponents & {
   storage: RunnerHomeStorage
   clock: RunnerClock
+}
+
+export async function initializeRunnerPolicyRecord(
+  storage: RunnerHomeStorage,
+  candidate: RunnerPolicySnapshot,
+): Promise<RunnerPolicyRecordInitialization> {
+  let policy: RunnerPolicySnapshot
+  try {
+    policy = validateRunnerPolicySnapshot(candidate)
+  } catch (error) {
+    return { status: 'failed', code: error instanceof HomeRecordError ? error.failure : 'policy-malformed' }
+  }
+  try {
+    const held = await storage.read('policy')
+    if (held.status === 'found') return { status: 'exists' }
+    if (held.status === 'storage-unavailable') return { status: 'failed', code: 'state-io-failed' }
+    const stored = await storage.replace('policy', null, encodeJson(policy))
+    if (stored.status === 'written') return { status: 'initialized', policy }
+    return stored.status === 'conflict' ? { status: 'exists' } : { status: 'failed', code: 'state-io-failed' }
+  } catch {
+    return { status: 'failed', code: 'state-io-failed' }
+  }
+}
+
+export function validateRunnerPolicySnapshot(value: unknown): RunnerPolicySnapshot {
+  const policy = decodePolicy(value)
+  trustedPolicy(policy)
+  return policy
 }
 
 export async function openRunnerHomeRecords(options: RunnerHomeRecordsOptions): Promise<RunnerHomeOpen> {

@@ -61,8 +61,11 @@ export {
 } from './preview.js'
 export {
   DEFAULT_ALLOWLIST_EXECUTABLES,
+  allowlistKeyId,
   canonicalAllowlistBytes,
+  decodeAllowlistDocument,
   decodeSignedAllowlist,
+  generateAllowlistSigningKey,
   loadTrustedAllowlist,
   signAllowlist,
   verifyAllowlistSignature,
@@ -72,11 +75,17 @@ export {
   type AllowlistRejection,
   type AllowlistSigningKey,
   type CommandPolicy,
+  type GeneratedAllowlistSigningKey,
   type LoadAllowlistOptions,
   type PreviewRecipe,
   type SignedAllowlist,
   type TrustAnchor,
 } from './allowlist.js'
+export {
+  createAllowlistSigningKeyFile,
+  readAllowlistSigningKeyFile,
+  signingKeyOutsideHome,
+} from './allowlistKeyFile.js'
 export { openAuditLog, type AuditLog, type AuditLogOptions, type AuditRecord, type SpawnOutcome } from './auditLog.js'
 export {
   activateKillSwitch,
@@ -277,6 +286,7 @@ export {
   type RunnerHomeStorageRead,
   type RunnerHomeStorageWrite,
   type RunnerLocalConfiguration,
+  type RunnerPolicyInitialization,
   type RunnerPolicyReplace,
   type RunnerPolicySnapshot,
   type RunnerPolicyStore,

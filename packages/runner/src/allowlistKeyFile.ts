@@ -1,0 +1,119 @@
+import { createPrivateKey, createPublicKey } from 'node:crypto'
+import { constants } from 'node:fs'
+import { link, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
+import path from 'node:path'
+import {
+  allowlistKeyId,
+  generateAllowlistSigningKey,
+  type AllowlistSigningKey,
+  type GeneratedAllowlistSigningKey,
+} from './allowlist.js'
+
+const PRIVATE_KEY_MODE = 0o600
+const MAX_PRIVATE_KEY_BYTES = 16 * 1024
+
+export async function createAllowlistSigningKeyFile(target: string): Promise<GeneratedAllowlistSigningKey> {
+  const keyPath = await validatedKeyPath(target)
+  const generated = generateAllowlistSigningKey()
+  const temporary = `${keyPath}.tmp-${process.pid}-${generated.signingKey.keyId.slice(0, 16)}`
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, PRIVATE_KEY_MODE)
+    await handle.chmod(PRIVATE_KEY_MODE)
+    const info = await handle.stat()
+    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_KEY_MODE || info.nlink !== 1) {
+      throw new Error('generated allowlist signing key custody is invalid')
+    }
+    await writeAll(handle, Buffer.from(generated.signingKey.privateKey))
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await link(temporary, keyPath)
+    await unlink(temporary)
+    await syncDirectory(path.dirname(keyPath))
+    return generated
+  } catch (error) {
+    if (isCode(error, 'EEXIST')) throw new Error('allowlist signing key path already exists')
+    throw error
+  } finally {
+    // A failed no-overwrite publish leaves only a private temporary owned by this operation.
+    await handle?.close().catch(() => undefined)
+    // The target is never removed here; only the uniquely named unpublished temporary is cleanup-safe.
+    await unlink(temporary).catch(() => undefined)
+  }
+}
+
+export async function readAllowlistSigningKeyFile(target: string): Promise<GeneratedAllowlistSigningKey> {
+  const keyPath = await validatedKeyPath(target)
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const info = await handle.stat()
+    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_KEY_MODE || info.nlink !== 1) {
+      throw new Error('allowlist signing key custody is invalid')
+    }
+    if (info.size > MAX_PRIVATE_KEY_BYTES) throw new Error('allowlist signing key is too large')
+    const privateKey = (await readBounded(handle)).toString('utf8')
+    const privateObject = createPrivateKey({ key: privateKey, format: 'pem' })
+    if (privateObject.asymmetricKeyType !== 'ed25519') throw new Error('allowlist signing key must use Ed25519')
+    const publicKey = createPublicKey(privateObject).export({ type: 'spki', format: 'pem' }).toString()
+    const keyId = allowlistKeyId(publicKey)
+    return { signingKey: { keyId, privateKey }, trustAnchor: { keyId, publicKey } }
+  } finally {
+    await handle?.close()
+  }
+}
+
+export function signingKeyOutsideHome(target: string, homeRoot: string): boolean {
+  const keyPath = path.resolve(target)
+  const root = path.resolve(homeRoot)
+  const relative = path.relative(root, keyPath)
+  return relative !== '' && (relative.startsWith('..') || path.isAbsolute(relative))
+}
+
+async function validatedKeyPath(target: string): Promise<string> {
+  if (typeof target !== 'string' || target.length === 0 || target.length > 4_096 || /[\u0000-\u001f\u007f]/.test(target)) {
+    throw new Error('allowlist signing key path is invalid')
+  }
+  const keyPath = path.resolve(target)
+  const parent = path.dirname(keyPath)
+  const [resolvedParent, info] = await Promise.all([realpath(parent), lstat(parent)])
+  if (resolvedParent !== parent || !info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) {
+    throw new Error('allowlist signing key directory custody is invalid')
+  }
+  return keyPath
+}
+
+async function readBounded(handle: FileHandle): Promise<Buffer> {
+  const buffer = Buffer.alloc(MAX_PRIVATE_KEY_BYTES + 1)
+  let offset = 0
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
+    if (bytesRead === 0) break
+    offset += bytesRead
+  }
+  if (offset > MAX_PRIVATE_KEY_BYTES) throw new Error('allowlist signing key grew past its size limit')
+  return buffer.subarray(0, offset)
+}
+
+async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
+  let offset = 0
+  while (offset < bytes.byteLength) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset)
+    if (bytesWritten === 0) throw new Error('allowlist signing key write made no progress')
+    offset += bytesWritten
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+function isCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === code
+}

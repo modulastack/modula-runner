@@ -5,7 +5,7 @@ import type { CommandPolicy, SignedAllowlist, TrustAnchor } from './allowlist.js
 import type { Grants } from './consent.js'
 import type { LocalEndpointConfig } from './localEndpoints.js'
 import type { PairingContractStore } from './pairingContract.js'
-import { openRunnerHomeRecords } from './runnerHomeRecords.js'
+import { initializeRunnerPolicyRecord, openRunnerHomeRecords } from './runnerHomeRecords.js'
 import type { RunnerClock } from './runtimeClock.js'
 import type { LocalProjectRegistry, SessionReceiptLedger } from './sessionLaunch.js'
 
@@ -77,8 +77,18 @@ export type RunnerHomeSelection = {
   override?: string
 }
 
+export type RunnerPolicyInitialization =
+  | { status: 'initialized'; policy: RunnerPolicySnapshot }
+  | { status: 'exists' }
+  | { status: 'failed'; code: RunnerHomeFailure }
+
 export interface RunnerHome {
   open(selection: RunnerHomeSelection): Promise<RunnerHomeOpen>
+  initializePolicy?(
+    selection: RunnerHomeSelection,
+    signingKeyPath: string,
+    policy: RunnerPolicySnapshot,
+  ): Promise<RunnerPolicyInitialization>
   close?(): Promise<void>
 }
 
@@ -154,10 +164,9 @@ export function createRunnerHome(options: RunnerHomeOptions): RunnerHome {
   const lease = { held: false }
   return {
     open: selection => openHome(options, lease, selection),
+    initializePolicy: (selection, _signingKeyPath, policy) => initializeHomePolicy(options, lease, selection, policy),
     close: async () => {
-      if (lease.held && options.storage.release) await options.storage.release()
-      lease.held = false
-      await options.storage.close?.()
+      if (!(await releaseAndClose(options.storage, lease))) throw new Error('runner home did not close cleanly')
     },
   }
 }
@@ -187,14 +196,78 @@ async function failedHomeOpen(
   lease: { held: boolean },
   code: RunnerHomeFailure,
 ): Promise<RunnerHomeOpen> {
+  return (await releaseAndClose(options.storage, lease))
+    ? { status: 'failed', code }
+    : { status: 'failed', code: 'state-io-failed' }
+}
+
+async function initializeHomePolicy(
+  options: RunnerHomeOptions,
+  lease: { held: boolean },
+  selection: RunnerHomeSelection,
+  policy: RunnerPolicySnapshot,
+): Promise<RunnerPolicyInitialization> {
+  if (lease.held) return { status: 'failed', code: 'state-io-failed' }
+  const inspection = await inspectHome(options.storage, selection)
+  if ('failure' in inspection) return await failedInitializationBeforeLease(options.storage, inspection.failure)
+  if (!options.storage.acquire || !options.storage.release) return await failedInitializationBeforeLease(options.storage, 'state-io-failed')
   try {
-    await options.storage.release!()
-    lease.held = false
-    await options.storage.close?.()
+    if (await options.storage.acquire() !== 'acquired') return await failedInitializationBeforeLease(options.storage, 'state-io-failed')
+    lease.held = true
+    const result = await initializeRunnerPolicyRecord(options.storage, policy)
+    return (await releaseAndClose(options.storage, lease))
+      ? result
+      : { status: 'failed', code: 'state-io-failed' }
+  } catch {
+    return lease.held
+      ? await failedInitialization(options.storage, lease, 'state-io-failed')
+      : await failedInitializationBeforeLease(options.storage, 'state-io-failed')
+  }
+}
+
+async function failedInitializationBeforeLease(
+  storage: RunnerHomeStorage,
+  code: RunnerHomeFailure,
+): Promise<RunnerPolicyInitialization> {
+  try {
+    await storage.close?.()
     return { status: 'failed', code }
   } catch {
     return { status: 'failed', code: 'state-io-failed' }
   }
+}
+
+async function failedInitialization(
+  storage: RunnerHomeStorage,
+  lease: { held: boolean },
+  code: RunnerHomeFailure,
+): Promise<RunnerPolicyInitialization> {
+  return (await releaseAndClose(storage, lease))
+    ? { status: 'failed', code }
+    : { status: 'failed', code: 'state-io-failed' }
+}
+
+async function releaseAndClose(storage: RunnerHomeStorage, lease: { held: boolean }): Promise<boolean> {
+  let clean = true
+  let released = !lease.held
+  if (lease.held && storage.release) {
+    try {
+      await storage.release()
+      released = true
+    } catch {
+      clean = false
+    }
+  }
+  if (storage.close) {
+    try {
+      await storage.close()
+      released = true
+    } catch {
+      clean = false
+    }
+  }
+  if (released) lease.held = false
+  return clean
 }
 
 async function failedBeforeLease(storage: RunnerHomeStorage, code: RunnerHomeFailure): Promise<RunnerHomeOpen> {

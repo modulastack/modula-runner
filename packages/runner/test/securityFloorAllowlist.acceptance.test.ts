@@ -11,6 +11,7 @@ import {
   DEFAULT_FLOW,
   DEFAULT_REPLAY_LINES,
   TerminalSession,
+  allowlistKeyId,
   createSpawnSeam,
   loadTrustedAllowlist,
   openAuditLog,
@@ -40,11 +41,12 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
 })
 
-function signingIdentity(keyId: string): { anchor: TrustAnchor; key: AllowlistSigningKey } {
+function signingIdentity(_label: string): { anchor: TrustAnchor; key: AllowlistSigningKey } {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519', {
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   })
+  const keyId = allowlistKeyId(publicKey)
   return {
     anchor: { keyId, publicKey },
     key: { keyId, privateKey },

@@ -1,4 +1,4 @@
-import { createPrivateKey, createPublicKey, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto'
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { isSafeIdentifier } from '@modulastack/runner-protocol'
@@ -69,6 +69,11 @@ export type AllowlistSigningKey = {
   keyId: string
   // PEM-encoded PKCS8 Ed25519 private key.
   privateKey: string
+}
+
+export type GeneratedAllowlistSigningKey = {
+  signingKey: AllowlistSigningKey
+  trustAnchor: TrustAnchor
 }
 
 // Why a file is not trusted. Errors are values here, not exceptions: an untrusted allowlist is
@@ -150,10 +155,30 @@ function commandPolicy(allowlist: Allowlist, keyId: string): CommandPolicy {
 // public half is a configured anchor; the result is what they write back. This is a pure
 // function of the document and the key — no filesystem, no ambient state — so it is equally
 // the runner's ops helper and a test's fixture tool.
+export function generateAllowlistSigningKey(): GeneratedAllowlistSigningKey {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519')
+  const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString()
+  const keyId = allowlistKeyId(publicPem)
+  return {
+    signingKey: { keyId, privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString() },
+    trustAnchor: { keyId, publicKey: publicPem },
+  }
+}
+
+export function allowlistKeyId(publicKey: string): string {
+  const key = createPublicKey({ key: publicKey, format: 'pem' })
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('allowlist signing keys must use Ed25519')
+  const der = key.export({ type: 'spki', format: 'der' })
+  return createHash('sha256').update(der).digest('hex')
+}
+
 export function signAllowlist(allowlist: Allowlist, key: AllowlistSigningKey): SignedAllowlist {
   const privateKey = createPrivateKey({ key: key.privateKey, format: 'pem' })
+  if (privateKey.asymmetricKeyType !== 'ed25519') throw new Error('allowlist signing keys must use Ed25519')
+  const derivedKeyId = allowlistKeyId(createPublicKey(privateKey).export({ type: 'spki', format: 'pem' }).toString())
+  if (key.keyId !== derivedKeyId) throw new Error('allowlist signing key id does not match its public key')
   const signature = cryptoSign(null, canonicalAllowlistBytes(allowlist), privateKey)
-  return { allowlist: normalizeAllowlist(allowlist), keyId: key.keyId, signature: signature.toString('base64') }
+  return { allowlist: normalizeAllowlist(allowlist), keyId: derivedKeyId, signature: signature.toString('base64') }
 }
 
 // Verify a signed envelope against one anchor's public key. Separated from loading so the
@@ -162,6 +187,9 @@ export function signAllowlist(allowlist: Allowlist, key: AllowlistSigningKey): S
 export function verifyAllowlistSignature(signed: SignedAllowlist, anchor: TrustAnchor): boolean {
   try {
     const publicKey = createPublicKey({ key: anchor.publicKey, format: 'pem' })
+    if (publicKey.asymmetricKeyType !== 'ed25519') return false
+    const derivedKeyId = allowlistKeyId(anchor.publicKey)
+    if (anchor.keyId !== derivedKeyId || signed.keyId !== derivedKeyId) return false
     return cryptoVerify(null, canonicalAllowlistBytes(signed.allowlist), publicKey, Buffer.from(signed.signature, 'base64'))
   } catch {
     // A malformed key or signature is a verification failure, not a crash: the caller's answer
@@ -204,6 +232,16 @@ function canonicalJson(value: unknown): string {
 // Strict decode of the on-disk envelope. A structurally invalid file is `malformed`, never a
 // throw and never a partial read: the loader's contract is a classification, and a record the
 // runner cannot fully parse is a policy it cannot reason about.
+export function decodeAllowlistDocument(raw: string): Allowlist | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  return decodeAllowlist(parsed)
+}
+
 export function decodeSignedAllowlist(raw: string): SignedAllowlist | null {
   let parsed: unknown
   try {
