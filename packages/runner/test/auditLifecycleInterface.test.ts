@@ -4,7 +4,6 @@ import {
   AUDIT_RECORD_SCHEMA_VERSION,
   AUDIT_SEGMENT_STATES,
   AuditLifecycleNotImplementedError,
-  CapabilityProbeBatchNotImplementedError,
   SessionChannelEventNotImplementedError,
   MAX_AUDIT_METADATA_BYTES,
   MAX_AUDIT_RECORD_BYTES,
@@ -15,6 +14,7 @@ import {
   createCapabilityProbeBatchSeam,
   createSessionChannelEventCoordinator,
   openRunnerAuditLifecycle,
+  type AuditRecordInputV2,
   type SessionReceiptLedger,
 } from '../src/index.js'
 
@@ -59,11 +59,12 @@ describe('audit lifecycle interface checkpoint', () => {
     })).rejects.toBeInstanceOf(SessionChannelEventNotImplementedError)
   })
 
-  it('keeps aggregate probe execution inactive', async () => {
+  it('wraps one refresh in the durable aggregate admission and outcome pair', async () => {
+    const records: AuditRecordInputV2[] = []
     const seam = createCapabilityProbeBatchSeam({
       policy: null,
       audit: {
-        append: async () => undefined,
+        append: async record => { records.push(record) },
         snapshot: async () => ({ state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }),
         close: async () => undefined,
       },
@@ -75,6 +76,7 @@ describe('audit lifecycle interface checkpoint', () => {
         snapshotChanged: false,
       },
       value: null,
-    }))).rejects.toBeInstanceOf(CapabilityProbeBatchNotImplementedError)
+    }))).resolves.toEqual({ status: 'completed', value: null })
+    expect(records.map(record => record.kind)).toEqual(['capability-refresh-admitted', 'capability-refresh-outcome'])
   })
 })

@@ -10,7 +10,13 @@ import {
   probeRuntime as probeRuntimeRaw,
   type RuntimeSpec,
 } from '../src/capabilities.js'
-import { permissiveSpawnSeam } from './spawnSeamSupport.js'
+import {
+  createCapabilityProbeBatchSeam,
+  type AuditRecordInputV2,
+  type CommandPolicy,
+  type RunnerAuditLifecycle,
+} from '../src/index.js'
+import { denyingSpawnSeam, permissiveSpawnSeam } from './spawnSeamSupport.js'
 
 // Probing now passes the spawn seam; these tests exercise probe behavior, not the allowlist, so
 // a permissive seam stands in and the call sites stay unchanged.
@@ -29,6 +35,30 @@ const PROBE_ANSWER_BUDGET_MS = 8_000
 // from a probe's own timers by its length alone.
 const CADENCE_MS = 5_000
 const PROBE_TIMERS_BELOW_MS = 3_000
+
+const batchPolicy: CommandPolicy = {
+  allowsExecutable: executable => executable === process.execPath,
+  recipe: () => null,
+  executables: [process.execPath],
+  keyId: 'test-batch-anchor',
+}
+
+function batchAudit(failAt = -1) {
+  const records: AuditRecordInputV2[] = []
+  let appends = 0
+  const audit: RunnerAuditLifecycle = {
+    async append(record) {
+      appends += 1
+      if (appends === failAt) throw new Error('audit unavailable')
+      records.push(record)
+    },
+    async snapshot() {
+      return { state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }
+    },
+    async close() {},
+  }
+  return { audit, records }
+}
 
 const roots: string[] = []
 const spawned: (() => number[])[] = []
@@ -231,6 +261,46 @@ describe('runtime probes', () => {
 })
 
 describe('the capability monitor', () => {
+  it('routes one routine refresh through the aggregate seam instead of per-probe audit', async () => {
+    const runtime = standIn(workspace())
+    const held = batchAudit()
+    const batchSeam = createCapabilityProbeBatchSeam({ policy: batchPolicy, audit: held.audit })
+    const monitor = new CapabilityMonitor({ seam: denyingSpawnSeam(), batchSeam, runtimes: [runtime.spec()] })
+
+    const snapshot = await monitor.refresh()
+
+    expect(snapshot.runtimes).toHaveLength(1)
+    expect(runtime.invocations()).toEqual(['--version', 'auth'])
+    expect(held.records.map(record => record.kind)).toEqual(['capability-refresh-admitted', 'capability-refresh-outcome'])
+    expect(held.records[1]).toMatchObject({
+      runtimeOutcomes: { answered: 2, missing: 0, unanswered: 0, refused: 0 },
+      snapshotChanged: true,
+    })
+  })
+
+  it('does not probe or publish when aggregate admission is unavailable', async () => {
+    const runtime = standIn(workspace())
+    const held = batchAudit(1)
+    const batchSeam = createCapabilityProbeBatchSeam({ policy: batchPolicy, audit: held.audit })
+    const monitor = new CapabilityMonitor({ seam: denyingSpawnSeam(), batchSeam, runtimes: [runtime.spec()] })
+
+    await expect(monitor.refresh()).rejects.toThrow('capability refresh audit unavailable')
+    expect(runtime.invocations()).toEqual([])
+    expect(monitor.snapshot()).toBeNull()
+  })
+
+  it('withholds a probed snapshot when aggregate outcome is unavailable', async () => {
+    const runtime = standIn(workspace())
+    const held = batchAudit(2)
+    const batchSeam = createCapabilityProbeBatchSeam({ policy: batchPolicy, audit: held.audit })
+    const monitor = new CapabilityMonitor({ seam: denyingSpawnSeam(), batchSeam, runtimes: [runtime.spec()] })
+
+    await expect(monitor.refresh()).rejects.toThrow('capability refresh audit unavailable')
+    expect(runtime.invocations()).toEqual(['--version', 'auth'])
+    expect(monitor.snapshot()).toBeNull()
+    expect(held.records.map(record => record.kind)).toEqual(['capability-refresh-admitted'])
+  })
+
   it('has no snapshot until a probe lands, then holds the last one', async () => {
     const runtime = standIn(workspace())
     const monitor = new CapabilityMonitor({ seam, runtimes: [runtime.spec()] })
