@@ -83,6 +83,12 @@ export type LocalModelProfile = {
 // `env` holds non-secret orchestration variables only. Anything the argv rule covers — the
 // API key, and the endpoint URL, which is not secret but sits on the never-crosses list for
 // the same reason arguments are readable by any local process — travels in `secrets`.
+export function isCompleteLocalModelProfile(profile: LocalModelProfile): boolean {
+  if (profile.access === 'api-key') return Boolean(profile.provider && profile.keyLabel)
+  if (profile.access === 'local') return Boolean(profile.model && profile.endpointId)
+  return true
+}
+
 export type LaunchPlan = {
   modelProfileId: string
   access: AccessMode

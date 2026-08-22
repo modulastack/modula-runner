@@ -65,6 +65,7 @@ const homeOptions = {
     }),
     read: async () => ({ status: 'missing' }),
     replace: async () => ({ status: 'storage-unavailable' }),
+    append: async () => 'storage-unavailable',
   },
 } satisfies RunnerHomeOptions
 

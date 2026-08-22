@@ -65,6 +65,7 @@ export {
   loadTrustedAllowlist,
   signAllowlist,
   verifyAllowlistSignature,
+  trustSignedAllowlist,
   type Allowlist,
   type AllowlistLoad,
   type AllowlistRejection,
@@ -279,6 +280,11 @@ export {
   createFileRunnerHomeStorage,
   type FileRunnerHomeStorageOptions,
 } from './runnerHomeStorage.js'
+export {
+  openRunnerHomeRecords,
+  type RunnerHomeRecordComponents,
+  type RunnerHomeRecordsOptions,
+} from './runnerHomeRecords.js'
 export {
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,

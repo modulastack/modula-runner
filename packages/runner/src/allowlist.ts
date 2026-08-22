@@ -113,10 +113,11 @@ export async function loadTrustedAllowlist(options: LoadAllowlistOptions): Promi
   if (raw === null) return { status: 'untrusted', reason: 'missing' }
   const signed = decodeSignedAllowlist(raw)
   if (signed === null) return { status: 'untrusted', reason: 'malformed' }
-  // The key id selects which anchor must verify; it is not itself trust. An anchor the runner
-  // does not hold makes the file untrusted, never honored on the strength of the name it
-  // carries about the key that signed it.
-  const anchor = options.trustAnchors.find(candidate => candidate.keyId === signed.keyId)
+  return trustSignedAllowlist(signed, options.trustAnchors)
+}
+
+export function trustSignedAllowlist(signed: SignedAllowlist, trustAnchors: readonly TrustAnchor[]): AllowlistLoad {
+  const anchor = trustAnchors.find(candidate => candidate.keyId === signed.keyId)
   if (!anchor) return { status: 'untrusted', reason: 'unknown-key' }
   if (!verifyAllowlistSignature(signed, anchor)) return { status: 'untrusted', reason: 'bad-signature' }
   return { status: 'trusted', policy: commandPolicy(signed.allowlist, anchor.keyId) }

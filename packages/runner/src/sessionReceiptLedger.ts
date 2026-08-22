@@ -57,6 +57,10 @@ export function createSessionReceiptLedger(options: SessionReceiptLedgerOptions)
   return new DurableSessionReceiptLedger(options)
 }
 
+export function decodeSessionReceiptLedgerImage(value: unknown): SessionReceiptLedgerImage | null {
+  return isValidImage(value) ? jsonClone(value) : null
+}
+
 class DurableSessionReceiptLedger implements SessionReceiptLedger {
   private queue: Promise<unknown> = Promise.resolve()
   private pendingOperations = 0

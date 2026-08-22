@@ -125,6 +125,7 @@ export interface RunnerHomeStorage {
   inspect(selection: RunnerHomeSelection): Promise<RunnerHomeInspection>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
+  append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'>
 }
 
 export type RunnerHomeOptions = {
