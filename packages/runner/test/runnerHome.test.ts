@@ -1,13 +1,15 @@
 import { generateKeyPairSync } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  createFileRunnerHomeStorage,
+  createFileRunnerHome,
+  createFileRunnerHomeStorage as createStorage,
   createMemoryApiKeyStore,
   createRunnerHome,
   signAllowlist,
+  type FileRunnerHomeStorageOptions,
   type PairingContractStore,
   type RunnerHomeFailure,
   type RunnerHomeInspection,
@@ -15,11 +17,19 @@ import {
 } from '../src/index.js'
 
 const roots: string[] = []
+const storages: RunnerHomeStorage[] = []
 const clock = { now: () => Date.parse('2026-08-22T00:00:00Z'), sleep: async () => undefined }
 
 afterEach(async () => {
+  await Promise.all(storages.splice(0).map(storage => storage.close?.()))
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
+
+function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): RunnerHomeStorage {
+  const storage = createStorage(options)
+  storages.push(storage)
+  return storage
+}
 
 function pairingStore(): PairingContractStore {
   return {
@@ -69,6 +79,21 @@ describe('production runner home', () => {
     await storage.release!()
     await expect(competing.open({})).resolves.toMatchObject({ status: 'ready' })
     await competingStorage.release!()
+  })
+
+  it('composes encrypted pairing/key custody behind one file-home factory and releases on close', async () => {
+    const { root } = await fileHome()
+    const home = createFileRunnerHome({ defaultRoot: root, clock })
+    await expect(home.open({})).resolves.toMatchObject({ status: 'ready' })
+    await home.close?.()
+    await expect(lstat(path.join(root, 'runner.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('fails before state reads when the shared sealing key is permissive', async () => {
+    const { root } = await fileHome()
+    await writeFile(path.join(root, 'sealing.key'), Buffer.alloc(32), { mode: 0o644 })
+    const home = createFileRunnerHome({ defaultRoot: root, clock })
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'state-insecure-mode' })
   })
 
   it('releases the foreground lease when record preflight fails', async () => {

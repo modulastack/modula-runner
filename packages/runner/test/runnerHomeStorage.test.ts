@@ -2,11 +2,19 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } 
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createFileRunnerHomeStorage } from '../src/index.js'
+import { createFileRunnerHomeStorage as createStorage, type FileRunnerHomeStorageOptions, type RunnerHomeStorage } from '../src/index.js'
 
 const roots: string[] = []
+const storages: RunnerHomeStorage[] = []
+
+function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): RunnerHomeStorage {
+  const storage = createStorage(options)
+  storages.push(storage)
+  return storage
+}
 
 afterEach(async () => {
+  await Promise.all(storages.splice(0).map(storage => storage.close?.()))
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 

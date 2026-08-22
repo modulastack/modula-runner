@@ -79,6 +79,7 @@ export type RunnerHomeSelection = {
 
 export interface RunnerHome {
   open(selection: RunnerHomeSelection): Promise<RunnerHomeOpen>
+  close?(): Promise<void>
 }
 
 export const RUNNER_HOME_STATE_RECORDS = [
@@ -102,11 +103,14 @@ export type RunnerHomeEntryInspection = {
   links: number
 }
 
+export type RunnerHomeCustodyInspection = Omit<RunnerHomeEntryInspection, 'record'>
+
 export type RunnerHomeInspection = {
   rootKind: 'missing' | 'directory' | 'symlink' | 'other'
   rootOwner: 'current-user' | 'other'
   rootMode: number
   entries: readonly RunnerHomeEntryInspection[]
+  sealingKey?: RunnerHomeCustodyInspection
 }
 
 export type RunnerHomeStorageRead =
@@ -126,6 +130,7 @@ export interface RunnerHomeStorage {
   inspect(selection: RunnerHomeSelection): Promise<RunnerHomeInspection>
   acquire?(): Promise<'acquired' | 'busy' | 'storage-unavailable'>
   release?(): Promise<void>
+  close?(): Promise<void>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
   append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'>
@@ -146,35 +151,58 @@ export class RunnerHomeNotImplementedError extends Error {
 }
 
 export function createRunnerHome(options: RunnerHomeOptions): RunnerHome {
+  const lease = { held: false }
   return {
-    async open(selection): Promise<RunnerHomeOpen> {
-      const inspection = await inspectHome(options.storage, selection)
-      if ('failure' in inspection) return { status: 'failed', code: inspection.failure }
-      if (!options.storage.acquire || !options.storage.release) return { status: 'failed', code: 'state-io-failed' }
-      let acquired: 'acquired' | 'busy' | 'storage-unavailable'
-      try {
-        acquired = await options.storage.acquire()
-      } catch {
-        return { status: 'failed', code: 'state-io-failed' }
-      }
-      if (acquired !== 'acquired') return { status: 'failed', code: 'state-io-failed' }
-      if (!options.pairing || !options.keys) {
-        try {
-          await options.storage.release()
-        } catch {
-          return { status: 'failed', code: 'state-io-failed' }
-        }
-        return { status: 'failed', code: 'state-io-failed' }
-      }
-      const opened = await openRunnerHomeRecords({ ...options, pairing: options.pairing, keys: options.keys })
-      if (opened.status === 'ready') return opened
-      try {
-        await options.storage.release()
-      } catch {
-        return { status: 'failed', code: 'state-io-failed' }
-      }
-      return opened
+    open: selection => openHome(options, lease, selection),
+    close: async () => {
+      if (lease.held && options.storage.release) await options.storage.release()
+      lease.held = false
+      await options.storage.close?.()
     },
+  }
+}
+
+async function openHome(
+  options: RunnerHomeOptions,
+  lease: { held: boolean },
+  selection: RunnerHomeSelection,
+): Promise<RunnerHomeOpen> {
+  if (lease.held) return { status: 'failed', code: 'state-io-failed' }
+  const inspection = await inspectHome(options.storage, selection)
+  if ('failure' in inspection) return await failedBeforeLease(options.storage, inspection.failure)
+  if (!options.storage.acquire || !options.storage.release) return await failedBeforeLease(options.storage, 'state-io-failed')
+  try {
+    if (await options.storage.acquire() !== 'acquired') return await failedBeforeLease(options.storage, 'state-io-failed')
+  } catch {
+    return await failedBeforeLease(options.storage, 'state-io-failed')
+  }
+  lease.held = true
+  if (!options.pairing || !options.keys) return await failedHomeOpen(options, lease, 'state-io-failed')
+  const opened = await openRunnerHomeRecords({ ...options, pairing: options.pairing, keys: options.keys })
+  return opened.status === 'ready' ? opened : await failedHomeOpen(options, lease, opened.code)
+}
+
+async function failedHomeOpen(
+  options: RunnerHomeOptions,
+  lease: { held: boolean },
+  code: RunnerHomeFailure,
+): Promise<RunnerHomeOpen> {
+  try {
+    await options.storage.release!()
+    lease.held = false
+    await options.storage.close?.()
+    return { status: 'failed', code }
+  } catch {
+    return { status: 'failed', code: 'state-io-failed' }
+  }
+}
+
+async function failedBeforeLease(storage: RunnerHomeStorage, code: RunnerHomeFailure): Promise<RunnerHomeOpen> {
+  try {
+    await storage.close?.()
+    return { status: 'failed', code }
+  } catch {
+    return { status: 'failed', code: 'state-io-failed' }
   }
 }
 
@@ -197,7 +225,7 @@ function inspectionFailure(inspection: RunnerHomeInspection): RunnerHomeFailure 
   if (inspection.rootKind !== 'directory') return 'state-not-regular'
   if (inspection.rootOwner !== 'current-user') return 'state-wrong-owner'
   if (inspection.rootMode !== 0o700) return 'state-insecure-mode'
-  for (const entry of inspection.entries) {
+  for (const entry of [...inspection.entries, ...(inspection.sealingKey ? [inspection.sealingKey] : [])]) {
     if (entry.kind === 'missing') continue
     if (entry.kind === 'symlink' || entry.links !== 1) return 'state-linked'
     if (entry.kind !== 'regular') return 'state-not-regular'

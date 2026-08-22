@@ -6,6 +6,7 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   RUNNER_HOME_RECORDS,
+  type RunnerHomeCustodyInspection,
   type RunnerHomeEntryInspection,
   type RunnerHomeInspection,
   type RunnerHomeRecord,
@@ -59,6 +60,14 @@ export function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOption
   return new FileRunnerHomeStorage(options)
 }
 
+export function fileRunnerHomeRecordPath(root: string, record: RunnerHomeRecord): string {
+  return path.join(root, RECORD_FILES[record])
+}
+
+export function fileRunnerHomeSealingKeyPath(root: string): string {
+  return path.join(root, 'sealing.key')
+}
+
 class FileRunnerHomeStorage implements RunnerHomeStorage {
   private queue: Promise<unknown> = Promise.resolve()
   private root: string | null = null
@@ -82,6 +91,16 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   release(): Promise<void> {
     return this.serialize(async () => await this.releaseLock())
+  }
+
+  close(): Promise<void> {
+    return this.serialize(async () => {
+      await this.releaseLock()
+      await this.rootHandle?.close()
+      this.rootHandle = null
+      this.rootIdentity = null
+      this.root = null
+    })
   }
 
   read(record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
@@ -129,11 +148,15 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       entries = []
     }
     const info = bound ? await bound.stat() : await lstat(root)
+    const sealingKey = bound
+      ? await inspectCustody(rootEntryPath(bound, 'sealing.key'), this.uid)
+      : undefined
     return {
       rootKind: rootKindOf(info),
       rootOwner: ownerOf(info, this.uid),
       rootMode: permissionsOf(info),
       entries,
+      ...(sealingKey ? { sealingKey } : {}),
     }
   }
 
@@ -613,6 +636,12 @@ async function inspectEntry(root: FileHandle, record: RunnerHomeRecord, uid: num
   const info = await lstat(rootEntryPath(root, RECORD_FILES[record])).catch(error => missingOnly(error))
   if (info === null) return { record, kind: 'missing', owner: 'current-user', mode: 0, links: 0 }
   return { record, kind: entryKindOf(info), owner: ownerOf(info, uid), mode: permissionsOf(info), links: info.nlink }
+}
+
+async function inspectCustody(target: string, uid: number | undefined): Promise<RunnerHomeCustodyInspection> {
+  const info = await lstat(target).catch(error => missingOnly(error))
+  if (info === null) return { kind: 'missing', owner: 'current-user', mode: 0, links: 0 }
+  return { kind: entryKindOf(info), owner: ownerOf(info, uid), mode: permissionsOf(info), links: info.nlink }
 }
 
 async function openRecord(target: string): Promise<FileHandle | null> {

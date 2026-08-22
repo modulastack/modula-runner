@@ -46,6 +46,7 @@ export {
   type PairingResponseMediaType,
   type PairingReservation,
 } from './pairingContract.js'
+export { createEncryptedPairingContractStore, pairingContractStore } from './pairingContractStore.js'
 export { createPairedClient, type PairedClientOptions } from './pairedClient.js'
 export { PresenceTracker, type PresenceSnapshot, type PresenceState, type PresenceTrackerOptions } from './presence.js'
 export {
@@ -261,6 +262,7 @@ export {
   type RunnerConfigurationReplace,
   type RunnerConfigurationStore,
   type RunnerHome,
+  type RunnerHomeCustodyInspection,
   type RunnerHomeEntryInspection,
   type RunnerHomeFailure,
   type RunnerHomeInspection,
@@ -278,6 +280,10 @@ export {
   type RunnerPolicySnapshot,
   type RunnerPolicyStore,
 } from './runnerHome.js'
+export {
+  createFileRunnerHome,
+  type FileRunnerHomeOptions,
+} from './fileRunnerHome.js'
 export {
   createFileRunnerHomeStorage,
   type FileRunnerHomeStorageOptions,
