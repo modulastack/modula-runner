@@ -23,26 +23,20 @@ bug to fix.
 - The per-runner token travels as an `Authorization: Bearer` header on the upgrade
   request. It authenticates this connection and nothing else. It never appears inside a
   frame.
-- The token is minted by pairing, which is **not part of this protocol**: it is an
-  outbound HTTP redemption the runner performs before it ever opens a socket, and the
-  pairing code that buys it enters the runner through its local command line only. There
-  is no frame type for pairing and there will not be one — an inbound path for a code
-  would contradict the outbound-only rule the transport is built on. A control plane
-  answering the redemption returns a runner id and a token; that request and response
-  shape is currently this runner's **proposal**, since no control-plane implementation of
-  it exists yet, and it is expected to be settled by the slice that builds one.
-- **Redemption must be two-phase.** A pairing code is single-use, so a runner that
-  redeems successfully but then fails to persist the token locally leaves an active
-  binding nobody holds and a code that cannot be retried. The runner cannot repair that
-  from its side — there is nothing to call — so the hosted contract carries the
-  obligation: mint a *pending* binding, let the runner persist it, have the runner confirm
-  activation, and expire any binding that is never confirmed. A crash between persistence
-  and confirmation must be recoverable rather than fatal, which requires **confirmation to
-  be idempotent**: a runner that confirmed successfully but failed to record the result
-  locally will confirm the same binding again, and that repeat must succeed rather than
-  being read as a second activation. This is a requirement on the
-  control-plane slice, not a suggestion; an idempotency key was considered and rejected,
-  because a key that can retrieve an already-minted token is itself a credential.
+- Pairing is outbound HTTP, not a WebSocket frame. Its adopted contract is
+  [`docs/runner-launch-contract.md`](../../docs/runner-launch-contract.md), and its shared
+  executable shapes live in `src/pairing.ts`. `POST /api/runner/v1/pair` carries only the
+  canonical `<22-character base64url pairing id>.<19-character base64url secret>` code and bounded
+  runner metadata; success returns a lowercase UUIDv4 binding id,
+  safe runner id, canonical 32-byte base64url bearer token, independent 32-byte nonce, and
+  UTC confirmation deadline. `POST /api/runner/v1/pair/confirm` carries the binding/runner
+  ids, nonce, and lowercase HMAC proof—never the token.
+- Redemption is two-phase, serialized locally, and confirmation is idempotent. A pending
+  binding expires after ten minutes. The proof binds the raw token bytes to the binding,
+  runner, canonical configured origin, and nonce. Lost redemption cannot retrieve a token;
+  lost confirmation replays only the exact stored proof. The pre-contract runner client is
+  not evidence of this adopted shape and cannot be wired into the packaged CLI until the
+  production implementation checkpoint.
 - Revocation is expressed as refusing the upgrade. A `401` or `403` is terminal for the
   binding, not a transient error to back off from: a runner whose access was withdrawn
   stops, says so locally, and does not retry into the same wall.
@@ -59,9 +53,10 @@ bug to fix.
 
 ## Versioning
 
-- The protocol version is a positive integer. This package's `PROTOCOL_VERSION` is the
-  newest version the package describes; `MIN_PROTOCOL_VERSION` is the oldest it can still
-  speak.
+- The protocol version is a positive integer. `PROTOCOL_VERSION` is the newest version the
+  active runtime speaks; `MIN_PROTOCOL_VERSION` is the oldest. The interface-first
+  `SESSION_LAUNCH_PROTOCOL_VERSION` may name a later reviewed shape without advertising it;
+  it does not widen the active hello range.
 - The runner's `hello` offers a contiguous range `{min, max}`. The control plane holds a
   set of supported versions — by policy the current version and the one before it
   (**N and N−1**) — and `negotiate()` picks the highest version in both; the connection
@@ -85,7 +80,9 @@ bug to fix.
   against the older document drops traffic the newer one considers valid. This covers
   channel kinds, refusal reasons, and the capability enums. Payload *message types* are
   not enums in this sense — an unrecognised message parses to null and an endpoint ignores
-  it, which is how the terminal and job-control payload sets each shipped inside version 1.
+  it, which is how the terminal and preview job-control payloads shipped inside version 1.
+  Session launch deliberately takes the stricter v2 gate: silently ignoring a launch leaves
+  an orchestrator unable to distinguish unsupported work from work still pending.
 
 ## Frames
 
@@ -373,6 +370,56 @@ its reason — `not-allowlisted`, `path-not-granted`, `runner-paused`, `non-loop
 `already-running`, `unknown-preview`, `spawn-failed`, `ambiguous-listener`, `at-capacity`. Nothing is held for a later attempt.
 This is the wire form of the seam's fourth principle: an offline or unwilling runner is
 visible, and a request that will not be served never looks like one still in progress.
+
+### Inactive session-launch v2 interface
+
+`SESSION_LAUNCH_PROTOCOL_VERSION = 2` publishes the reviewed endpoint interface without
+activating it. `PROTOCOL_VERSION` remains 1, the current job-control decoder continues to
+reject `SESSION_START`, and the v2 parsers require an explicit negotiated version of 2.
+No runner runtime handles these messages in this checkpoint.
+
+Control plane → runner:
+
+| Message | Fields |
+|---|---|
+| `SESSION_START` | `bindingId` · `requestId` · `expiresAt` · `terminalProfile` · `modelProfileId` · `target {projectId, worktreeName, branch, baseBranch, relativeCwd}` |
+
+Runner → control plane:
+
+| Message | Fields |
+|---|---|
+| `SESSION_ACCEPTED` | `requestId` |
+| `SESSION_STARTED` | `requestId` · `channelId` · `sessionId` |
+| `SESSION_REFUSED` | `requestId` · `reason` |
+| `SESSION_FAILED` | `requestId` · `reason` |
+| `SESSION_FINISHED` | `requestId` · exactly one of `exitCode` / `signal` |
+
+Binding and request ids are lowercase UUIDv4 values. Profile/project/worktree/channel/session
+ids use the safe-identifier grammar. Branches are bounded and control-character-free, then
+must pass the runner's local `git check-ref-format --branch` before admission. `relativeCwd`
+is canonical relative POSIX syntax with no empty, dot, dot-dot, absolute, backslash, or leading
+ASCII drive-prefix component. Unknown properties are discarded. In particular there is no command, argv,
+arbitrary environment, key label, credential, endpoint, absolute path, allowlist extension,
+or signing material in the validated request.
+
+Session refusal reasons are `invalid-request`, `binding-mismatch`, `project-unknown`,
+`path-not-granted`, `runner-paused`, `worktree-invalid`, `at-capacity`, `request-conflict`,
+`request-expired`, `unknown-profile`, `runtime-unknown`, `runtime-unavailable`,
+`runtime-unauthenticated`, `access-unsupported`, `unknown-key`, `key-provider-mismatch`,
+`unknown-endpoint`, `endpoint-unavailable`, `model-unavailable`, and `profile-incomplete`.
+
+Session failure reasons are `project-unknown`, `path-not-granted`, `worktree-invalid`,
+`worktree-conflict`, `provision-failed`, `spawn-failed`, `channel-unavailable`,
+`launch-timeout`, `recovery-uncertain`, `unknown-profile`,
+`runtime-unknown`, `runtime-unavailable`, `runtime-unauthenticated`, `access-unsupported`,
+`unknown-key`, `key-provider-mismatch`, `unknown-endpoint`, `endpoint-unavailable`,
+`model-unavailable`, and `profile-incomplete`.
+
+Canonical equality is SHA-256 over the validated semantic request with recursively fixed
+key order. The request deadline governs first admission only; known receipts replay before
+deadline checks. Receipt, recovery, durability-first storage failure, and counterpart
+obligations remain normative in
+[`docs/runner-launch-contract.md`](../../docs/runner-launch-contract.md).
 
 ## Capability payloads
 
