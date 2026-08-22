@@ -80,7 +80,10 @@ export async function observePairingScenario(scenario: RuntimeScenario): Promise
         const confirmation = new URL(request.url).pathname === PAIRING_CONFIRM_PATH
         secrecy.outboundFrames.push(recordPairingRequest(recorder.record, request, scenario))
         const response = responses[exchangeIndex++]
-        if (response instanceof Error) throw response
+        if (response instanceof Error) {
+          if (!confirmation) recorder.record('transport.redeem:lost-response')
+          throw response
+        }
         const resolved = response ?? { status: 500, mediaType: 'missing' as const, body: '' }
         recorder.record(`${confirmation ? 'transport.confirm' : 'transport.redeem'}:${resolved.status}`)
         return resolved

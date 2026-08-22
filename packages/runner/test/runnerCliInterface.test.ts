@@ -4,7 +4,6 @@ import {
   RUNNER_HOME_FAILURES,
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
-  PairingContractNotImplementedError,
   RunnerApplicationNotImplementedError,
   SessionLaunchNotImplementedError,
   SessionReceiptStorageUnavailableError,
@@ -122,9 +121,9 @@ describe('G2 runner CLI composition interface', () => {
     expect(RUNNER_PROJECT_COMMANDS).toEqual(['create', 'list', 'remove'])
   })
 
-  it('exposes pairing transport, store, and clock without activating them', async () => {
+  it('runs pairing through injected transport, store, and clock boundaries', async () => {
     const service = createPairingContractService(pairingOptions)
-    await expect(service.snapshot()).rejects.toBeInstanceOf(PairingContractNotImplementedError)
+    await expect(service.snapshot()).resolves.toEqual({ state: 'unpaired', record: null })
   })
 
   it('exposes launch and negotiated job-control ports without activating protocol v2', async () => {
