@@ -61,11 +61,16 @@ export interface RunnerCliIo {
   writeStderr(text: string): void
 }
 
+export interface RunnerCliSignals {
+  subscribe(listener: (signal: 'SIGINT' | 'SIGTERM') => void): () => void
+}
+
 export type RunnerCliInvocation = {
   args: readonly string[]
   cwd: string
   environment: RunnerCliEnvironment
   io: RunnerCliIo
+  signals?: RunnerCliSignals
 }
 
 export interface RunnerApplication {
@@ -145,7 +150,7 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
   if (command === '--help' || command === 'help') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: helpText() })
   if (command === '--version' || command === 'version') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: options.version })
   if (!command) return emit(invocation.io, usage())
-  if (!['pair', 'status', 'project', 'key', 'grant', 'profile', 'endpoint', 'allowlist'].includes(command)) {
+  if (!['pair', 'status', 'run', 'project', 'key', 'grant', 'profile', 'endpoint', 'allowlist'].includes(command)) {
     if ((RUNNER_TOP_LEVEL_COMMANDS as readonly string[]).includes(command)) throw new RunnerApplicationNotImplementedError()
     return emit(invocation.io, usage())
   }
@@ -206,6 +211,7 @@ async function runOpened(
 ): Promise<CommandOutcome> {
   if (command === 'pair') return await pairCommand(options, home, invocation, args[1]!)
   if (command === 'status') return await statusCommand(options.composition.pairing(home), args[0] === '--json')
+  if (command === 'run') return await runCommand(options.composition, home, invocation.signals)
   if (command === 'project') return await projectCommand(home, invocation.cwd, args)
   if (command === 'key') return await keyCommand(home, invocation, args)
   if (command === 'grant') return await grantCommand(home, invocation.cwd, args)
@@ -222,6 +228,7 @@ function commandSyntax(command: string, args: readonly string[], invocation: Run
   if (command === 'status' && (args.length > 1 || (args[0] !== undefined && args[0] !== '--json'))) {
     return usage('usage: modula-runner status [--json]')
   }
+  if (command === 'run' && args.length > 0) return usage('usage: modula-runner run')
   if (command === 'project' && !RUNNER_PROJECT_COMMANDS.includes(args[0] as RunnerProjectCommand)) {
     return usage('usage: modula-runner project <create|list|remove> ...')
   }
@@ -260,6 +267,59 @@ async function pairCommand(
     const reason = error instanceof PairingContractError ? error.failure : 'unreachable'
     return { exitCode: 1, stderr: `pairing failed: ${reason}` }
   }
+}
+
+async function runCommand(
+  composition: RunnerComposition,
+  home: RunnerHomeState,
+  signals: RunnerCliSignals | undefined,
+): Promise<CommandOutcome> {
+  let handle: RunnerRuntimeHandle
+  try {
+    const sessions = composition.sessions(home)
+    handle = await composition.runtime.start(home, composition.jobControl(sessions))
+  } catch (error) {
+    if (error instanceof RunnerRuntimeNotImplementedError) {
+      return { exitCode: 1, stderr: 'protocol-inactive: session runtime awaits the separate protocol-v2 activation gate' }
+    }
+    throw error
+  }
+  const result = await waitForRuntime(handle, signals)
+  return result.status === 'confirmed'
+    ? { exitCode: 0, stdout: 'runner stopped — all identified children terminated' }
+    : { exitCode: 1, stderr: result.detail.startsWith('unconfirmed') ? result.detail : `unconfirmed — ${result.detail}` }
+}
+
+function waitForRuntime(handle: RunnerRuntimeHandle, signals: RunnerCliSignals | undefined): Promise<RunnerShutdownResult> {
+  return new Promise(resolve => {
+    let settled = false
+    let stopping = false
+    let unsubscribe: (() => void) | undefined
+    const finish = (result: RunnerShutdownResult) => {
+      if (settled) return
+      settled = true
+      unsubscribe?.()
+      resolve(result)
+    }
+    void handle.finished.then(finish, () => finish({ status: 'unconfirmed', detail: 'unconfirmed — runtime completion failed' }))
+    if (!signals) return
+    unsubscribe = signals.subscribe(signal => {
+      if (stopping) {
+        try {
+          handle.forceStop()
+        } catch {
+          // The forced result is already unconfirmed; a throwing teardown cannot make a stronger claim.
+        }
+        finish({ status: 'unconfirmed', detail: 'unconfirmed — forced exit during cleanup' })
+        return
+      }
+      stopping = true
+      void Promise.resolve()
+        .then(async () => await handle.stop(signal))
+        .then(finish, () => finish({ status: 'unconfirmed', detail: 'unconfirmed — runtime cleanup failed' }))
+    })
+    if (settled) unsubscribe()
+  })
 }
 
 async function statusCommand(pairing: PairingContractService, json: boolean): Promise<CommandOutcome> {

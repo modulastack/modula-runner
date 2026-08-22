@@ -7,6 +7,7 @@ import {
   createMemoryApiKeyStore,
   createMemoryGrantStore,
   createRunnerApplication,
+  createRunnerRuntime,
   type ContractPairingRecord,
   type LocalProjectRecord,
   type PairingContractService,
@@ -15,6 +16,8 @@ import {
   type RunnerConfigurationStore,
   type RunnerHomeState,
   type RunnerLocalConfiguration,
+  type RunnerCliSignals,
+  type RunnerRuntimeHandle,
   type RunnerRuntimePort,
 } from '../src/index.js'
 
@@ -70,12 +73,13 @@ function application(
   pairingService = pairing(),
   projects = projectRegistry(),
   stateOverrides: Partial<RunnerHomeState> = {},
+  runtimeOverride?: RunnerRuntimePort,
 ) {
   const state = { projects, ...stateOverrides } as unknown as RunnerHomeState
   const open = vi.fn<RunnerHome['open']>(async () => ({ status: 'ready', home: state }))
   const close = vi.fn<NonNullable<RunnerHome['close']>>(async () => undefined)
   const home: RunnerHome = { open, close }
-  const runtime: RunnerRuntimePort = { start: async () => { throw new Error('runtime must not start') } }
+  const runtime: RunnerRuntimePort = runtimeOverride ?? { start: async () => { throw new Error('runtime must not start') } }
   const options: RunnerApplicationOptions = {
     version: '0.1.0',
     clock: { now: () => 0, sleep: async () => undefined },
@@ -92,7 +96,7 @@ function application(
 
 function invocation(
   args: string[],
-  options: { tty?: boolean; hidden?: string; cwd?: string; runnerHome?: string; endpointUrl?: string } = {},
+  options: { tty?: boolean; hidden?: string; cwd?: string; runnerHome?: string; endpointUrl?: string; signals?: RunnerCliSignals } = {},
 ) {
   const stdout: string[] = []
   const stderr: string[] = []
@@ -111,11 +115,29 @@ function invocation(
         writeStdout: (text: string) => stdout.push(text),
         writeStderr: (text: string) => stderr.push(text),
       },
+      ...(options.signals ? { signals: options.signals } : {}),
     },
     stdout,
     stderr,
     readHidden,
   }
+}
+
+function testSignals() {
+  const listeners = new Set<(signal: 'SIGINT' | 'SIGTERM') => void>()
+  const source: RunnerCliSignals = {
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+  return { source, send: (signal: 'SIGINT' | 'SIGTERM') => { for (const listener of [...listeners]) listener(signal) } }
+}
+
+function pending<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
 }
 
 describe('core runner application commands', () => {
@@ -128,6 +150,45 @@ describe('core runner application commands', () => {
     expect(help.stdout.join('')).toContain('modula-runner')
     expect(version.stdout).toEqual(['0.1.0\n'])
     expect(app.open).not.toHaveBeenCalled()
+  })
+
+  it('runs in the foreground and maps first and second signals onto bounded shutdown', async () => {
+    const finished = pending<{ status: 'confirmed' }>()
+    const stop = vi.fn(async () => ({ status: 'confirmed' as const }))
+    const forceStop = vi.fn()
+    const handle: RunnerRuntimeHandle = { finished: finished.promise, stop, forceStop }
+    const runtime: RunnerRuntimePort = { start: vi.fn(async () => handle) }
+    const signals = testSignals()
+    const call = invocation(['run'], { signals: signals.source })
+    const execution = application(pairing(), projectRegistry(), {}, runtime).value.execute(call.value)
+    await vi.waitFor(() => expect(runtime.start).toHaveBeenCalledOnce())
+    signals.send('SIGTERM')
+    await expect(execution).resolves.toBe(0)
+    expect(stop).toHaveBeenCalledWith('SIGTERM')
+    expect(forceStop).not.toHaveBeenCalled()
+    expect(call.stdout).toEqual(['runner stopped — all identified children terminated\n'])
+
+    const heldStop = vi.fn(async () => await new Promise<never>(() => undefined))
+    const forced = vi.fn()
+    const heldStart = vi.fn(async () => ({ finished: new Promise<never>(() => undefined), stop: heldStop, forceStop: forced }))
+    const heldRuntime: RunnerRuntimePort = { start: heldStart }
+    const repeated = testSignals()
+    const forcedCall = invocation(['run'], { signals: repeated.source })
+    const forcedExecution = application(pairing(), projectRegistry(), {}, heldRuntime).value.execute(forcedCall.value)
+    await vi.waitFor(() => expect(heldStart).toHaveBeenCalledOnce())
+    repeated.send('SIGINT')
+    await vi.waitFor(() => expect(heldStop).toHaveBeenCalledOnce())
+    repeated.send('SIGTERM')
+    await expect(forcedExecution).resolves.toBe(1)
+    expect(forced).toHaveBeenCalledOnce()
+    expect(forcedCall.stderr).toEqual(['unconfirmed — forced exit during cleanup\n'])
+  })
+
+  it('keeps the foreground runtime explicitly inactive while protocol v1 is active', async () => {
+    const call = invocation(['run'])
+    const runtime = createRunnerRuntime({ clock: { now: Date.now, sleep: async () => undefined } })
+    await expect(application(pairing(), projectRegistry(), {}, runtime).value.execute(call.value)).resolves.toBe(1)
+    expect(call.stderr).toEqual(['protocol-inactive: session runtime awaits the separate protocol-v2 activation gate\n'])
   })
 
   it('accepts pairing codes only through a hidden interactive read', async () => {

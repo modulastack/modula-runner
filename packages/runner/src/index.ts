@@ -27,6 +27,7 @@ export {
   type RunnerBinding,
 } from './pairing.js'
 export { createEncryptedPairingStore, createMemoryPairingStore, type EncryptedStoreOptions } from './identityStore.js'
+export { createPairingHttpTransport } from './pairingHttpTransport.js'
 export {
   PAIRING_CONTRACT_FAILURES,
   PairingContractError,
@@ -309,6 +310,7 @@ export {
   type RunnerHomeRecordComponents,
   type RunnerHomeRecordsOptions,
 } from './runnerHomeRecords.js'
+export { createInstalledRunnerApplication, type InstalledRunnerOptions } from './installedRunner.js'
 export {
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
@@ -322,6 +324,7 @@ export {
   type RunnerCliEnvironment,
   type RunnerCliInvocation,
   type RunnerCliIo,
+  type RunnerCliSignals,
   type RunnerComposition,
   type RunnerExitCode,
   type RunnerRuntimeHandle,
