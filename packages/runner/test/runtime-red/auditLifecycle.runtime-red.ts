@@ -1,3 +1,6 @@
+import { appendFile, chmod, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   createCapabilityProbeBatchSeam,
@@ -126,12 +129,36 @@ describe('audit lifecycle and replacement-channel production subjects are intent
   })
 
   it('[AL-02] drives the production lifecycle factory with a constructible spawn-admitted record', async () => {
-    const opened = await openRunnerAuditLifecycle({ runnerHome: `/runtime-red/${auditScenarioIdFor('AL-02')}` })
-    if (opened.status !== 'ready') throw new Error('unexpected storage-unavailable lifecycle')
-    const record: AuditRecordInputV2 = { schemaVersion: 2, eventId: auditScenarioIdFor('AL-02'), at: '2026-08-22T00:00:00.000Z', kind: 'spawn-admitted', spawnId: 'spawn-1', spawnKind: 'pane', subjectId: null, requestId: null }
-    await opened.audit.append(record)
-    expect((await opened.audit.snapshot()).state).toBe('ready')
-    await opened.audit.close()
+    const runnerHome = await mkdtemp(join(tmpdir(), 'runner-audit-lifecycle-'))
+    await chmod(runnerHome, 0o700)
+    try {
+      const opened = await openRunnerAuditLifecycle({ runnerHome })
+      if (opened.status !== 'ready') throw new Error('unexpected storage-unavailable lifecycle')
+      try {
+        const record: AuditRecordInputV2 = { schemaVersion: 2, eventId: auditScenarioIdFor('AL-02'), at: '2026-08-22T00:00:00.000Z', kind: 'spawn-admitted', spawnId: 'spawn-1', spawnKind: 'pane', subjectId: null, requestId: null }
+        await opened.audit.append(record)
+        expect((await opened.audit.snapshot()).state).toBe('ready')
+      } finally {
+        await opened.audit.close()
+      }
+    } finally {
+      await rm(runnerHome, { recursive: true, force: true })
+    }
+  })
+
+  it('[AL-04] repairs only a recoverable open-record prefix, never arbitrary tail corruption', async () => {
+    const runnerHome = await mkdtemp(join(tmpdir(), 'runner-audit-lifecycle-'))
+    await chmod(runnerHome, 0o700)
+    try {
+      const opened = await openRunnerAuditLifecycle({ runnerHome })
+      if (opened.status !== 'ready') throw new Error('unexpected storage-unavailable lifecycle')
+      await opened.audit.append({ schemaVersion: 2, eventId: auditScenarioIdFor('AL-04'), at: '2026-08-22T00:00:00.000Z', kind: 'spawn-admitted', spawnId: 'spawn-1', spawnKind: 'pane', subjectId: null, requestId: null })
+      await opened.audit.close()
+      await appendFile(join(runnerHome, 'audit.jsonl', 'segment-00000000000000000001.open'), 'not-a-record')
+      await expect(openRunnerAuditLifecycle({ runnerHome })).resolves.toEqual({ status: 'storage-unavailable' })
+    } finally {
+      await rm(runnerHome, { recursive: true, force: true })
+    }
   })
 
   it('[CH-01] replaces a closed generation only after its loss state is observed', async () => {

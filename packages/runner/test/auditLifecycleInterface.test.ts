@@ -29,9 +29,9 @@ describe('audit lifecycle interface checkpoint', () => {
     expect(AUDIT_SEGMENT_STATES).toEqual(['open', 'sealed', 'acked', 'reclaimed'])
   })
 
-  it('keeps the file lifecycle and offline archive inactive until runtime-red specs exist', async () => {
+  it('fails closed for an unusable lifecycle root and keeps offline archive inactive', async () => {
     await expect(openRunnerAuditLifecycle({ runnerHome: '/inactive' }))
-      .rejects.toBeInstanceOf(AuditLifecycleNotImplementedError)
+      .resolves.toEqual({ status: 'storage-unavailable' })
     await expect(archiveRunnerAudit({ runnerHome: '/inactive', destination: '/inactive-archive' }))
       .rejects.toBeInstanceOf(AuditLifecycleNotImplementedError)
   })

@@ -160,11 +160,3 @@ export class AuditLifecycleNotImplementedError extends Error {
     this.name = 'AuditLifecycleNotImplementedError'
   }
 }
-
-export async function openRunnerAuditLifecycle(_options: RunnerAuditLifecycleOptions): Promise<RunnerAuditLifecycleOpen> {
-  throw new AuditLifecycleNotImplementedError()
-}
-
-export async function archiveRunnerAudit(_options: RunnerAuditArchiveOptions): Promise<RunnerAuditArchiveResult> {
-  throw new AuditLifecycleNotImplementedError()
-}

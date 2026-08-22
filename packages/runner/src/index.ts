@@ -105,8 +105,6 @@ export {
   MAX_CAPABILITY_REFRESH_RUNTIMES,
   MAX_RESIDENT_AUDIT_SEGMENTS,
   AuditLifecycleNotImplementedError,
-  archiveRunnerAudit,
-  openRunnerAuditLifecycle,
   type AuditArchiveAcknowledgement,
   type AuditLifecycleSnapshot,
   type AuditRecordBaseV2,
@@ -126,6 +124,7 @@ export {
   type RunnerAuditLifecycleOpen,
   type RunnerAuditLifecycleOptions,
 } from './auditLifecycle.js'
+export { archiveRunnerAudit, openRunnerAuditLifecycle } from './fileAuditLifecycle.js'
 export {
   activateKillSwitch,
   type KillOutcome,

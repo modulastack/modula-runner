@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto'
-import { lstat, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -96,6 +96,15 @@ describe('production runner home', () => {
     await writeFile(path.join(root, 'sealing.key'), Buffer.alloc(32), { mode: 0o644 })
     const home = createFileRunnerHome({ defaultRoot: root, clock })
     await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'state-insecure-mode' })
+  })
+
+  it('accepts the secure segmented audit directory during home preflight', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'runner-home-audit-directory-'))
+    roots.push(root)
+    await mkdir(path.join(root, 'audit.jsonl'), { mode: 0o700 })
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'policy-missing' })
   })
 
   it('releases the foreground lease when record preflight fails', async () => {

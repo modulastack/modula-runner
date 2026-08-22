@@ -299,12 +299,24 @@ function inspectionFailure(inspection: RunnerHomeInspection): RunnerHomeFailure 
   if (inspection.rootKind !== 'directory') return 'state-not-regular'
   if (inspection.rootOwner !== 'current-user') return 'state-wrong-owner'
   if (inspection.rootMode !== 0o700) return 'state-insecure-mode'
-  for (const entry of [...inspection.entries, ...(inspection.sealingKey ? [inspection.sealingKey] : [])]) {
+  for (const entry of inspection.entries) {
     if (entry.kind === 'missing') continue
+    if (entry.record === 'audit' && entry.kind === 'directory') {
+      if (entry.owner !== 'current-user') return 'state-wrong-owner'
+      if (entry.mode !== 0o700) return 'state-insecure-mode'
+      continue
+    }
     if (entry.kind === 'symlink' || entry.links !== 1) return 'state-linked'
     if (entry.kind !== 'regular') return 'state-not-regular'
     if (entry.owner !== 'current-user') return 'state-wrong-owner'
     if (entry.mode !== 0o600) return 'state-insecure-mode'
+  }
+  const sealingKey = inspection.sealingKey
+  if (sealingKey && sealingKey.kind !== 'missing') {
+    if (sealingKey.kind === 'symlink' || sealingKey.links !== 1) return 'state-linked'
+    if (sealingKey.kind !== 'regular') return 'state-not-regular'
+    if (sealingKey.owner !== 'current-user') return 'state-wrong-owner'
+    if (sealingKey.mode !== 0o600) return 'state-insecure-mode'
   }
   return null
 }
