@@ -276,6 +276,10 @@ export {
   type RunnerPolicyStore,
 } from './runnerHome.js'
 export {
+  createFileRunnerHomeStorage,
+  type FileRunnerHomeStorageOptions,
+} from './runnerHomeStorage.js'
+export {
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
   RunnerApplicationNotImplementedError,
