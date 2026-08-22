@@ -1,6 +1,7 @@
+import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { constants, type BigIntStats, type Stats } from 'node:fs'
-import { lstat, mkdir, open, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
@@ -16,6 +17,8 @@ import {
 
 const DIRECTORY_MODE = 0o700
 const RECORD_MODE = 0o600
+const LOCK_FILE = 'runner.lock'
+const LOCK_BYTES = 1_024
 const DEFAULT_RECORD_LIMIT = 2 * 1024 * 1024
 const MUTATION_LOCK_FILE = '.records.lock'
 const MUTATION_REAPER_FILE = '.records.reap'
@@ -61,6 +64,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   private root: string | null = null
   private rootHandle: FileHandle | null = null
   private rootIdentity: RootIdentity | null = null
+  private lockHandle: FileHandle | null = null
   private readonly uid: number | undefined
 
   constructor(private readonly options: FileRunnerHomeStorageOptions) {
@@ -70,6 +74,14 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   inspect(selection: RunnerHomeSelection): Promise<RunnerHomeInspection> {
     return this.serialize(async () => await this.inspectSelected(selection))
+  }
+
+  acquire(): Promise<'acquired' | 'busy' | 'storage-unavailable'> {
+    return this.serialize(async () => await this.acquireLock())
+  }
+
+  release(): Promise<void> {
+    return this.serialize(async () => await this.releaseLock())
   }
 
   read(record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
@@ -123,6 +135,63 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       rootMode: permissionsOf(info),
       entries,
     }
+  }
+
+  private async acquireLock(): Promise<'acquired' | 'busy' | 'storage-unavailable'> {
+    if (this.lockHandle) return (await this.lockStillBound()) ? 'busy' : 'storage-unavailable'
+    const root = await this.boundRoot()
+    if (!root) return 'storage-unavailable'
+    const target = path.join(this.root!, LOCK_FILE)
+    const identity = await processIdentity(process.pid)
+    if (identity.status !== 'identified') return 'storage-unavailable'
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const created = await createLock(target, this.uid)
+      if (created.status === 'created') {
+        try {
+          await writeAll(created.handle, Buffer.from(`${JSON.stringify({ pid: process.pid, identity: identity.value })}\n`))
+          await created.handle.sync()
+          await root.sync()
+          this.lockHandle = created.handle
+          return (await this.lockStillBound()) ? 'acquired' : 'storage-unavailable'
+        } catch {
+          const owned = await lockPathMatches(created.handle, target, this.uid)
+          // The failed acquisition is already unavailable; closing must not hide that result.
+          await created.handle.close().catch(() => undefined)
+          if (owned) {
+            // A private incomplete lock is safe to remove; cleanup failure leaves startup closed.
+            await unlink(target).catch(() => undefined)
+          }
+          return 'storage-unavailable'
+        }
+      }
+      if (created.status === 'storage-unavailable') return 'storage-unavailable'
+      const owner = await readLockOwner(target, this.uid)
+      if (owner === null) return 'storage-unavailable'
+      const current = await processIdentity(owner.pid)
+      if (current.status === 'indeterminate') return 'storage-unavailable'
+      if (current.status === 'identified' && current.value === owner.identity) return 'busy'
+      if (!(await retireStaleLock(target, root))) return 'storage-unavailable'
+    }
+    return 'storage-unavailable'
+  }
+
+  private async releaseLock(): Promise<void> {
+    const handle = this.lockHandle
+    if (!handle) return
+    if (!(await lockPathMatches(handle, path.join(this.root!, LOCK_FILE), this.uid))) {
+      await handle.close()
+      this.lockHandle = null
+      throw new Error('runner-home lock identity changed')
+    }
+    await unlink(path.join(this.root!, LOCK_FILE))
+    await this.rootHandle?.sync()
+    await handle.close()
+    this.lockHandle = null
+  }
+
+  private async lockStillBound(): Promise<boolean> {
+    return this.lockHandle !== null
+      && await lockPathMatches(this.lockHandle, path.join(this.root!, LOCK_FILE), this.uid)
   }
 
   private async readRecord(record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
@@ -193,9 +262,9 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     if (!this.rootHandle || !this.rootIdentity) return null
     try {
       const info = await this.rootHandle.stat({ bigint: true })
-      return secureDirectory(info, this.uid) && sameIdentity(info, this.rootIdentity) && await this.rootStillBound()
-        ? this.rootHandle
-        : null
+      const homeMatches = secureDirectory(info, this.uid) && sameIdentity(info, this.rootIdentity) && await this.rootStillBound()
+      if (!homeMatches || (this.lockHandle && !(await this.lockStillBound()))) return null
+      return this.rootHandle
     } catch {
       return null
     }
@@ -250,6 +319,118 @@ async function syncDirectory(directory: string): Promise<void> {
     await handle.sync()
   } finally {
     await handle.close()
+  }
+}
+
+type LockCreation =
+  | { status: 'created'; handle: FileHandle }
+  | { status: 'exists' }
+  | { status: 'storage-unavailable' }
+
+async function createLock(target: string, uid: number | undefined): Promise<LockCreation> {
+  try {
+    const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, RECORD_MODE)
+    if (secureRecord(await handle.stat(), uid)) return { status: 'created', handle }
+    await handle.close()
+    await unlink(target)
+    return { status: 'storage-unavailable' }
+  } catch (error) {
+    return isCode(error, 'EEXIST') ? { status: 'exists' } : { status: 'storage-unavailable' }
+  }
+}
+
+type LockOwner = { pid: number; identity: string }
+type ProcessIdentity =
+  | { status: 'identified'; value: string }
+  | { status: 'absent' }
+  | { status: 'indeterminate' }
+
+async function readLockOwner(target: string, uid: number | undefined): Promise<LockOwner | null> {
+  try {
+    const handle = await openRecord(target)
+    if (!handle) return null
+    const held = await readSecure(handle, uid, LOCK_BYTES)
+    if (held.status !== 'found') return null
+    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(held.bytes)) as { pid?: unknown; identity?: unknown }
+    if (typeof value.pid !== 'number' || !Number.isSafeInteger(value.pid) || value.pid <= 0) return null
+    if (typeof value.identity !== 'string' || value.identity.length === 0 || value.identity.length > 512 || /[\u0000-\u001f\u007f]/.test(value.identity)) return null
+    return { pid: value.pid, identity: value.identity }
+  } catch {
+    return null
+  }
+}
+
+async function processIdentity(pid: number): Promise<ProcessIdentity> {
+  if (process.platform === 'linux') return await linuxProcessIdentity(pid)
+  if (process.platform === 'darwin') return await darwinProcessIdentity(pid)
+  return processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' }
+}
+
+async function linuxProcessIdentity(pid: number): Promise<ProcessIdentity> {
+  try {
+    const [bootId, stat] = await Promise.all([
+      readFile('/proc/sys/kernel/random/boot_id', 'utf8'),
+      readFile(`/proc/${pid}/stat`, 'utf8'),
+    ])
+    const closingParenthesis = stat.lastIndexOf(')')
+    const fields = closingParenthesis < 0 ? [] : stat.slice(closingParenthesis + 1).trim().split(/\s+/)
+    const startTicks = fields[19]
+    const boot = bootId.trim()
+    if (!/^[0-9a-f-]{36}$/.test(boot) || !startTicks || !/^\d+$/.test(startTicks)) return { status: 'indeterminate' }
+    return { status: 'identified', value: `linux:${boot}:${startTicks}` }
+  } catch {
+    return processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' }
+  }
+}
+
+function darwinProcessIdentity(pid: number): Promise<ProcessIdentity> {
+  return new Promise(resolve => {
+    execFile(
+      '/bin/ps',
+      ['-p', String(pid), '-o', 'pid=', '-o', 'lstart='],
+      { encoding: 'utf8', timeout: 1_000, maxBuffer: 4_096, env: { LC_ALL: 'C', LANG: 'C', PATH: '/usr/bin:/bin' } },
+      (error, stdout) => {
+        if (error) {
+          resolve(processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' })
+          return
+        }
+        const matched = stdout.match(/^\s*(\d+)\s+(.+?)\s*$/)
+        resolve(matched?.[1] === String(pid) && matched[2]
+          ? { status: 'identified', value: `darwin:${matched[2]}` }
+          : { status: 'indeterminate' })
+      },
+    )
+  })
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return !isCode(error, 'ESRCH')
+  }
+}
+
+async function retireStaleLock(target: string, root: FileHandle): Promise<boolean> {
+  const retired = `${target}.stale-${randomBytes(16).toString('hex')}`
+  try {
+    await rename(target, retired)
+    await unlink(retired)
+    await root.sync()
+    return true
+  } catch (error) {
+    return isCode(error, 'ENOENT')
+  }
+}
+
+async function lockPathMatches(handle: FileHandle, target: string, uid: number | undefined): Promise<boolean> {
+  try {
+    const held = await handle.stat({ bigint: true })
+    const current = await lstat(target, { bigint: true })
+    return secureRecord(held, uid) && secureRecord(current, uid) && sameIdentity(current, identityOf(held))
+  } catch {
+    return false
   }
 }
 

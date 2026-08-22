@@ -1,6 +1,8 @@
 import {
+  createMemoryApiKeyStore,
   RunnerHomeNotImplementedError,
   createRunnerHome,
+  type PairingContractStore,
   type RunnerHomeInspection,
   type RunnerHomeStorage,
 } from '../../src/index.js'
@@ -20,6 +22,8 @@ export async function observeHomeScenario(scenario: RuntimeScenario): Promise<Ru
         recorder.record(`clock.sleep:${milliseconds}`)
       },
     },
+    pairing: pairingStore,
+    keys: createMemoryApiKeyStore(),
     storage,
   })
   try {
@@ -42,6 +46,13 @@ export function createHomeFixtureStorage(fixture: string, record: (event: string
       if (fixture === 'home-unsafe-metadata') record('storage.inspect:unsafe-metadata')
       else record('storage.inspect:0700-current-user')
       return homeInspection(fixture)
+    },
+    async acquire() {
+      record('storage.acquire')
+      return 'acquired'
+    },
+    async release() {
+      record('storage.release')
     },
     async read(name) {
       record(`storage.read:${name}`)
@@ -82,6 +93,16 @@ function homeInspection(fixture: string): RunnerHomeInspection {
     entries: [{ record: 'configuration', kind: 'regular', owner: 'current-user', mode: 0o600, links: 1 }],
   }
 }
+
+const pairingStore = {
+  reserve: async () => ({ status: 'reserved', reservationId: 'runtime-red' }),
+  release: async () => undefined,
+  commitPending: async () => 'updated',
+  snapshot: async () => ({ state: 'unpaired', record: null }),
+  markConfirmationUnknown: async () => 'updated',
+  settle: async () => 'updated',
+  revoke: async () => 'updated',
+} satisfies PairingContractStore
 
 function encodedConfiguration(fixture: string) {
   const profiles = fixture === 'duplicate-local-configuration'

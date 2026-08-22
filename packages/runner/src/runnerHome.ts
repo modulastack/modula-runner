@@ -5,6 +5,7 @@ import type { CommandPolicy, SignedAllowlist, TrustAnchor } from './allowlist.js
 import type { Grants } from './consent.js'
 import type { LocalEndpointConfig } from './localEndpoints.js'
 import type { PairingContractStore } from './pairingContract.js'
+import { openRunnerHomeRecords } from './runnerHomeRecords.js'
 import type { RunnerClock } from './runtimeClock.js'
 import type { LocalProjectRegistry, SessionReceiptLedger } from './sessionLaunch.js'
 
@@ -123,6 +124,8 @@ export interface RunnerHomeStorage {
   // selection is rejected; reinspection may refresh only that bound root's metadata. Read/replace
   // never consult ambient or later mutable selection state.
   inspect(selection: RunnerHomeSelection): Promise<RunnerHomeInspection>
+  acquire?(): Promise<'acquired' | 'busy' | 'storage-unavailable'>
+  release?(): Promise<void>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
   append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'>
@@ -131,6 +134,8 @@ export interface RunnerHomeStorage {
 export type RunnerHomeOptions = {
   storage: RunnerHomeStorage
   clock: RunnerClock
+  pairing?: PairingContractStore
+  keys?: ApiKeyStore
 }
 
 export class RunnerHomeNotImplementedError extends Error {
@@ -140,10 +145,64 @@ export class RunnerHomeNotImplementedError extends Error {
   }
 }
 
-export function createRunnerHome(_options: RunnerHomeOptions): RunnerHome {
+export function createRunnerHome(options: RunnerHomeOptions): RunnerHome {
   return {
-    async open(): Promise<never> {
-      throw new RunnerHomeNotImplementedError()
+    async open(selection): Promise<RunnerHomeOpen> {
+      const inspection = await inspectHome(options.storage, selection)
+      if ('failure' in inspection) return { status: 'failed', code: inspection.failure }
+      if (!options.storage.acquire || !options.storage.release) return { status: 'failed', code: 'state-io-failed' }
+      let acquired: 'acquired' | 'busy' | 'storage-unavailable'
+      try {
+        acquired = await options.storage.acquire()
+      } catch {
+        return { status: 'failed', code: 'state-io-failed' }
+      }
+      if (acquired !== 'acquired') return { status: 'failed', code: 'state-io-failed' }
+      if (!options.pairing || !options.keys) {
+        try {
+          await options.storage.release()
+        } catch {
+          return { status: 'failed', code: 'state-io-failed' }
+        }
+        return { status: 'failed', code: 'state-io-failed' }
+      }
+      const opened = await openRunnerHomeRecords({ ...options, pairing: options.pairing, keys: options.keys })
+      if (opened.status === 'ready') return opened
+      try {
+        await options.storage.release()
+      } catch {
+        return { status: 'failed', code: 'state-io-failed' }
+      }
+      return opened
     },
   }
+}
+
+async function inspectHome(
+  storage: RunnerHomeStorage,
+  selection: RunnerHomeSelection,
+): Promise<RunnerHomeInspection | { failure: RunnerHomeFailure }> {
+  let inspection: RunnerHomeInspection
+  try {
+    inspection = await storage.inspect(selection)
+  } catch {
+    return { failure: 'state-io-failed' }
+  }
+  const failure = inspectionFailure(inspection)
+  return failure ? { failure } : inspection
+}
+
+function inspectionFailure(inspection: RunnerHomeInspection): RunnerHomeFailure | null {
+  if (inspection.rootKind === 'symlink') return 'state-linked'
+  if (inspection.rootKind !== 'directory') return 'state-not-regular'
+  if (inspection.rootOwner !== 'current-user') return 'state-wrong-owner'
+  if (inspection.rootMode !== 0o700) return 'state-insecure-mode'
+  for (const entry of inspection.entries) {
+    if (entry.kind === 'missing') continue
+    if (entry.kind === 'symlink' || entry.links !== 1) return 'state-linked'
+    if (entry.kind !== 'regular') return 'state-not-regular'
+    if (entry.owner !== 'current-user') return 'state-wrong-owner'
+    if (entry.mode !== 0o600) return 'state-insecure-mode'
+  }
+  return null
 }

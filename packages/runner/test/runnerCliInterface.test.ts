@@ -6,7 +6,6 @@ import {
   RUNNER_TOP_LEVEL_COMMANDS,
   PairingContractNotImplementedError,
   RunnerApplicationNotImplementedError,
-  RunnerHomeNotImplementedError,
   SessionJobControlNotImplementedError,
   SessionLaunchNotImplementedError,
   SessionReceiptStorageUnavailableError,
@@ -148,7 +147,7 @@ describe('G2 runner CLI composition interface', () => {
     const receipts = createSessionReceiptLedger(receiptOptions)
     await expect(receipts.recover()).rejects.toBeInstanceOf(SessionReceiptStorageUnavailableError)
     const home = createRunnerHome(homeOptions)
-    await expect(home.open({})).rejects.toBeInstanceOf(RunnerHomeNotImplementedError)
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'state-not-regular' })
   })
 
   it('exposes one home-backed application root with stable startup failures', async () => {

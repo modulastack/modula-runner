@@ -171,4 +171,40 @@ describe('file runner-home storage', () => {
     await expect(storage.read('configuration')).resolves.toEqual({ status: 'storage-unavailable' })
     await expect(storage.replace('configuration', null, Buffer.from('unsafe'))).resolves.toEqual({ status: 'storage-unavailable' })
   })
+
+  it('holds one foreground lease per home and releases it for the next runner', async () => {
+    const { root } = await temporaryHome()
+    const first = createFileRunnerHomeStorage({ defaultRoot: root })
+    const second = createFileRunnerHomeStorage({ defaultRoot: root })
+    await first.inspect({})
+    await second.inspect({})
+    const outcomes = await Promise.all([first.acquire!(), second.acquire!()])
+    expect([...outcomes].sort()).toEqual(['acquired', 'busy'])
+    const winner = outcomes[0] === 'acquired' ? first : second
+    const contender = winner === first ? second : first
+    await expect(winner.acquire!()).resolves.toBe('busy')
+    await contender.release!()
+    await winner.release!()
+    await expect(contender.acquire!()).resolves.toBe('acquired')
+    await contender.release!()
+  })
+
+  it('reclaims a well-formed lock whose owning process no longer exists', async () => {
+    const { root } = await temporaryHome()
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    await storage.inspect({})
+    await writeFile(path.join(root, 'runner.lock'), '{"pid":2147483647,"identity":"linux:stale:1"}\n', { mode: 0o600 })
+    await expect(storage.acquire!()).resolves.toBe('acquired')
+    await storage.release!()
+    await expect(lstat(path.join(root, 'runner.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('reclaims a live reused PID when its process-start identity differs', async () => {
+    const { root } = await temporaryHome()
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    await storage.inspect({})
+    await writeFile(path.join(root, 'runner.lock'), `${JSON.stringify({ pid: process.pid, identity: 'stale-process-instance' })}\n`, { mode: 0o600 })
+    await expect(storage.acquire!()).resolves.toBe('acquired')
+    await storage.release!()
+  })
 })

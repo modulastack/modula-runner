@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { unemittableOracleFragments } from './driverEmittability.js'
 import { RUNTIME_RED_OBLIGATIONS } from './obligationMatrix.js'
 import { pairingFixtureBearer, runtimeRedFixtureForbiddenEnv } from './fixtureMaterial.js'
-import { createHomeFixtureStorage } from './homeSubject.js'
+import { createHomeFixtureStorage, observeHomeScenario } from './homeSubject.js'
 import { jobControlPayloadForScenario } from './jobControlSubject.js'
 import { pairingRequestContainsFixtureBearer, pairingResponsesForFixture } from './pairingSubject.js'
 import { scenarioFor } from './runtimeScenarios.js'
@@ -32,6 +32,20 @@ describe('PR43 round 4 origin adaptation', () => {
     const replaceFailure = createHomeFixtureStorage('home-replace-unavailable', event => replaceEvents.push(event))
     await expect(replaceFailure.replace('configuration', null, Buffer.from('{}'))).resolves.toEqual({ status: 'storage-unavailable' })
     expect(replaceEvents).toContain('storage.replace:configuration:storage-unavailable')
+
+    const duplicate = await observeHomeScenario(scenario('G1-L19'))
+    expect(observationMatches(duplicate, scenario('G1-L19').oracle)).toBe(true)
+
+    const unsafe = await observeHomeScenario({ ...scenario('G1-L19'), fixture: 'home-unsafe-metadata' })
+    expect(unsafe).toMatchObject({ status: 'observed', result: 'home:failed:state-linked' })
+    if (unsafe.status === 'observed') expect(unsafe.events.some(event => event.includes('storage.acquire'))).toBe(false)
+
+    const unreadable = await observeHomeScenario({ ...scenario('G1-L19'), fixture: 'home-read-unavailable' })
+    expect(unreadable).toMatchObject({ status: 'observed', result: 'home:failed:state-io-failed' })
+    if (unreadable.status === 'observed') expect(unreadable.events).toEqual(expect.arrayContaining([
+      expect.stringContaining('storage.acquire'),
+      expect.stringContaining('storage.release'),
+    ]))
   })
 
   it('uses only deterministic non-credential material in the forbidden environment fixture', () => {
