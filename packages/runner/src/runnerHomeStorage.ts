@@ -167,7 +167,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     const target = path.join(this.root!, LOCK_FILE)
     const identity = await processIdentity(process.pid)
     if (identity.status !== 'identified') return 'storage-unavailable'
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
       const created = await createLock(target, this.uid)
       if (created.status === 'created') {
         try {
@@ -189,7 +189,10 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       }
       if (created.status === 'storage-unavailable') return 'storage-unavailable'
       const owner = await readLockOwner(target, this.uid)
-      if (owner === null) return 'storage-unavailable'
+      if (owner === null) {
+        await delay(5)
+        continue
+      }
       const current = await processIdentity(owner.pid)
       if (current.status === 'indeterminate') return 'storage-unavailable'
       if (current.status === 'identified' && current.value === owner.identity) return 'busy'

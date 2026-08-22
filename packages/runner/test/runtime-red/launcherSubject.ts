@@ -136,12 +136,15 @@ export async function observeLauncherScenario(scenario: RuntimeScenario): Promis
       async replace(_expectedRevision, receipt) {
         recorder.record(`receipts.replace:${receipt.state}`)
         recorder.record(`receipt.${receipt.state}`)
+        if (receipt.state === 'failed' && receipt.result?.type === 'SESSION_FAILED') {
+          recorder.record(`receipt.failed:${receipt.result.reason}`)
+        }
         const updated = { ...receipt, revision: receipt.revision + 1 }
         const key = receiptKey(receipt.key.bindingId, receipt.key.requestId)
         stored.set(key, updated)
         const persisted = stored.get(key)
-        const serialized = JSON.stringify(persisted) ?? ''
         recordReceiptSensitivity(recorder.record, persisted)
+        const serialized = JSON.stringify(persisted) ?? ''
         if (/127\.0\.0\.1|ANTHROPIC_BASE_URL/.test(serialized)) recorder.record('receipt.endpoint-address')
         if (/ANTHROPIC_API_KEY|secret|attachToken/.test(serialized)) recorder.record('receipt.secret')
         rememberDurableStart(updated, durableStarts)
@@ -159,7 +162,10 @@ export async function observeLauncherScenario(scenario: RuntimeScenario): Promis
       async resolve(modelProfileId) {
         recorder.record(`access.resolve:${modelProfileId}`)
         recorder.record('access.resolve')
-        if (modelProfileId === primary.modelProfileId) recorder.record('access.resolve:exact-model-profile')
+        if (modelProfileId === primary.modelProfileId) {
+          recorder.record('access.resolve:exact-model-profile')
+          recorder.record('access.resolve:model-profile')
+        }
         const reason = accessReason(scenario.fixture)
         if (reason) return { status: 'refused', reason }
         return {

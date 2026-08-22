@@ -9,8 +9,11 @@ import {
   type Payload,
 } from '@modulastack/runner-protocol'
 import type { AuditLog } from './auditLog.js'
+import { AsyncReplayCache } from './asyncReplay.js'
 import type { RunnerClock } from './runtimeClock.js'
 import type { SessionLaunchAction, SessionLauncher } from './sessionLaunch.js'
+
+const MAX_REPLAYED_SESSION_ACTIONS = 8
 
 export const SESSION_JOB_CONTROL_ERRORS = [
   'unsupported-session-launch',
@@ -73,26 +76,16 @@ export class SessionJobControlNotImplementedError extends Error {
 }
 
 export function createSessionJobControl(options: SessionJobControlOptions): SessionJobControl {
-  const replays = new Map<string, ReplayEntry>()
+  const replays = new AsyncReplayCache<SessionLaunchAction>(4_096, MAX_REPLAYED_SESSION_ACTIONS)
   return {
     dispatch: input => dispatch(options, replays, input),
     recover: context => recover(options.launcher, context),
   }
 }
 
-type ReplayEntry = {
-  actions: SessionLaunchAction[]
-  done: boolean
-  failed: boolean
-  failure: unknown
-  waiters: Set<() => void>
-}
-
-const MAX_REPLAY_ENTRIES = 4_096
-
 async function* dispatch(
   options: SessionJobControlOptions,
-  replays: Map<string, ReplayEntry>,
+  replays: AsyncReplayCache<SessionLaunchAction>,
   input: SessionJobControlInput,
 ): AsyncGenerator<SessionJobControlEffect> {
   if (!sessionCandidate(input.payload)) {
@@ -138,58 +131,8 @@ async function* dispatch(
     return
   }
   const key = `${request.bindingId}\u0000${request.requestId}\u0000${sessionStartFingerprint(request)}`
-  let replay = replays.get(key)
-  if (!replay) {
-    replay = { actions: [], done: false, failed: false, failure: undefined, waiters: new Set() }
-    replays.set(key, replay)
-    evictCompletedReplays(replays)
-    void pumpReplay(replay, options.launcher.handle(request))
-  }
-  for await (const action of replayActions(replay)) yield effectFor(input.context, action)
-}
-
-async function pumpReplay(entry: ReplayEntry, actions: AsyncIterable<SessionLaunchAction>): Promise<void> {
-  try {
-    for await (const action of actions) {
-      entry.actions.push(structuredClone(action))
-      notifyReplay(entry)
-    }
-  } catch (error) {
-    entry.failed = true
-    entry.failure = error
-  } finally {
-    entry.done = true
-    notifyReplay(entry)
-  }
-}
-
-async function* replayActions(entry: ReplayEntry): AsyncGenerator<SessionLaunchAction> {
-  let index = 0
-  for (;;) {
-    while (index < entry.actions.length) {
-      yield entry.actions[index]!
-      index += 1
-    }
-    if (entry.done) {
-      if (entry.failed) throw entry.failure
-      return
-    }
-    await new Promise<void>(resolve => entry.waiters.add(resolve))
-  }
-}
-
-function notifyReplay(entry: ReplayEntry): void {
-  const waiters = [...entry.waiters]
-  entry.waiters.clear()
-  for (const resolve of waiters) resolve()
-}
-
-function evictCompletedReplays(replays: Map<string, ReplayEntry>): void {
-  if (replays.size <= MAX_REPLAY_ENTRIES) return
-  for (const [key, entry] of replays) {
-    if (!entry.done) continue
-    replays.delete(key)
-    if (replays.size <= MAX_REPLAY_ENTRIES) return
+  for await (const action of replays.stream(key, () => options.launcher.handle(request))) {
+    yield effectFor(input.context, action)
   }
 }
 

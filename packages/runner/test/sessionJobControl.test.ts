@@ -184,6 +184,33 @@ describe('session job-control dispatch', () => {
     expect(calls).toBe(1)
   })
 
+  it('bounds the detached replay pump and closes an overproducing launcher', async () => {
+    let calls = 0
+    let yielded = 0
+    let closed = false
+    const subject = createSessionJobControl({
+      launcher: {
+        async *handle(received) {
+          calls += 1
+          try {
+            while (true) {
+              yielded += 1
+              yield { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: received.requestId } }
+            }
+          } finally {
+            closed = true
+          }
+        },
+        async *recover() {},
+      },
+    })
+    const input = { context: context(), payload: { codec: 'json' as const, body: request } }
+    await expect(collect(subject.dispatch(input))).rejects.toThrow('maximum is 8')
+    expect({ calls, yielded, closed }).toEqual({ calls: 1, yielded: 9, closed: true })
+    await expect(collect(subject.dispatch(input))).rejects.toThrow('maximum is 8')
+    expect(calls).toBe(1)
+  })
+
   it('recovers only after active v2 negotiation and preserves launcher action order', async () => {
     const subject = createSessionJobControl({ launcher: launcher() })
     await expect(collect(subject.recover(context(1)))).resolves.toEqual([])

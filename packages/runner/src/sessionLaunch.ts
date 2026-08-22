@@ -224,18 +224,20 @@ export interface SessionWorktreePort {
   prepare(
     project: SessionProjectSnapshot,
     target: SessionLaunchTarget,
+    signal: AbortSignal,
   ): Promise<SessionWorktreeStep<SessionBranchCreatedSnapshot | SessionWorktreeRegisteredSnapshot>>
-  register(snapshot: SessionBranchCreatedSnapshot): Promise<SessionWorktreeStep<SessionWorktreeRegisteredSnapshot>>
+  register(snapshot: SessionBranchCreatedSnapshot, signal: AbortSignal): Promise<SessionWorktreeStep<SessionWorktreeRegisteredSnapshot>>
   verify(
     snapshot: SessionWorktreeRegisteredSnapshot,
     relativeCwd: string,
+    signal: AbortSignal,
   ): Promise<SessionWorktreeStep<SessionWorktreeVerifiedSnapshot>>
   inspect(snapshot: SessionWorktreeSnapshot): Promise<'exact' | 'missing' | 'mismatch'>
   rollback(snapshot: SessionWorktreeSnapshot): Promise<'rolled-back' | 'not-owned' | 'uncertain'>
 }
 
 export interface SessionAccessPort {
-  resolve(modelProfileId: string): Promise<AccessResolution>
+  resolve(modelProfileId: string, signal: AbortSignal): Promise<AccessResolution>
 }
 
 export type SessionTerminalRequest = {
@@ -251,7 +253,7 @@ export type SessionChannelOpen =
   | { status: 'failed'; reason: 'channel-unavailable' }
 
 export interface SessionChannelPort {
-  open(requestId: string, sessionId: string): Promise<SessionChannelOpen>
+  open(requestId: string, sessionId: string, signal: AbortSignal): Promise<SessionChannelOpen>
   close(channelId: string, reason: string): Promise<void>
 }
 
@@ -267,8 +269,8 @@ export type SessionProcessStart =
   | { status: 'failed'; reason: 'spawn-failed' }
 
 export interface SessionProcessPort {
-  start(request: SessionProcessRequest): Promise<SessionProcessStart>
-  adopt(request: SessionProcessRequest): Promise<SessionProcessStart>
+  start(request: SessionProcessRequest, signal: AbortSignal): Promise<SessionProcessStart>
+  adopt(request: SessionProcessRequest, signal: AbortSignal): Promise<SessionProcessStart>
   inspect(sessionId: string): Promise<'exact' | 'missing' | 'mismatch'>
   terminate(sessionId: string): Promise<'terminated' | 'missing' | 'uncertain'>
 }
@@ -308,10 +310,6 @@ export class SessionLaunchNotImplementedError extends Error {
     super('session launch is an interface-only checkpoint and is not active')
     this.name = 'SessionLaunchNotImplementedError'
   }
-}
-
-export function createSessionLauncher(_options: SessionLauncherOptions): SessionLauncher {
-  return createUnimplementedSessionLauncher()
 }
 
 export function createUnimplementedSessionLauncher(): SessionLauncher {

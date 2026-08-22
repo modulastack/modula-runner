@@ -202,7 +202,6 @@ export {
   SessionLaunchNotImplementedError,
   SessionReceiptLedgerNotImplementedError,
   SessionReceiptStorageUnavailableError,
-  createSessionLauncher,
   createUnimplementedSessionLauncher,
   type LocalFileIdentity,
   type LocalProjectRecord,
@@ -249,6 +248,7 @@ export {
   type SessionWorktreeVerifiedSnapshot,
   type WorktreeOwnershipPhase,
 } from './sessionLaunch.js'
+export { createSessionLauncher } from './sessionLauncher.js'
 export { MAX_PENDING_SESSION_LEDGER_OPERATIONS, createSessionReceiptLedger } from './sessionReceiptLedger.js'
 export {
   SESSION_JOB_CONTROL_ERRORS,
