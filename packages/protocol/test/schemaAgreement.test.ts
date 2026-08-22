@@ -7,8 +7,13 @@ import {
   CLI_AUTH_STATES,
   ENDPOINT_UNREACHABLE_REASONS,
   LOCAL_ENDPOINT_KINDS,
+  PAIRING_CONFIRM_PATH,
+  PAIRING_REDEEM_PATH,
   PROTOCOL_VERSION,
   REFUSAL_REASONS,
+  SESSION_FAILURE_REASONS,
+  SESSION_LAUNCH_PROTOCOL_VERSION,
+  SESSION_REFUSAL_REASONS,
 } from '../src/index.js'
 
 // The schema document is the contract; the validators are its executable form. Three
@@ -46,8 +51,14 @@ describe('schema and validators agree', () => {
     for (const kind of CHANNEL_KINDS) expect(mentioned.has(kind)).toBe(true)
   })
 
-  it('states the protocol version the package implements', () => {
+  it('states the active version and the inactive session-launch version separately', () => {
     expect(schema).toContain(`*Protocol version **${PROTOCOL_VERSION}**`)
+    expect(schema).toContain(`SESSION_LAUNCH_PROTOCOL_VERSION = ${SESSION_LAUNCH_PROTOCOL_VERSION}`)
+  })
+
+  it('documents the adopted pairing routes', () => {
+    expect(schema).toContain(PAIRING_REDEEM_PATH)
+    expect(schema).toContain(PAIRING_CONFIRM_PATH)
   })
 
   // Every enum that crosses the wire, not only the two that existed when this file was
@@ -58,13 +69,15 @@ describe('schema and validators agree', () => {
     'Per-CLI auth states are': CLI_AUTH_STATES,
     'Endpoint kinds are': LOCAL_ENDPOINT_KINDS,
     'An unreachable endpoint names one of': ENDPOINT_UNREACHABLE_REASONS,
+    'Session refusal reasons are': SESSION_REFUSAL_REASONS,
+    'Session failure reasons are': SESSION_FAILURE_REASONS,
   }
 
   for (const [marker, members] of Object.entries(wireEnums)) {
     it(`documents every member the decoder accepts after "${marker}"`, () => {
       const start = schema.indexOf(marker)
       expect(start).toBeGreaterThan(-1)
-      const documented = backtickedIn(schema.slice(start, schema.indexOf('\n', start)))
+      const documented = backtickedIn(schema.slice(start, schema.indexOf('\n\n', start)))
 
       const missing = members.filter(member => !documented.has(member))
 
