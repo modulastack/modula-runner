@@ -3,6 +3,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  createGrants,
+  createMemoryApiKeyStore,
+  createMemoryGrantStore,
   createRunnerApplication,
   type ContractPairingRecord,
   type LocalProjectRecord,
@@ -61,8 +64,12 @@ function projectRegistry() {
   }
 }
 
-function application(pairingService = pairing(), projects = projectRegistry()) {
-  const state = { projects } as unknown as RunnerHomeState
+function application(
+  pairingService = pairing(),
+  projects = projectRegistry(),
+  stateOverrides: Partial<RunnerHomeState> = {},
+) {
+  const state = { projects, ...stateOverrides } as unknown as RunnerHomeState
   const open = vi.fn<RunnerHome['open']>(async () => ({ status: 'ready', home: state }))
   const close = vi.fn<NonNullable<RunnerHome['close']>>(async () => undefined)
   const home: RunnerHome = { open, close }
@@ -184,6 +191,53 @@ describe('core runner application commands', () => {
     const call = invocation(['project', 'create', 'modulastack', '--repo', alias, '--worktrees-root', worktrees], { cwd: root })
     await expect(app.value.execute(call.value)).resolves.toBe(1)
     expect(create).not.toHaveBeenCalled()
+  })
+
+  it('adds, lists, and removes keys without accepting or printing the secret', async () => {
+    const keys = createMemoryApiKeyStore()
+    const app = application(pairing(), projectRegistry(), { keys })
+    const add = invocation(['key', 'add', 'daily', '--provider', 'anthropic'], { tty: true, hidden: 'sk-ant-example-secret' })
+    await expect(app.value.execute(add.value)).resolves.toBe(0)
+    expect(add.stdout.join('')).toContain('****cret')
+    expect(`${add.stdout.join('')} ${add.stderr.join('')}`).not.toContain('sk-ant-example-secret')
+
+    const positional = invocation(['key', 'add', 'daily', '--provider', 'anthropic', 'sk-ant-example-secret'], { tty: true })
+    await expect(app.value.execute(positional.value)).resolves.toBe(2)
+    expect(positional.readHidden).not.toHaveBeenCalled()
+
+    const list = invocation(['key', 'list'])
+    await expect(app.value.execute(list.value)).resolves.toBe(0)
+    expect(list.stdout.join('')).toContain('daily  anthropic  ****cret')
+    expect(list.stdout.join('')).not.toContain('sk-ant-example-secret')
+
+    const remove = invocation(['key', 'remove', 'daily'])
+    await expect(app.value.execute(remove.value)).resolves.toBe(0)
+  })
+
+  it('adds, lists, and revokes grants relative to the invocation cwd', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'runner-application-grant-'))
+    roots.push(root)
+    const project = path.join(root, 'project')
+    await mkdir(project)
+    const grants = createGrants({ store: createMemoryGrantStore() })
+    const app = application(pairing(), projectRegistry(), { grants })
+
+    const add = invocation(['grant', 'project'], { cwd: root })
+    await expect(app.value.execute(add.value)).resolves.toBe(0)
+    expect(add.stdout.join('')).toContain(project)
+    const list = invocation(['grant', 'list'], { cwd: root })
+    await expect(app.value.execute(list.value)).resolves.toBe(0)
+    expect(list.stdout.join('')).toContain(project)
+    const revoke = invocation(['grant', 'revoke', 'project'], { cwd: root })
+    await expect(app.value.execute(revoke.value)).resolves.toBe(0)
+    await expect(grants.list()).resolves.toEqual([])
+
+    const unsafeCwd = await mkdtemp(path.join(tmpdir(), 'runner-grant-\n-control-'))
+    roots.push(unsafeCwd)
+    const unsafe = invocation(['grant', 'revoke', '.'], { cwd: unsafeCwd })
+    await expect(app.value.execute(unsafe.value)).resolves.toBe(1)
+    expect(unsafe.stdout).toEqual([])
+    expect(unsafe.stderr.join('')).not.toContain(unsafeCwd)
   })
 
   it('uses stable home failure codes and closes state before emitting success', async () => {

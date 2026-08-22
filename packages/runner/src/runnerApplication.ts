@@ -1,8 +1,18 @@
-import { hasControlCharacter } from '@modulastack/runner-protocol'
+import { hasControlCharacter, isSafeIdentifier } from '@modulastack/runner-protocol'
 import { lstat, realpath, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import path from 'node:path'
+import {
+  runGrantAddCommand,
+  runGrantListCommand,
+  runGrantRevokeCommand,
+  runKeyAddCommand,
+  runKeyListCommand,
+  runKeyRemoveCommand,
+  type CommandResult,
+} from './cli.js'
 import { PairingContractError, type PairingContractService } from './pairingContract.js'
+import { assertProviderName } from './apiKeys.js'
 import type { RunnerClock } from './runtimeClock.js'
 import type { RunnerHome, RunnerHomeFailure, RunnerHomeState } from './runnerHome.js'
 import type { SessionJobControl } from './sessionJobControl.js'
@@ -124,7 +134,7 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
   if (command === '--help' || command === 'help') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: helpText() })
   if (command === '--version' || command === 'version') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: options.version })
   if (!command) return emit(invocation.io, usage())
-  if (!['pair', 'status', 'project'].includes(command)) {
+  if (!['pair', 'status', 'project', 'key', 'grant'].includes(command)) {
     if ((RUNNER_TOP_LEVEL_COMMANDS as readonly string[]).includes(command)) throw new RunnerApplicationNotImplementedError()
     return emit(invocation.io, usage())
   }
@@ -169,7 +179,9 @@ async function runOpened(
 ): Promise<CommandOutcome> {
   if (command === 'pair') return await pairCommand(options, home, invocation, args[1]!)
   if (command === 'status') return await statusCommand(options.composition.pairing(home), args[0] === '--json')
-  return await projectCommand(home, invocation.cwd, args)
+  if (command === 'project') return await projectCommand(home, invocation.cwd, args)
+  if (command === 'key') return await keyCommand(home, invocation, args)
+  return await grantCommand(home, invocation.cwd, args)
 }
 
 function commandSyntax(command: string, args: readonly string[], invocation: RunnerCliInvocation): CommandOutcome | null {
@@ -183,6 +195,8 @@ function commandSyntax(command: string, args: readonly string[], invocation: Run
   if (command === 'project' && !RUNNER_PROJECT_COMMANDS.includes(args[0] as RunnerProjectCommand)) {
     return usage('usage: modula-runner project <create|list|remove> ...')
   }
+  if (command === 'key') return keySyntax(args, invocation)
+  if (command === 'grant') return grantSyntax(args)
   return null
 }
 
@@ -242,6 +256,59 @@ function statusText(value: ReturnType<typeof statusValue>): string {
   if (value.state === 'revoked') return 'revoked — pair again to reconnect'
   if (value.state === 'pending') return `pending as runner ${value.runnerId}${value.error ? ` — ${value.error.code}` : ''}`
   return `paired as runner ${value.runnerId} to ${value.controlPlaneOrigin}`
+}
+
+function keySyntax(args: readonly string[], invocation: RunnerCliInvocation): CommandOutcome | null {
+  const [action, label, flag, provider] = args
+  if (action === 'list' && args.length === 1) return null
+  if (action === 'remove' && args.length === 2 && isSafeIdentifier(label)) return null
+  if (action === 'add' && args.length === 4 && isSafeIdentifier(label) && flag === '--provider' && validProvider(provider)) {
+    return invocation.io.inputIsTTY ? null : usage('key entry requires an interactive TTY')
+  }
+  return usage('usage: modula-runner key <add|list|remove> ...')
+}
+
+function validProvider(value: string | undefined): value is string {
+  if (!value) return false
+  try {
+    assertProviderName(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function grantSyntax(args: readonly string[]): CommandOutcome | null {
+  if (args[0] === 'list' && args.length === 1) return null
+  if (args[0] === 'revoke' && args.length === 2 && !hasControlCharacter(args[1]!)) return null
+  if (args.length === 1 && args[0] && !hasControlCharacter(args[0])) return null
+  return usage('usage: modula-runner grant <directory>|list|revoke <directory>')
+}
+
+async function keyCommand(
+  home: RunnerHomeState,
+  invocation: RunnerCliInvocation,
+  args: readonly string[],
+): Promise<CommandOutcome> {
+  const context = { keys: home.keys, readSecret: (prompt: string) => invocation.io.readHidden(prompt) }
+  if (args[0] === 'add') return commandOutcome(await runKeyAddCommand(args.slice(1), context))
+  if (args[0] === 'list') return commandOutcome(await runKeyListCommand([], context))
+  return commandOutcome(await runKeyRemoveCommand(args.slice(1), context))
+}
+
+async function grantCommand(home: RunnerHomeState, cwd: string, args: readonly string[]): Promise<CommandOutcome> {
+  const context = { grants: home.grants }
+  if (args[0] === 'list') return commandOutcome(await runGrantListCommand([], context))
+  const candidate = path.resolve(cwd, args[0] === 'revoke' ? args[1]! : args[0]!)
+  if (hasControlCharacter(candidate)) return { exitCode: 1, stderr: 'grant path must not contain control characters' }
+  return args[0] === 'revoke'
+    ? commandOutcome(await runGrantRevokeCommand([candidate], context))
+    : commandOutcome(await runGrantAddCommand([candidate], context))
+}
+
+function commandOutcome(result: CommandResult): CommandOutcome {
+  const exitCode = result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 2 ? result.exitCode : 1
+  return exitCode === 0 ? { exitCode, stdout: result.output } : { exitCode, stderr: result.output }
 }
 
 async function projectCommand(home: RunnerHomeState, cwd: string, args: readonly string[]): Promise<CommandOutcome> {
