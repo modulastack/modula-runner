@@ -66,8 +66,12 @@ npm run release:reproducible  # performs two isolated npm ci/build/pack passes
 
 `release:build` compiles both workspaces and creates
 `dist/release/modula-runner-<version>.tgz`. The package contains compiled runner and protocol
-workspaces, the lockfile as `npm-shrinkwrap.json`, license, README, and deterministic build metadata.
-It contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
+workspaces, a production-only `npm-shrinkwrap.json`, license, README, and deterministic build
+metadata. Staging internalizes runner imports of the bundled protocol workspace and promotes the
+runner's external runtime dependencies to the installable root manifest; otherwise an installed
+archive would contain the protocol bytes but still ask Node to resolve an unpublished sibling
+package. Build metadata binds both the staged shrinkwrap and the original source lockfile. The
+package contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
 source before either comparison begins, performs exactly two independently isolated
 install/build/staging/packing passes, fails unless their package bytes match, and preserves the first
 compared package plus its checksum as the canonical release output. Untracked files, an existing
