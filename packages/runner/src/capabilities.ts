@@ -12,6 +12,7 @@ import {
   type RunnerCapabilities,
   type RuntimeCapability,
 } from '@modulastack/runner-protocol'
+import type { CapabilityProbeBatchSeam } from './capabilityProbeBatch.js'
 import type { LocalEndpointRegistry } from './localEndpoints.js'
 import type { SpawnOutcome } from './auditLog.js'
 import type { SpawnSeam } from './spawnSeam.js'
@@ -118,6 +119,9 @@ export type CapabilityMonitorOptions = {
   // Probing spawns third-party CLIs, so it passes the same allowlist gate every runner-owned
   // spawn does: a runtime whose command is not allowlisted is not probed and not advertised.
   seam: SpawnSeam
+  // Present only for the interface-first checkpoint. The implementation checkpoint makes this
+  // seam authoritative; omission preserves current behavior until verifier-owned specs exist.
+  batchSeam?: CapabilityProbeBatchSeam
   runtimes?: readonly RuntimeSpec[]
   endpoints?: LocalEndpointRegistry
   probeTimeoutMs?: number

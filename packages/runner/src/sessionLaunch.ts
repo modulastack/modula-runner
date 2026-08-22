@@ -110,6 +110,13 @@ export type SessionWorktreeSnapshot =
 
 export type SessionTerminalResult = SessionRefusedMessage | SessionFailedMessage | SessionFinishedMessage
 
+export const SESSION_CHANNEL_LIFECYCLES = ['live', 'closed', 'lost', 'replacement-intent'] as const
+export type SessionChannelLifecycle = (typeof SESSION_CHANNEL_LIFECYCLES)[number]
+
+export type SessionChannelSnapshot =
+  | { generation: number; lifecycle: 'live' | 'closed' | 'lost'; channelId: string }
+  | { generation: number; lifecycle: 'replacement-intent'; channelId: null }
+
 export type SessionReceipt = {
   schemaVersion: typeof SESSION_RECEIPT_SCHEMA_VERSION
   revision: number
@@ -121,6 +128,9 @@ export type SessionReceipt = {
   project?: SessionProjectSnapshot
   worktree: SessionWorktreeSnapshot
   sessionId?: string
+  // Optional for additive schema-v1 reads; new recovery writes this before replacing the legacy
+  // channelId field so an older receipt never becomes an empty recovery guess.
+  channel?: SessionChannelSnapshot
   channelId?: string
   result?: SessionTerminalResult
 }
@@ -262,11 +272,62 @@ export interface SessionChannelPort {
   close(channelId: string, reason: string): Promise<void>
 }
 
-export type SessionProcessRequest = SessionTerminalRequest & { channelId: string }
+export type SessionChannelStatus = 'live' | 'closed' | 'lost' | 'unknown'
+export type SessionChannelCloseResult = 'closed' | 'lost' | 'unknown'
+
+export interface SessionRecoveryChannelPort extends SessionChannelPort {
+  status(channelId: string, generation: number): Promise<SessionChannelStatus>
+  closeExact(channelId: string, generation: number, reason: string): Promise<SessionChannelCloseResult>
+}
+
+export type SessionChannelEvent = {
+  key: SessionReceiptKey
+  sessionId: string
+  channelId: string
+  generation: number
+} & (
+  | { kind: 'closed' | 'lost' }
+  | { kind: 'terminal'; exitCode: number | null; signal: number | null }
+)
+
+export type SessionChannelEventResult =
+  | { status: 'applied'; receipt: SessionReceipt; action: SessionLaunchAction | null }
+  | { status: 'retired' | 'unknown' | 'storage-unavailable' }
+
+export interface SessionChannelEventCoordinator {
+  handle(event: SessionChannelEvent): Promise<SessionChannelEventResult>
+}
+
+export type SessionChannelEventCoordinatorOptions = {
+  receipts: SessionReceiptLedger
+  audit: Pick<AuditLog, 'append'>
+  clock: RunnerClock
+}
+
+export class SessionChannelEventNotImplementedError extends Error {
+  constructor() {
+    super('generation-scoped channel events are interface-only and are not active')
+    this.name = 'SessionChannelEventNotImplementedError'
+  }
+}
+
+export function createSessionChannelEventCoordinator(
+  _options: SessionChannelEventCoordinatorOptions,
+): SessionChannelEventCoordinator {
+  return {
+    async handle(): Promise<never> {
+      throw new SessionChannelEventNotImplementedError()
+    },
+  }
+}
+
+export type SessionProcessRequest = SessionTerminalRequest & { channelId: string; channelGeneration?: number }
 export type SessionProcessIdentity = Pick<SessionProcessRequest, 'sessionId' | 'cwd'>
 
 export type SessionProcessHandle = {
   sessionId: string
+  channelId?: string
+  channelGeneration?: number
   finished: Promise<Pick<SessionFinishedMessage, 'exitCode' | 'signal'>>
 }
 
@@ -292,6 +353,10 @@ export type SessionLauncherOptions = {
   access: SessionAccessPort
   worktrees: SessionWorktreePort
   channels: SessionChannelPort
+  // Additive until the replacement-channel implementation lands. Recovery treats omission as
+  // uncertainty rather than inferring closure from reconnect or elapsed time.
+  recoveryChannels?: SessionRecoveryChannelPort
+  channelEvents?: SessionChannelEventCoordinator
   processes: SessionProcessPort
   identifiers: SessionIdentifierPort
   audit: Pick<AuditLog, 'append'>
