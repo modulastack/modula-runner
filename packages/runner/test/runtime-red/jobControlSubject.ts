@@ -34,7 +34,18 @@ export async function observeJobControlScenario(scenario: RuntimeScenario): Prom
       recorder.record('launcher.recover')
     },
   }
-  const subject = createSessionJobControl({ launcher })
+  const subject = createSessionJobControl({
+    launcher,
+    audit: {
+      async append(record) {
+        recorder.record(`audit.append:${record.kind}`)
+      },
+    },
+    clock: {
+      now: () => Date.parse('2026-08-22T00:00:00Z'),
+      sleep: async () => undefined,
+    },
+  })
   const input = jobControlInput(scenario)
   try {
     const first = await collectJobControlEffects(subject.dispatch(input))
@@ -72,6 +83,7 @@ export async function observeJobControlOverflowProbe(
     channelId: 'job-control-overflow',
     phase: 'active',
     selectedProtocolVersion: 2,
+    authenticatedBindingId: runtimeRedBindingId,
   }
   const subject = createSessionJobControl({ launcher })
   const effects = stream === 'dispatch'

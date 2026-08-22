@@ -241,6 +241,8 @@ export {
   SESSION_JOB_CONTROL_ERRORS,
   SessionJobControlNotImplementedError,
   createSessionJobControl,
+  type SessionConnectionAuditReason,
+  type SessionConnectionAuditRecord,
   type SessionJobControl,
   type SessionJobControlContext,
   type SessionJobControlEffect,

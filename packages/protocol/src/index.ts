@@ -46,6 +46,7 @@ export {
   type WelcomeFrame,
 } from './frames.js'
 export { MAX_FRAME_BYTES, decodeFrame, encodeFrame } from './codec.js'
+export { isLowercaseUuidV4 } from './validation.js'
 export {
   MAX_PAIRING_CODE_LENGTH,
   MAX_PAIRING_RESPONSE_BYTES,

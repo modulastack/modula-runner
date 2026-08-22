@@ -2,6 +2,7 @@ import { open, type FileHandle } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RefusalReason } from '@modulastack/runner-protocol'
+import type { SessionConnectionAuditRecord } from './sessionJobControl.js'
 import type { SessionLaunchAuditRecord } from './sessionLaunch.js'
 
 // The local audit log: every command the runner spawns, and every request it refuses, lands
@@ -54,6 +55,7 @@ export type AuditRecord =
       at: string
     }
   | { kind: 'kill'; confirmed: boolean; details: string; at: string }
+  | SessionConnectionAuditRecord
   | SessionLaunchAuditRecord
 
 // The writer. Deliberately narrow: `append` is the only mutation, so there is no rewrite or

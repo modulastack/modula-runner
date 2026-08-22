@@ -6,7 +6,6 @@ import {
   RUNNER_TOP_LEVEL_COMMANDS,
   PairingContractNotImplementedError,
   RunnerApplicationNotImplementedError,
-  SessionJobControlNotImplementedError,
   SessionLaunchNotImplementedError,
   SessionReceiptStorageUnavailableError,
   createPairingContractService,
@@ -131,16 +130,17 @@ describe('G2 runner CLI composition interface', () => {
   it('exposes launch and negotiated job-control ports without activating protocol v2', async () => {
     const launcher = createSessionLauncher(sessionOptions)
     await expect(next(launcher.recover())).rejects.toBeInstanceOf(SessionLaunchNotImplementedError)
-    const jobControl = createSessionJobControl({ launcher })
+    const jobControl = createSessionJobControl({ launcher, audit: { append: async () => undefined }, clock })
     await expect(next(jobControl.dispatch({
       context: {
         connectionId: 'connection-1',
         channelId: 'job-control-1',
         phase: 'active',
         selectedProtocolVersion: 1,
+        authenticatedBindingId: null,
       },
       payload: { codec: 'json', body: { type: 'SESSION_START' } },
-    }))).rejects.toBeInstanceOf(SessionJobControlNotImplementedError)
+    }))).resolves.toMatchObject({ value: { kind: 'close-job-control', error: 'unsupported-session-launch' } })
   })
 
   it('runs the production receipt subject behind deterministic storage boundaries', async () => {
