@@ -4,7 +4,6 @@ import {
   RUNNER_HOME_FAILURES,
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
-  RunnerApplicationNotImplementedError,
   SessionLaunchNotImplementedError,
   SessionReceiptStorageUnavailableError,
   createPairingContractService,
@@ -177,6 +176,6 @@ describe('G2 runner CLI composition interface', () => {
         writeStdout: () => undefined,
         writeStderr: () => undefined,
       },
-    })).rejects.toBeInstanceOf(RunnerApplicationNotImplementedError)
+    })).resolves.toBe(1)
   })
 })
