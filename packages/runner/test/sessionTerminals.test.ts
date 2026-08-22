@@ -74,6 +74,7 @@ function request(cwd: string, channelId: string, sessionId = '123e4567-e89b-42d3
     requestId: '223e4567-e89b-42d3-a456-426614174001',
     sessionId,
     channelId,
+    channelGeneration: 1,
     terminalProfile: 'coder',
     cwd,
     plan: {
@@ -89,6 +90,18 @@ function request(cwd: string, channelId: string, sessionId = '123e4567-e89b-42d3
 }
 
 describe('production session terminal ports', () => {
+  it('reports authoritative state and confirmed close for a pending exact channel', async () => {
+    const item = await rig()
+    const opened = await item.ports.recoveryChannels.open('request-1', 'session-1', liveSignal())
+    if (opened.status !== 'opened') throw new Error('channel did not open')
+    expect(opened.connectionEpoch).toBeDefined()
+    await expect(item.ports.recoveryChannels.status(opened.channelId, 1, opened.connectionEpoch)).resolves.toBe('live')
+    await expect(item.ports.recoveryChannels.closeExact(opened.channelId, 1, 'recovery-uncertain', opened.connectionEpoch)).resolves.toBe('closed')
+    await expect(item.ports.recoveryChannels.status(opened.channelId, 1, opened.connectionEpoch)).resolves.toBe('closed')
+    await expect(item.ports.recoveryChannels.status('unobserved-channel', 1, opened.connectionEpoch)).resolves.toBe('unknown')
+    await expect(item.ports.recoveryChannels.status('prior-process-channel', 1, 'prior-connection-epoch')).resolves.toBe('lost')
+  })
+
   it('binds the reserved channel to the stable session and reports its durable exit', async () => {
     const item = await rig()
     const opened = await item.ports.channels.open('request-1', 'session-1', liveSignal())
@@ -98,7 +111,11 @@ describe('production session terminal ports', () => {
     const started = await item.ports.processes.start(processRequest, liveSignal())
     expect(started.status).toBe('started')
     if (started.status !== 'started') throw new Error('process did not start')
-    expect(started.handle.sessionId).toBe(processRequest.sessionId)
+    expect(started.handle).toMatchObject({
+      sessionId: processRequest.sessionId,
+      channelId: processRequest.channelId,
+      channelGeneration: 1,
+    })
     await waitUntil(() => item.stub.channels.has(opened.channelId))
     item.stub.sendTerminal(opened.channelId, { type: 'INIT', cols: 80, rows: 24, profile: 'coder' })
     await expect(started.handle.finished).resolves.toEqual({ exitCode: 7, signal: null })
@@ -120,11 +137,11 @@ describe('production session terminal ports', () => {
 
     const second = await item.ports.channels.open('request-1', original.sessionId, liveSignal())
     if (second.status !== 'opened') throw new Error('replacement channel did not open')
-    const recovery = { ...original, channelId: second.channelId }
+    const recovery = { ...original, channelId: second.channelId, channelGeneration: 2 }
     const adopted = await item.ports.processes.adopt(recovery, liveSignal())
     expect(adopted.status).toBe('started')
     if (adopted.status !== 'started') throw new Error('process did not adopt')
-    expect(adopted.handle.sessionId).toBe(original.sessionId)
+    expect(adopted.handle).toMatchObject({ sessionId: original.sessionId, channelId: second.channelId, channelGeneration: 2 })
     expect(await item.ports.processes.terminate(recovery)).toBe('terminated')
     await expect(settlement(started.handle.finished)).resolves.toBe('settled')
     await expect(settlement(adopted.handle.finished)).resolves.toBe('settled')

@@ -250,11 +250,9 @@ export {
   SESSION_RECEIPT_STATES,
   SESSION_TOMBSTONE_RETENTION_MS,
   WORKTREE_OWNERSHIP_PHASES,
-  SessionChannelEventNotImplementedError,
   SessionLaunchNotImplementedError,
   SessionReceiptLedgerNotImplementedError,
   SessionReceiptStorageUnavailableError,
-  createSessionChannelEventCoordinator,
   createUnimplementedSessionLauncher,
   type LocalFileIdentity,
   type LocalProjectRecord,
@@ -311,6 +309,7 @@ export {
   type SessionWorktreeVerifiedSnapshot,
   type WorktreeOwnershipPhase,
 } from './sessionLaunch.js'
+export { createSessionChannelEventCoordinator } from './sessionChannelEvents.js'
 export { createSessionLauncher } from './sessionLauncher.js'
 export { MAX_PENDING_SESSION_LEDGER_OPERATIONS, createSessionReceiptLedger } from './sessionReceiptLedger.js'
 export {

@@ -43,6 +43,10 @@ function options(overrides: Partial<SessionLauncherOptions> = {}) {
   const clock = { now: () => now, sleep: async () => undefined }
   const audit: AuditRecord[] = []
   let processStarts = 0
+  const channels: SessionLauncherOptions['channels'] = {
+    open: async () => ({ status: 'opened', channelId: 'channel-1' }),
+    close: async () => undefined,
+  }
   const base: SessionLauncherOptions = {
     bindingId: () => request.bindingId,
     projects: {
@@ -92,13 +96,30 @@ function options(overrides: Partial<SessionLauncherOptions> = {}) {
       inspect: async () => 'exact',
       rollback: async () => 'rolled-back',
     },
-    channels: { open: async () => ({ status: 'opened', channelId: 'channel-1' }), close: async () => undefined },
+    channels,
+    recoveryChannels: recoveryChannelPorts(channels),
     processes: {
       start: async value => {
         processStarts += 1
-        return { status: 'started', handle: { sessionId: value.sessionId, finished: Promise.resolve({ exitCode: 0, signal: null }) } }
+        return {
+          status: 'started',
+          handle: {
+            sessionId: value.sessionId,
+            channelId: value.channelId,
+            ...(value.channelGeneration === undefined ? {} : { channelGeneration: value.channelGeneration }),
+            finished: Promise.resolve({ exitCode: 0, signal: null }),
+          },
+        }
       },
-      adopt: async value => ({ status: 'started', handle: { sessionId: value.sessionId, finished: Promise.resolve({ exitCode: 0, signal: null }) } }),
+      adopt: async value => ({
+        status: 'started',
+        handle: {
+          sessionId: value.sessionId,
+          channelId: value.channelId,
+          ...(value.channelGeneration === undefined ? {} : { channelGeneration: value.channelGeneration }),
+          finished: Promise.resolve({ exitCode: 0, signal: null }),
+        },
+      }),
       inspect: async () => 'exact',
       terminate: async () => 'terminated',
     },
@@ -152,7 +173,21 @@ function recoveryReceipt(): SessionReceipt {
       relativeCwd: '.', resolvedCwdPath: '/worktrees/lane-01', resolvedCwdIdentity: { device: '8', inode: '101' }, clean: true,
     },
     sessionId: 'session-stable',
+    channel: { generation: 1, lifecycle: 'lost', channelId: 'channel-old' },
     channelId: 'channel-old',
+  }
+}
+
+function recoveryChannelPorts(
+  channels: SessionLauncherOptions['channels'],
+): NonNullable<SessionLauncherOptions['recoveryChannels']> {
+  return {
+    ...channels,
+    status: async () => 'lost',
+    closeExact: async (channelId, _generation, reason) => {
+      await channels.close(channelId, reason)
+      return 'closed'
+    },
   }
 }
 
@@ -314,6 +349,26 @@ describe('production session launcher', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
+  it('uses connection-level uncertainty when an exact pre-start close is unknown', async () => {
+    const base = options()
+    const closeExact = vi.fn(async () => 'unknown' as const)
+    const subject = options({
+      recoveryChannels: { ...base.value.recoveryChannels!, closeExact },
+      processes: {
+        ...base.value.processes,
+        start: async () => ({ status: 'failed', reason: 'spawn-failed' }),
+      },
+    })
+
+    await expect(collect(createSessionLauncher(subject.value).handle(request))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } },
+      { kind: 'close-job-control', error: 'storage-unavailable' },
+    ])
+    expect(closeExact).toHaveBeenCalledOnce()
+    expect(subject.held.image().receipts[0]?.state).toBe('spawn-intent')
+    expect(subject.held.image().receipts[0]?.result).toBeUndefined()
+  })
+
   it('turns unprovable timeout compensation into recovery uncertainty', async () => {
     let sleeps = 0
     let lateSpawned = false
@@ -358,7 +413,12 @@ describe('production session launcher', () => {
     const held = recoveryReceipts(recoveryReceipt())
     const adopt = vi.fn(async value => ({
       status: 'started' as const,
-      handle: { sessionId: value.sessionId, finished: Promise.resolve({ exitCode: 0, signal: null }) },
+      handle: {
+        sessionId: value.sessionId,
+        channelId: value.channelId,
+        channelGeneration: value.channelGeneration,
+        finished: Promise.resolve({ exitCode: 0, signal: null }),
+      },
     }))
     const base = options()
     const subject = options({
@@ -377,7 +437,7 @@ describe('production session launcher', () => {
 
   it('closes a pre-start recovery channel when another recovery stream aborts the job control', async () => {
     const first = recoveryReceipt()
-    const { sessionId: _sessionId, channelId: _channelId, ...secondBase } = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...secondBase } = recoveryReceipt()
     const second: SessionReceipt = {
       ...secondBase,
       key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
@@ -386,13 +446,15 @@ describe('production session launcher', () => {
       phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
       worktree: { phase: 'none' },
     }
-    let persist!: (value: { status: 'updated'; receipt: SessionReceipt }) => void
-    const persisted = new Promise<{ status: 'updated'; receipt: SessionReceipt }>(resolve => { persist = resolve })
     let releaseSecondAudit!: () => void
     const secondAudit = new Promise<void>(resolve => { releaseSecondAudit = resolve })
     let opened!: () => void
     const firstOpened = new Promise<void>(resolve => { opened = resolve })
     const close = vi.fn(async () => undefined)
+    const channels: SessionLauncherOptions['channels'] = {
+      open: async () => { opened(); return { status: 'opened', channelId: 'channel-1' } },
+      close,
+    }
     const base = options()
     const subject = options({
       receipts: {
@@ -400,12 +462,12 @@ describe('production session launcher', () => {
         claim: async () => ({ status: 'storage-unavailable' }),
         recover: async () => [first, second],
         compact: async () => undefined,
-        replace: async (_revision, next) => {
-          if (next.key.requestId === first.key.requestId && next.channelId === 'channel-1') return await persisted
-          return { status: 'storage-unavailable' }
-        },
+        replace: async (_revision, next) => next.key.requestId === first.key.requestId
+          ? { status: 'updated', receipt: { ...next, revision: next.revision + 1 } }
+          : { status: 'storage-unavailable' },
       },
-      channels: { open: async () => { opened(); return { status: 'opened', channelId: 'channel-1' } }, close },
+      channels,
+      recoveryChannels: recoveryChannelPorts(channels),
       worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
       audit: {
         append: async record => {
@@ -419,14 +481,13 @@ describe('production session launcher', () => {
     await firstOpened
     releaseSecondAudit()
     await expect(actions).resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
-    persist({ status: 'updated', receipt: { ...first, revision: first.revision + 1, channelId: 'channel-1' } })
     await Promise.resolve()
     expect(close).toHaveBeenCalledWith('channel-1', 'storage-unavailable')
   })
 
   it('closes a correlated channel when recovery aborts while process start is pending', async () => {
     const first = recoveryReceipt()
-    const { sessionId: _sessionId, channelId: _channelId, ...secondBase } = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...secondBase } = recoveryReceipt()
     const second: SessionReceipt = {
       ...secondBase,
       key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
@@ -440,6 +501,10 @@ describe('production session launcher', () => {
     let started!: () => void
     const firstStarted = new Promise<void>(resolve => { started = resolve })
     const close = vi.fn(async () => undefined)
+    const channels: SessionLauncherOptions['channels'] = {
+      open: async () => ({ status: 'opened', channelId: 'channel-1' }),
+      close,
+    }
     const base = options()
     const subject = options({
       clock: { now: () => now, sleep: async () => await new Promise<void>(() => undefined) },
@@ -450,7 +515,8 @@ describe('production session launcher', () => {
         compact: async () => undefined,
         replace: async (_revision, next) => ({ status: 'updated', receipt: { ...next, revision: next.revision + 1 } }),
       },
-      channels: { open: async () => ({ status: 'opened', channelId: 'channel-1' }), close },
+      channels,
+      recoveryChannels: recoveryChannelPorts(channels),
       processes: { ...base.value.processes, adopt: async () => { started(); return await new Promise(() => undefined) } },
       worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
       audit: {
@@ -469,13 +535,13 @@ describe('production session launcher', () => {
   })
 
   it('terminates an owned process when recovery aborts before SESSION_STARTED is durable', async () => {
-    const { sessionId: _sessionId, channelId: _channelId, ...firstBase } = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...firstBase } = recoveryReceipt()
     const first: SessionReceipt = {
       ...firstBase,
       state: 'provisioned',
       phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z' },
     }
-    const { sessionId: _otherSessionId, channelId: _otherChannelId, ...secondBase } = recoveryReceipt()
+    const { sessionId: _otherSessionId, channelId: _otherChannelId, channel: _otherChannel, ...secondBase } = recoveryReceipt()
     const second: SessionReceipt = {
       ...secondBase,
       key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
@@ -530,13 +596,13 @@ describe('production session launcher', () => {
   })
 
   it('terminates an owned process when recovery aborts between start commitment and handle observation', async () => {
-    const { sessionId: _sessionId, channelId: _channelId, ...firstBase } = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...firstBase } = recoveryReceipt()
     const first: SessionReceipt = {
       ...firstBase,
       state: 'provisioned',
       phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z' },
     }
-    const { sessionId: _otherSessionId, channelId: _otherChannelId, ...secondBase } = recoveryReceipt()
+    const { sessionId: _otherSessionId, channelId: _otherChannelId, channel: _otherChannel, ...secondBase } = recoveryReceipt()
     const second: SessionReceipt = {
       ...secondBase,
       key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },

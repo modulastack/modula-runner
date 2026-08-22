@@ -16,6 +16,7 @@ import {
   type SessionLaunchAction,
   type SessionLauncher,
   type SessionLauncherOptions,
+  type SessionProcessHandle,
   type SessionReceipt,
   type SessionReceiptTombstone,
   type SessionTerminalResult,
@@ -248,13 +249,18 @@ async function* recoverProcess(
 ): AsyncGenerator<SessionLaunchAction> {
   if (recoverySignal.aborted) return
   const sessionId = startingReceipt.sessionId
-  if (!sessionId || !isSafeIdentifier(sessionId)) {
+  const prior = startingReceipt.channel
+  if (!sessionId || !isSafeIdentifier(sessionId) || !prior || prior.lifecycle === 'replacement-intent' || !options.recoveryChannels) {
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return
   }
   const inspected = await safe(() => options.processes.inspect({ sessionId, cwd: worktree.resolvedCwdPath }))
-  if (recoverySignal.aborted) return
-  if (!inspected.ok || inspected.value !== 'exact') {
+  if (!inspected.ok || inspected.value !== 'exact' || recoverySignal.aborted) {
+    yield await fail(options, startingReceipt, 'recovery-uncertain')
+    return
+  }
+  const status = await safe(() => options.recoveryChannels!.status(prior.channelId, prior.generation, prior.connectionEpoch))
+  if (!status.ok || (status.value !== 'closed' && status.value !== 'lost')) {
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return
   }
@@ -268,51 +274,147 @@ async function* recoverProcess(
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return
   }
-  const plan = access.value.plan
-  const opened = await timed(
-    options,
-    LAUNCH_PROGRESS_MS,
-    operationSignal => options.channels.open(startingReceipt.request.requestId, sessionId, operationSignal),
-    recoverySignal,
-  )
-  if (!opened.ok || opened.value.status === 'failed') {
+  const generation = prior.generation + 1
+  if (!Number.isSafeInteger(generation)) {
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return
   }
-  const channelId = opened.value.channelId
-  if (!isSafeIdentifier(channelId)) {
-    await safe(() => options.channels.close(channelId, 'recovery-uncertain'))
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
-  }
-  const correlation = await correlateChannel(options, startingReceipt, channelId, recoverySignal)
-  if (correlation.aborted) return
-  const correlated = correlation.receipt
-  if (!correlated) {
-    await safe(() => options.channels.close(channelId, 'storage-unavailable'))
+  const claimed = await claimReplacement(options, startingReceipt, generation)
+  if (claimed.status === 'storage-unavailable') {
     yield STORAGE_CLOSE
     return
   }
-  const stopClosingOnAbort = closeChannelOnAbort(options, channelId, recoverySignal)
+  if (claimed.status === 'contender') {
+    const replay = await waitForReplacement(options, startingReceipt.key, claimed.current, generation)
+    yield replay ?? STORAGE_CLOSE
+    return
+  }
+  yield* openReplacement(options, claimed.receipt, worktree, access.value.plan, sessionId, generation, recoverySignal)
+}
+
+type ReplacementClaim =
+  | { status: 'winner'; receipt: SessionReceipt }
+  | { status: 'contender'; current: SessionReceipt | null }
+  | { status: 'storage-unavailable' }
+
+async function claimReplacement(
+  options: SessionLauncherOptions,
+  receipt: SessionReceipt,
+  generation: number,
+): Promise<ReplacementClaim> {
+  const intent: SessionReceipt = {
+    ...receipt,
+    channel: { generation, lifecycle: 'replacement-intent', channelId: null },
+  }
+  const result = await safe(() => options.receipts.replace(receipt.revision, intent))
+  if (!result.ok || result.value.status === 'storage-unavailable') return { status: 'storage-unavailable' }
+  return result.value.status === 'updated'
+    ? { status: 'winner', receipt: result.value.receipt }
+    : { status: 'contender', current: result.value.current }
+}
+
+async function waitForReplacement(
+  options: SessionLauncherOptions,
+  key: SessionReceipt['key'],
+  initial: SessionReceipt | null,
+  generation: number,
+): Promise<SessionLaunchAction | null> {
+  let current = initial
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const action = current ? await replacementReplay(options, current, generation) : null
+    if (action) return action
+    const slept = await safe(() => options.clock.sleep(1))
+    if (!slept.ok) return null
+    const found = await safe(() => options.receipts.lookup(key))
+    if (!found.ok || found.value.status !== 'receipt') return null
+    current = found.value.receipt
+  }
+  return null
+}
+
+async function replacementReplay(
+  options: SessionLauncherOptions,
+  receipt: SessionReceipt,
+  generation: number,
+): Promise<SessionLaunchAction | null> {
+  if (receipt.result) return (await audit(options, receipt)) ? message(receipt.result) : STORAGE_CLOSE
+  if (receipt.state !== 'started' || !receipt.sessionId || receipt.channel?.generation !== generation
+    || receipt.channel.lifecycle !== 'live' || !receipt.channel.channelId) return null
+  return (await audit(options, receipt))
+    ? message({ type: 'SESSION_STARTED', requestId: receipt.key.requestId, sessionId: receipt.sessionId, channelId: receipt.channel.channelId })
+    : STORAGE_CLOSE
+}
+
+async function* openReplacement(
+  options: SessionLauncherOptions,
+  receipt: SessionReceipt,
+  worktree: SessionWorktreeVerifiedSnapshot,
+  plan: LaunchPlan,
+  sessionId: string,
+  generation: number,
+  signal: AbortSignal,
+): AsyncGenerator<SessionLaunchAction> {
+  const opened = await timed(options, LAUNCH_PROGRESS_MS, operationSignal => options.channels.open(receipt.key.requestId, sessionId, operationSignal), signal)
+  if (!opened.ok || opened.value.status === 'failed') {
+    yield await fail(options, receipt, 'recovery-uncertain')
+    return
+  }
+  const channelId = opened.value.channelId
+  const connectionEpoch = opened.value.connectionEpoch
+  if (!isSafeIdentifier(channelId)) {
+    yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
+    return
+  }
+  const stopClosing = closeChannelOnAbort(options, channelId, signal, generation, connectionEpoch)
   try {
     const adopted = await timed(options, LAUNCH_PROGRESS_MS, operationSignal => options.processes.adopt({
-      requestId: correlated.request.requestId,
+      requestId: receipt.key.requestId,
       sessionId,
       channelId,
-      terminalProfile: correlated.request.terminalProfile,
+      channelGeneration: generation,
+      terminalProfile: receipt.request.terminalProfile,
       cwd: worktree.resolvedCwdPath,
       plan,
-    }, operationSignal), recoverySignal)
+    }, operationSignal), signal)
     if (!adopted.ok || adopted.value.status === 'failed') {
-      await safe(() => options.channels.close(channelId, 'recovery-uncertain'))
-      yield await fail(options, correlated, 'recovery-uncertain')
+      yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
       return
     }
-    const handle = adopted.value.handle
-    yield* publishStarted(options, correlated, worktree, channelId, sessionId, handle, recoverySignal, stopClosingOnAbort)
+    yield* publishStarted(
+      options,
+      receipt,
+      worktree,
+      channelId,
+      sessionId,
+      adopted.value.handle,
+      signal,
+      stopClosing,
+      generation,
+      connectionEpoch,
+    )
   } finally {
-    stopClosingOnAbort()
+    stopClosing()
   }
+}
+
+async function* closeFailedReplacement(
+  options: SessionLauncherOptions,
+  receipt: SessionReceipt,
+  channelId: string,
+  generation: number,
+  connectionEpoch?: string,
+): AsyncGenerator<SessionLaunchAction> {
+  const closed = await safe(() => options.recoveryChannels!.closeExact(
+    channelId,
+    generation,
+    'recovery-uncertain',
+    connectionEpoch,
+  ))
+  if (!closed.ok || closed.value === 'unknown') {
+    yield STORAGE_CLOSE
+    return
+  }
+  yield await fail(options, receipt, 'recovery-uncertain')
 }
 
 async function* invalidRequest(
@@ -552,15 +654,15 @@ async function* startProvisioned(
   }
   const channelId = opened.value.channelId
   if (!isSafeIdentifier(channelId)) {
-    await safe(() => options.channels.close(channelId, 'channel-unavailable'))
-    yield await fail(options, receipt, 'channel-unavailable')
+    const closed = await closeExactOrLegacy(options, channelId, 'channel-unavailable', 1, opened.value.connectionEpoch)
+    yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, 'channel-unavailable')
     return
   }
-  const correlation = await correlateChannel(options, receipt, channelId, parentSignal)
+  const correlation = await correlateChannel(options, receipt, channelId, 1, opened.value.connectionEpoch, parentSignal)
   if (correlation.aborted) return
   const correlated = correlation.receipt
   if (!correlated) {
-    await safe(() => options.channels.close(channelId, 'storage-unavailable'))
+    await closeExactOrLegacy(options, channelId, 'storage-unavailable', 1, opened.value.connectionEpoch)
     yield STORAGE_CLOSE
     return
   }
@@ -570,11 +672,12 @@ async function* startProvisioned(
     requestId: receipt.request.requestId,
     sessionId,
     channelId,
+    channelGeneration: 1,
     terminalProfile: receipt.request.terminalProfile,
     cwd: worktree.resolvedCwdPath,
     plan,
   }
-  const stopClosingOnAbort = closeChannelOnAbort(options, channelId, parentSignal)
+  const stopClosingOnAbort = closeChannelOnAbort(options, channelId, parentSignal, 1, opened.value.connectionEpoch)
   let stopTerminatingOnAbort: () => void = () => undefined
   const releasePreStartGuards = () => {
     stopClosingOnAbort()
@@ -583,19 +686,23 @@ async function* startProvisioned(
   try {
     const started = await timed(options, LAUNCH_PROGRESS_MS, signal => options.processes.start(processRequest, signal), parentSignal)
     if (!started.ok) {
-      const reason = await compensateProcess(
+      const compensation = await compensateProcess(
         options,
         { sessionId: processRequest.sessionId, cwd: processRequest.cwd },
         channelId,
         started.timeout ? 'launch-timeout' : 'spawn-failed',
+        1,
+        opened.value.connectionEpoch,
       )
-      yield await fail(options, receipt, reason)
+      yield compensation === 'storage-unavailable'
+        ? STORAGE_CLOSE
+        : await fail(options, receipt, compensation)
       return
     }
     if (started.value.status === 'failed') {
       const reason = started.value.reason
-      const closed = await safe(() => options.channels.close(channelId, reason))
-      yield await fail(options, receipt, closed.ok ? reason : 'recovery-uncertain')
+      const closed = await closeExactOrLegacy(options, channelId, reason, 1, opened.value.connectionEpoch)
+      yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, reason)
       return
     }
     stopTerminatingOnAbort = terminateProcessOnAbort(
@@ -603,7 +710,18 @@ async function* startProvisioned(
       { sessionId: processRequest.sessionId, cwd: processRequest.cwd },
       parentSignal,
     )
-    yield* publishStarted(options, receipt, worktree, channelId, sessionId, started.value.handle, parentSignal, releasePreStartGuards)
+    yield* publishStarted(
+      options,
+      receipt,
+      worktree,
+      channelId,
+      sessionId,
+      started.value.handle,
+      parentSignal,
+      releasePreStartGuards,
+      1,
+      opened.value.connectionEpoch,
+    )
   } finally {
     releasePreStartGuards()
   }
@@ -615,18 +733,31 @@ async function* publishStarted(
   _worktree: SessionWorktreeVerifiedSnapshot,
   channelId: string,
   sessionId: string,
-  handle: { sessionId: string; finished: Promise<{ exitCode: number | null; signal: number | null }> },
+  handle: SessionProcessHandle,
   parentSignal?: AbortSignal,
   onStarted?: () => void,
+  generation = 1,
+  connectionEpoch?: string,
 ): AsyncGenerator<SessionLaunchAction> {
   if (parentSignal?.aborted) return
   let receipt = startingReceipt
-  if (handle.sessionId !== sessionId) {
-    await safe(() => options.channels.close(channelId, 'recovery-uncertain'))
-    yield await fail(options, receipt, 'recovery-uncertain')
+  if (handle.sessionId !== sessionId
+    || (handle.channelId !== undefined && handle.channelId !== channelId)
+    || (handle.channelGeneration !== undefined && handle.channelGeneration !== generation)) {
+    const closed = await closeExactOrLegacy(options, channelId, 'recovery-uncertain', generation, connectionEpoch)
+    yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, 'recovery-uncertain')
     return
   }
-  const live = await transition(options, receipt, 'started', { channelId, sessionId })
+  const live = await transition(options, receipt, 'started', {
+    channelId,
+    sessionId,
+    channel: {
+      generation,
+      lifecycle: 'live',
+      channelId,
+      ...(connectionEpoch === undefined ? {} : { connectionEpoch }),
+    },
+  })
   if (parentSignal?.aborted) return
   if (!live || !(await audit(options, live))) {
     yield STORAGE_CLOSE
@@ -643,7 +774,32 @@ async function* publishStarted(
     yield await fail(options, receipt, 'recovery-uncertain')
     return
   }
-  const terminal = await transition(options, receipt, 'finished', { result })
+  if (options.channelEvents) {
+    const settled = await safe(() => options.channelEvents!.handle({
+      kind: 'terminal',
+      key: receipt.key,
+      sessionId,
+      channelId,
+      generation,
+      exitCode: result.exitCode,
+      signal: result.signal,
+    }))
+    if (!settled.ok || settled.value.status === 'unknown' || settled.value.status === 'storage-unavailable') {
+      yield STORAGE_CLOSE
+      return
+    }
+    if (settled.value.status === 'applied' && settled.value.action) yield settled.value.action
+    return
+  }
+  const terminal = await transition(options, receipt, 'finished', {
+    result,
+    channel: {
+      generation,
+      lifecycle: 'closed',
+      channelId,
+      ...(connectionEpoch === undefined ? {} : { connectionEpoch }),
+    },
+  })
   if (!terminal || !(await audit(options, terminal))) {
     yield STORAGE_CLOSE
     return
@@ -656,10 +812,13 @@ async function compensateProcess(
   identity: { sessionId: string; cwd: string },
   channelId: string,
   definiteReason: Extract<SessionFailureReason, 'launch-timeout' | 'spawn-failed'>,
-): Promise<SessionFailureReason> {
+  generation?: number,
+  connectionEpoch?: string,
+): Promise<SessionFailureReason | 'storage-unavailable'> {
   const termination = await safe(() => options.processes.terminate(identity))
-  const closed = await safe(() => options.channels.close(channelId, definiteReason))
-  if (!termination.ok || termination.value === 'uncertain' || !closed.ok) return 'recovery-uncertain'
+  const closed = await closeExactOrLegacy(options, channelId, definiteReason, generation, connectionEpoch)
+  if (closed === 'unknown') return 'storage-unavailable'
+  if (!termination.ok || termination.value === 'uncertain') return 'recovery-uncertain'
   return definiteReason
 }
 
@@ -762,15 +921,25 @@ async function correlateChannel(
   options: SessionLauncherOptions,
   receipt: SessionReceipt,
   channelId: string,
+  generation: number,
+  connectionEpoch: string | undefined,
   signal?: AbortSignal,
 ): Promise<{ receipt: SessionReceipt | null; aborted: boolean }> {
-  const stopClosingOnAbort = closeChannelOnAbort(options, channelId, signal)
+  const stopClosingOnAbort = closeChannelOnAbort(options, channelId, signal, generation, connectionEpoch)
   if (signal?.aborted) {
     stopClosingOnAbort()
     return { receipt: null, aborted: true }
   }
   try {
-    const correlated = await persist(options, receipt, { channelId })
+    const correlated = await persist(options, receipt, {
+      channelId,
+      channel: {
+        generation,
+        lifecycle: 'live',
+        channelId,
+        ...(connectionEpoch === undefined ? {} : { connectionEpoch }),
+      },
+    })
     return { receipt: correlated, aborted: signal?.aborted ?? false }
   } finally {
     stopClosingOnAbort()
@@ -781,11 +950,28 @@ function closeChannelOnAbort(
   options: SessionLauncherOptions,
   channelId: string,
   signal?: AbortSignal,
+  generation?: number,
+  connectionEpoch?: string,
 ): () => void {
-  const close = () => { void safe(() => options.channels.close(channelId, 'storage-unavailable')) }
+  const close = () => { void closeExactOrLegacy(options, channelId, 'storage-unavailable', generation, connectionEpoch) }
   if (signal?.aborted) close()
   else signal?.addEventListener('abort', close, { once: true })
   return () => signal?.removeEventListener('abort', close)
+}
+
+async function closeExactOrLegacy(
+  options: SessionLauncherOptions,
+  channelId: string,
+  reason: string,
+  generation?: number,
+  connectionEpoch?: string,
+): Promise<'closed' | 'lost' | 'unknown'> {
+  if (generation !== undefined && options.recoveryChannels) {
+    const closed = await safe(() => options.recoveryChannels!.closeExact(channelId, generation, reason, connectionEpoch))
+    return closed.ok ? closed.value : 'unknown'
+  }
+  const closed = await safe(() => options.channels.close(channelId, reason))
+  return closed.ok ? 'closed' : 'unknown'
 }
 
 function terminateProcessOnAbort(

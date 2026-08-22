@@ -113,9 +113,13 @@ export type SessionTerminalResult = SessionRefusedMessage | SessionFailedMessage
 export const SESSION_CHANNEL_LIFECYCLES = ['live', 'closed', 'lost', 'replacement-intent'] as const
 export type SessionChannelLifecycle = (typeof SESSION_CHANNEL_LIFECYCLES)[number]
 
-export type SessionChannelSnapshot =
-  | { generation: number; lifecycle: 'live' | 'closed' | 'lost'; channelId: string }
-  | { generation: number; lifecycle: 'replacement-intent'; channelId: null }
+export type SessionChannelSnapshot = {
+  generation: number
+  connectionEpoch?: string
+} & (
+  | { lifecycle: 'live' | 'closed' | 'lost'; channelId: string }
+  | { lifecycle: 'replacement-intent'; channelId: null }
+)
 
 export type SessionReceipt = {
   schemaVersion: typeof SESSION_RECEIPT_SCHEMA_VERSION
@@ -264,7 +268,7 @@ export type SessionTerminalRequest = {
 }
 
 export type SessionChannelOpen =
-  | { status: 'opened'; channelId: string }
+  | { status: 'opened'; channelId: string; connectionEpoch?: string }
   | { status: 'failed'; reason: 'channel-unavailable' }
 
 export interface SessionChannelPort {
@@ -276,8 +280,8 @@ export type SessionChannelStatus = 'live' | 'closed' | 'lost' | 'unknown'
 export type SessionChannelCloseResult = 'closed' | 'lost' | 'unknown'
 
 export interface SessionRecoveryChannelPort extends SessionChannelPort {
-  status(channelId: string, generation: number): Promise<SessionChannelStatus>
-  closeExact(channelId: string, generation: number, reason: string): Promise<SessionChannelCloseResult>
+  status(channelId: string, generation: number, connectionEpoch?: string): Promise<SessionChannelStatus>
+  closeExact(channelId: string, generation: number, reason: string, connectionEpoch?: string): Promise<SessionChannelCloseResult>
 }
 
 export type SessionChannelEvent = {
@@ -302,23 +306,6 @@ export type SessionChannelEventCoordinatorOptions = {
   receipts: SessionReceiptLedger
   audit: Pick<AuditLog, 'append'>
   clock: RunnerClock
-}
-
-export class SessionChannelEventNotImplementedError extends Error {
-  constructor() {
-    super('generation-scoped channel events are interface-only and are not active')
-    this.name = 'SessionChannelEventNotImplementedError'
-  }
-}
-
-export function createSessionChannelEventCoordinator(
-  _options: SessionChannelEventCoordinatorOptions,
-): SessionChannelEventCoordinator {
-  return {
-    async handle(): Promise<never> {
-      throw new SessionChannelEventNotImplementedError()
-    },
-  }
 }
 
 export type SessionProcessRequest = SessionTerminalRequest & { channelId: string; channelGeneration?: number }

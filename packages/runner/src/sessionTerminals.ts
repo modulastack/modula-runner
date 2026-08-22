@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto'
 import type { ChannelHandle, RunnerClient } from './client.js'
 import type {
   SessionChannelPort,
   SessionProcessHandle,
   SessionProcessIdentity,
+  SessionRecoveryChannelPort,
   SessionProcessPort,
   SessionProcessRequest,
 } from './sessionLaunch.js'
@@ -19,6 +21,7 @@ export type SessionTerminalPortsOptions = {
 
 export type SessionTerminalPorts = {
   channels: SessionChannelPort
+  recoveryChannels: SessionRecoveryChannelPort
   processes: SessionProcessPort
   shutdown(): Promise<readonly string[]>
 }
@@ -40,21 +43,49 @@ export function createSessionTerminalPorts(options: SessionTerminalPortsOptions)
   const exits = new Map<string, ExitSignal>()
   const channelProcesses = new Map<string, string>()
   const forcedTerminationKeys = new Set<string>()
+  const retiredChannels = new Map<string, 'closed' | 'lost'>()
+  let connectionEpoch = randomUUID()
   const host = new TerminalHost(options.client, {
     seam: options.seam,
     onSessionExit(exit) {
       settleExit(exits, channelProcesses, forcedTerminationKeys, exit.channelId, { exitCode: exit.exitCode, signal: exit.signal })
     },
   })
-  const forgetChannel = (detail: unknown) => {
+  const retireChannel = (status: 'closed' | 'lost') => (detail: unknown) => {
     const channelId = (detail as { channel?: unknown }).channel
-    if (typeof channelId === 'string') slots.delete(channelId)
+    if (typeof channelId !== 'string') return
+    slots.delete(channelId)
+    rememberRetired(retiredChannels, channelId, status)
   }
-  options.client.on('channel-closed', forgetChannel)
-  options.client.on('channel-expired', forgetChannel)
+  const closedChannel = retireChannel('closed')
+  const expiredChannel = retireChannel('lost')
+  const advanceConnectionEpoch = () => { connectionEpoch = randomUUID() }
+  options.client.on('channel-closed', closedChannel)
+  options.client.on('channel-expired', expiredChannel)
+  options.client.on('connected', advanceConnectionEpoch)
   const channels: SessionChannelPort = {
-    open: (_requestId, _sessionId, signal) => openChannel(options.client, slots, signal),
+    open: (_requestId, _sessionId, signal) => openChannel(options.client, slots, signal, connectionEpoch),
     close: (channelId, reason) => closeChannel(host, slots, channelId, reason),
+  }
+  const recoveryChannels: SessionRecoveryChannelPort = {
+    ...channels,
+    async status(channelId, _generation, expectedEpoch) {
+      if (expectedEpoch !== undefined && expectedEpoch !== connectionEpoch) return 'lost'
+      return slots.has(channelId) ? 'live' : (retiredChannels.get(channelId) ?? 'unknown')
+    },
+    async closeExact(channelId, _generation, reason, expectedEpoch) {
+      if (expectedEpoch !== undefined && expectedEpoch !== connectionEpoch) return 'lost'
+      const slot = slots.get(channelId)
+      if (!slot) return retiredChannels.get(channelId) ?? 'unknown'
+      try {
+        await closeChannel(host, slots, channelId, reason)
+        if (slot.state !== 'pending') return 'unknown'
+        rememberRetired(retiredChannels, channelId, 'closed')
+        return 'closed'
+      } catch {
+        return 'unknown'
+      }
+    },
   }
   const processes: SessionProcessPort = {
     start: (request, signal) => startProcess(options.seam, host, slots, exits, channelProcesses, forcedTerminationKeys, request, signal),
@@ -64,10 +95,12 @@ export function createSessionTerminalPorts(options: SessionTerminalPortsOptions)
   }
   return {
     channels,
+    recoveryChannels,
     processes,
     async shutdown() {
-      options.client.off('channel-closed', forgetChannel)
-      options.client.off('channel-expired', forgetChannel)
+      options.client.off('channel-closed', closedChannel)
+      options.client.off('channel-expired', expiredChannel)
+      options.client.off('connected', advanceConnectionEpoch)
       for (const [channelId, slot] of [...slots]) {
         if (slot.state === 'pending') await closeChannel(host, slots, channelId, 'shutdown')
       }
@@ -88,6 +121,7 @@ async function openChannel(
   client: RunnerClient,
   slots: Map<string, ChannelSlot>,
   signal: AbortSignal,
+  connectionEpoch: string,
 ) {
   if (signal.aborted || slots.size >= MAX_SESSION_CHANNELS) return { status: 'failed' as const, reason: 'channel-unavailable' as const }
   let handle: ChannelHandle
@@ -105,7 +139,7 @@ async function openChannel(
     return { status: 'failed' as const, reason: 'channel-unavailable' as const }
   }
   slots.set(handle.id, { handle, state: 'pending', exit: exitSignal() })
-  return { status: 'opened' as const, channelId: handle.id }
+  return { status: 'opened' as const, channelId: handle.id, connectionEpoch }
 }
 
 async function closeChannel(
@@ -155,7 +189,7 @@ async function startProcess(
       await closeChannel(host, slots, request.channelId, 'launch-timeout')
       return { status: 'failed' as const, reason: 'spawn-failed' as const }
     }
-    return { status: 'started' as const, handle: processHandle(request.sessionId, slot.exit) }
+    return { status: 'started' as const, handle: processHandle(request, slot.exit) }
   } catch (error) {
     slots.delete(request.channelId)
     throw error
@@ -193,7 +227,7 @@ async function adoptProcess(
       await closeChannel(host, slots, request.channelId, 'launch-timeout')
       return { status: 'failed' as const, reason: 'spawn-failed' as const }
     }
-    return { status: 'started' as const, handle: processHandle(request.sessionId, slot.exit) }
+    return { status: 'started' as const, handle: processHandle(request, slot.exit) }
   } catch {
     slots.delete(request.channelId)
     return { status: 'failed' as const, reason: 'spawn-failed' as const }
@@ -282,6 +316,16 @@ function settleProcess(
   }
 }
 
+function rememberRetired(
+  retired: Map<string, 'closed' | 'lost'>,
+  channelId: string,
+  status: 'closed' | 'lost',
+) {
+  retired.delete(channelId)
+  retired.set(channelId, status)
+  if (retired.size > MAX_SESSION_CHANNELS * 2) retired.delete(retired.keys().next().value!)
+}
+
 function processKey(identity: SessionProcessIdentity): string {
   return `${identity.cwd}\u0000${identity.sessionId}`
 }
@@ -298,9 +342,14 @@ function processRef(identity: SessionProcessIdentity): TmuxRef {
   }
 }
 
-function processHandle(sessionId: string, exit: ExitSignal): SessionProcessHandle {
+function processHandle(request: SessionProcessRequest, exit: ExitSignal): SessionProcessHandle {
   exit.exposed = true
-  return { sessionId, finished: exit.promise }
+  return {
+    sessionId: request.sessionId,
+    channelId: request.channelId,
+    ...(request.channelGeneration === undefined ? {} : { channelGeneration: request.channelGeneration }),
+    finished: exit.promise,
+  }
 }
 
 function exitSignal(): ExitSignal {

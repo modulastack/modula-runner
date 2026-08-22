@@ -4,7 +4,6 @@ import {
   AUDIT_RECORD_SCHEMA_VERSION,
   AUDIT_SEGMENT_STATES,
   AuditLifecycleNotImplementedError,
-  SessionChannelEventNotImplementedError,
   MAX_AUDIT_METADATA_BYTES,
   MAX_AUDIT_RECORD_BYTES,
   MAX_AUDIT_SEGMENT_BYTES,
@@ -37,7 +36,7 @@ describe('audit lifecycle interface checkpoint', () => {
       .rejects.toBeInstanceOf(AuditLifecycleNotImplementedError)
   })
 
-  it('keeps generation-scoped channel events inactive', async () => {
+  it('does not classify a channel event without a current receipt', async () => {
     const receipts: SessionReceiptLedger = {
       lookup: async () => ({ status: 'missing' }),
       claim: async () => ({ status: 'storage-unavailable' }),
@@ -56,7 +55,7 @@ describe('audit lifecycle interface checkpoint', () => {
       sessionId: 'session-1',
       channelId: 'channel-1',
       generation: 1,
-    })).rejects.toBeInstanceOf(SessionChannelEventNotImplementedError)
+    })).resolves.toEqual({ status: 'unknown' })
   })
 
   it('wraps one refresh in the durable aggregate admission and outcome pair', async () => {

@@ -68,7 +68,16 @@ function receipt(index: number, state: SessionReceipt['state'], at: string): Ses
     state,
     phaseTimestamps: { [state]: at },
     worktree: state === 'started' || state === 'finished' ? verifiedWorktree() : { phase: 'none' },
-    ...(state === 'started' || state === 'finished' ? { sessionId: 'session-stable', channelId: 'channel-stable' } : {}),
+    ...(state === 'started' || state === 'finished' ? {
+      sessionId: 'session-stable',
+      channelId: 'channel-stable',
+      channel: {
+        generation: 1,
+        lifecycle: terminal ? 'closed' as const : 'live' as const,
+        channelId: 'channel-stable',
+        connectionEpoch: 'connection-epoch-1',
+      },
+    } : {}),
     ...(terminal ? { result: { type: 'SESSION_FINISHED' as const, requestId: value.requestId, exitCode: 0, signal: null } } : {}),
   }
 }
@@ -173,6 +182,12 @@ function invalidPersistedImages(): Array<readonly [string, unknown]> {
     ['verified clean marker', ['receipts', 0, 'worktree', 'clean'], false],
     ['session id', ['receipts', 0, 'sessionId'], null],
     ['channel id', ['receipts', 0, 'channelId'], {}],
+    ['channel object', ['receipts', 0, 'channel'], []],
+    ['channel generation', ['receipts', 0, 'channel', 'generation'], 0],
+    ['channel lifecycle', ['receipts', 0, 'channel', 'lifecycle'], 'bogus'],
+    ['channel connection epoch', ['receipts', 0, 'channel', 'connectionEpoch'], {}],
+    ['channel current id', ['receipts', 0, 'channel', 'channelId'], {}],
+    ['channel id mismatch', ['receipts', 0, 'channel', 'channelId'], 'channel-other'],
     ['terminal result', ['receipts', 0, 'result'], null],
     ['terminal result request id', ['receipts', 0, 'result', 'requestId'], []],
     ['terminal exit code', ['receipts', 0, 'result', 'exitCode'], '0'],
@@ -401,7 +416,7 @@ describe('production session receipt ledger', () => {
     await expect(ledger.replace(1, rewritten)).resolves.toMatchObject({ status: 'conflict' })
   })
 
-  it('keeps assigned session and channel identities immutable', async () => {
+  it('keeps assigned session and channel identities immutable outside generation replacement', async () => {
     const initial = emptyImage()
     initial.receipts = [receipt(1, 'started', '2026-08-21T00:05:00Z')]
     const held = memoryStorage(initial)
@@ -415,8 +430,16 @@ describe('production session receipt ledger', () => {
     }
     await expect(ledger.replace(1, { ...terminal, sessionId: 'different-session' }))
       .resolves.toMatchObject({ status: 'conflict' })
-    await expect(ledger.replace(1, { ...terminal, channelId: 'different-channel' }))
-      .resolves.toMatchObject({ status: 'conflict' })
+    await expect(ledger.replace(1, {
+      ...terminal,
+      channelId: 'different-channel',
+      channel: {
+        generation: terminal.channel!.generation,
+        lifecycle: 'live',
+        channelId: 'different-channel',
+        ...(terminal.channel!.connectionEpoch ? { connectionEpoch: terminal.channel!.connectionEpoch } : {}),
+      },
+    })).resolves.toMatchObject({ status: 'conflict' })
   })
 
   it('preserves assigned project and worktree evidence across later transitions', async () => {
