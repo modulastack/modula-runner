@@ -84,6 +84,7 @@ export type RunnerPolicyInitialization =
 
 export interface RunnerHome {
   open(selection: RunnerHomeSelection): Promise<RunnerHomeOpen>
+  validateSigningKeyPath?(selection: RunnerHomeSelection, signingKeyPath: string): Promise<RunnerHomeFailure | null>
   initializePolicy?(
     selection: RunnerHomeSelection,
     signingKeyPath: string,

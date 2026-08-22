@@ -13,6 +13,11 @@ import {
 } from './cli.js'
 import { PairingContractError, type PairingContractService } from './pairingContract.js'
 import {
+  allowlistCommandSyntax,
+  runAllowlistCommand,
+  runAllowlistInit,
+} from './runnerAllowlistCommands.js'
+import {
   endpointCommandSyntax,
   profileCommandSyntax,
   runEndpointCommand,
@@ -140,12 +145,28 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
   if (command === '--help' || command === 'help') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: helpText() })
   if (command === '--version' || command === 'version') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: options.version })
   if (!command) return emit(invocation.io, usage())
-  if (!['pair', 'status', 'project', 'key', 'grant', 'profile', 'endpoint'].includes(command)) {
+  if (!['pair', 'status', 'project', 'key', 'grant', 'profile', 'endpoint', 'allowlist'].includes(command)) {
     if ((RUNNER_TOP_LEVEL_COMMANDS as readonly string[]).includes(command)) throw new RunnerApplicationNotImplementedError()
     return emit(invocation.io, usage())
   }
   const syntax = commandSyntax(command, args, invocation)
   if (syntax) return emit(invocation.io, syntax)
+  if (command === 'allowlist' && args[0] === 'init') {
+    try {
+      return emit(invocation.io, await runAllowlistInit(options.home, homeSelection(invocation), invocation.cwd, args))
+    } catch {
+      return emit(invocation.io, commandFailure(command, args, 'state-io-failed', 'allowlist initialization failed'))
+    }
+  }
+  if (command === 'allowlist' && args[0] === 'sign') {
+    if (!options.home.validateSigningKeyPath) return emit(invocation.io, homeFailure('state-io-failed'))
+    try {
+      const failure = await options.home.validateSigningKeyPath(homeSelection(invocation), path.resolve(invocation.cwd, args[2]!))
+      if (failure) return emit(invocation.io, homeFailure(failure))
+    } catch {
+      return emit(invocation.io, commandFailure(command, args, 'state-io-failed', 'signing key path validation failed'))
+    }
+  }
   return await executeWithHome(options, invocation, command, args)
 }
 
@@ -155,7 +176,7 @@ async function executeWithHome(
   command: string,
   args: readonly string[],
 ): Promise<RunnerExitCode> {
-  const opened = await options.home.open({ ...(invocation.environment.runnerHome ? { override: invocation.environment.runnerHome } : {}) })
+  const opened = await options.home.open(homeSelection(invocation))
   if (opened.status === 'failed') {
     const outcome = command === 'status' && args[0] === '--json'
       ? { exitCode: 1 as const, stdout: JSON.stringify({ error: { code: opened.code } }) }
@@ -189,7 +210,8 @@ async function runOpened(
   if (command === 'key') return await keyCommand(home, invocation, args)
   if (command === 'grant') return await grantCommand(home, invocation.cwd, args)
   if (command === 'profile') return await runProfileCommand(args, home.configuration)
-  return await runEndpointCommand(args, invocation.environment.endpointUrl, home.configuration)
+  if (command === 'endpoint') return await runEndpointCommand(args, invocation.environment.endpointUrl, home.configuration)
+  return await runAllowlistCommand(args, invocation.cwd, home)
 }
 
 function commandSyntax(command: string, args: readonly string[], invocation: RunnerCliInvocation): CommandOutcome | null {
@@ -211,6 +233,10 @@ function commandSyntax(command: string, args: readonly string[], invocation: Run
   }
   if (command === 'endpoint') {
     const message = endpointCommandSyntax(args, invocation.environment.endpointUrl)
+    return message ? usage(message) : null
+  }
+  if (command === 'allowlist') {
+    const message = allowlistCommandSyntax(args, invocation.cwd)
     return message ? usage(message) : null
   }
   return null
@@ -394,6 +420,10 @@ function runnerInfo(version: string) {
 
 function projectRow(project: { projectId: string; repoPath: string; worktreesRoot: string; revision: number }): string {
   return `${project.projectId}\t${project.repoPath}\t${project.worktreesRoot}\t${project.revision}`
+}
+
+function homeSelection(invocation: RunnerCliInvocation) {
+  return { ...(invocation.environment.runnerHome ? { override: invocation.environment.runnerHome } : {}) }
 }
 
 function commandFailure(command: string, args: readonly string[], code: string, detail: string): CommandOutcome {

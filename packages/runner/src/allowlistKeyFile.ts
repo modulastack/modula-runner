@@ -3,6 +3,7 @@ import { constants } from 'node:fs'
 import { link, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import {
+  MAX_ALLOWLIST_BYTES,
   allowlistKeyId,
   generateAllowlistSigningKey,
   type AllowlistSigningKey,
@@ -53,12 +54,28 @@ export async function readAllowlistSigningKeyFile(target: string): Promise<Gener
       throw new Error('allowlist signing key custody is invalid')
     }
     if (info.size > MAX_PRIVATE_KEY_BYTES) throw new Error('allowlist signing key is too large')
-    const privateKey = (await readBounded(handle)).toString('utf8')
+    const privateKey = (await readBounded(handle, MAX_PRIVATE_KEY_BYTES, 'allowlist signing key')).toString('utf8')
     const privateObject = createPrivateKey({ key: privateKey, format: 'pem' })
     if (privateObject.asymmetricKeyType !== 'ed25519') throw new Error('allowlist signing key must use Ed25519')
     const publicKey = createPublicKey(privateObject).export({ type: 'spki', format: 'pem' }).toString()
     const keyId = allowlistKeyId(publicKey)
     return { signingKey: { keyId, privateKey }, trustAnchor: { keyId, publicKey } }
+  } finally {
+    await handle?.close()
+  }
+}
+
+export async function readAllowlistDocumentFile(target: string): Promise<string> {
+  if (typeof target !== 'string' || target.length === 0 || target.length > 4_096 || /[\u0000-\u001f\u007f]/.test(target)) {
+    throw new Error('allowlist document path is invalid')
+  }
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(path.resolve(target), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const info = await handle.stat()
+    if (!info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1) throw new Error('allowlist document custody is invalid')
+    if (info.size > MAX_ALLOWLIST_BYTES) throw new Error('allowlist document is too large')
+    return (await readBounded(handle, MAX_ALLOWLIST_BYTES, 'allowlist document')).toString('utf8')
   } finally {
     await handle?.close()
   }
@@ -84,15 +101,15 @@ async function validatedKeyPath(target: string): Promise<string> {
   return keyPath
 }
 
-async function readBounded(handle: FileHandle): Promise<Buffer> {
-  const buffer = Buffer.alloc(MAX_PRIVATE_KEY_BYTES + 1)
+async function readBounded(handle: FileHandle, limit: number, label: string): Promise<Buffer> {
+  const buffer = Buffer.alloc(limit + 1)
   let offset = 0
   while (offset < buffer.length) {
     const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
     if (bytesRead === 0) break
     offset += bytesRead
   }
-  if (offset > MAX_PRIVATE_KEY_BYTES) throw new Error('allowlist signing key grew past its size limit')
+  if (offset > limit) throw new Error(`${label} grew past its size limit`)
   return buffer.subarray(0, offset)
 }
 

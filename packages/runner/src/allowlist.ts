@@ -101,7 +101,7 @@ export type AllowlistLoad =
   | { status: 'trusted'; policy: CommandPolicy }
   | { status: 'untrusted'; reason: AllowlistRejection }
 
-const MAX_ALLOWLIST_BYTES = 64 * 1024
+export const MAX_ALLOWLIST_BYTES = 64 * 1024
 
 export type LoadAllowlistOptions = {
   path: string

@@ -32,6 +32,10 @@ export function createFileRunnerHome(options: FileRunnerHomeOptions): RunnerHome
       if (opened.status === 'ready') active = home
       return opened
     },
+    async validateSigningKeyPath(selection, signingKeyPath) {
+      const root = selectedRoot(options.defaultRoot, selection)
+      return signingKeyOutsideHome(signingKeyPath, root) ? null : 'state-insecure-mode'
+    },
     async initializePolicy(selection, signingKeyPath, policy) {
       if (active) return { status: 'failed', code: 'state-io-failed' }
       const root = selectedRoot(options.defaultRoot, selection)

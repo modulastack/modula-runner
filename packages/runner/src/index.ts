@@ -61,6 +61,7 @@ export {
 } from './preview.js'
 export {
   DEFAULT_ALLOWLIST_EXECUTABLES,
+  MAX_ALLOWLIST_BYTES,
   allowlistKeyId,
   canonicalAllowlistBytes,
   decodeAllowlistDocument,
@@ -83,6 +84,7 @@ export {
 } from './allowlist.js'
 export {
   createAllowlistSigningKeyFile,
+  readAllowlistDocumentFile,
   readAllowlistSigningKeyFile,
   signingKeyOutsideHome,
 } from './allowlistKeyFile.js'
