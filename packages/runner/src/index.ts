@@ -1,7 +1,7 @@
 export { RunnerClient, type ChannelHandle, type RunnerClientOptions } from './client.js'
 export { ChannelStore, type ChannelState, type NextOutbound, type ReceiveResult } from './channels.js'
 export { backoffDelay, type BackoffOptions } from './backoff.js'
-export { TerminalHost, type TerminalBindingInfo, type TerminalHostOptions } from './terminalHost.js'
+export { TerminalHost, type TerminalBindingInfo, type TerminalExitInfo, type TerminalHostOptions } from './terminalHost.js'
 export {
   DEFAULT_FLOW,
   DEFAULT_REPLAY_LINES,
@@ -13,6 +13,7 @@ export {
 export { hasTmuxSession, killTmuxSession, tmuxSessionName, worktreeSocket, type TmuxRef } from './tmux.js'
 export { provisionWorktree, type WorktreeProvisionRequest, type WorktreeProvisionResult } from './worktrees.js'
 export { createSessionWorktreePort, type SessionWorktreePortOptions } from './sessionWorktrees.js'
+export { createSessionTerminalPorts, type SessionTerminalPorts, type SessionTerminalPortsOptions } from './sessionTerminals.js'
 export {
   PAIRING_FAILURES,
   PairingError,
@@ -235,6 +236,7 @@ export {
   type SessionReceiptStorageReplace,
   type SessionReceiptTombstone,
   type SessionProcessHandle,
+  type SessionProcessIdentity,
   type SessionProcessPort,
   type SessionProcessRequest,
   type SessionProcessStart,

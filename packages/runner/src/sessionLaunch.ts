@@ -263,6 +263,7 @@ export interface SessionChannelPort {
 }
 
 export type SessionProcessRequest = SessionTerminalRequest & { channelId: string }
+export type SessionProcessIdentity = Pick<SessionProcessRequest, 'sessionId' | 'cwd'>
 
 export type SessionProcessHandle = {
   sessionId: string
@@ -276,8 +277,8 @@ export type SessionProcessStart =
 export interface SessionProcessPort {
   start(request: SessionProcessRequest, signal: AbortSignal): Promise<SessionProcessStart>
   adopt(request: SessionProcessRequest, signal: AbortSignal): Promise<SessionProcessStart>
-  inspect(sessionId: string): Promise<'exact' | 'missing' | 'mismatch'>
-  terminate(sessionId: string): Promise<'terminated' | 'missing' | 'uncertain'>
+  inspect(identity: SessionProcessIdentity): Promise<'exact' | 'missing' | 'mismatch'>
+  terminate(identity: SessionProcessIdentity): Promise<'terminated' | 'missing' | 'uncertain'>
 }
 
 export interface SessionIdentifierPort {

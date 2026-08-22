@@ -350,7 +350,7 @@ describe('production session launcher', () => {
     attemptLateStart()
     await Promise.resolve()
     expect(lateSpawned).toBe(false)
-    expect(terminate).toHaveBeenCalledWith('session-1')
+    expect(terminate).toHaveBeenCalledWith({ sessionId: 'session-1', cwd: '/worktrees/lane-01' })
     expect(subject.held.image().receipts[0]?.state).toBe('uncertain')
   })
 
@@ -466,6 +466,123 @@ describe('production session launcher', () => {
     releaseSecondAudit()
     await expect(actions).resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
     expect(close).toHaveBeenCalledWith('channel-1', 'storage-unavailable')
+  })
+
+  it('terminates an owned process when recovery aborts before SESSION_STARTED is durable', async () => {
+    const { sessionId: _sessionId, channelId: _channelId, ...firstBase } = recoveryReceipt()
+    const first: SessionReceipt = {
+      ...firstBase,
+      state: 'provisioned',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z' },
+    }
+    const { sessionId: _otherSessionId, channelId: _otherChannelId, ...secondBase } = recoveryReceipt()
+    const second: SessionReceipt = {
+      ...secondBase,
+      key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      request: { ...request, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      state: 'accepted',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
+      worktree: { phase: 'none' },
+    }
+    let releaseSecondAudit!: () => void
+    const secondAudit = new Promise<void>(resolve => { releaseSecondAudit = resolve })
+    let enterStartedPersistence!: () => void
+    const startedPersistence = new Promise<void>(resolve => { enterStartedPersistence = resolve })
+    let releaseStartedPersistence!: (value: { status: 'updated'; receipt: SessionReceipt }) => void
+    const persisted = new Promise<{ status: 'updated'; receipt: SessionReceipt }>(resolve => { releaseStartedPersistence = resolve })
+    const terminate = vi.fn(async () => 'terminated' as const)
+    const base = options()
+    const subject = options({
+      clock: { now: () => now, sleep: async () => await new Promise<void>(() => undefined) },
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => [first, second],
+        compact: async () => undefined,
+        replace: async (_revision, next) => {
+          if (next.key.requestId === first.key.requestId && next.state === 'started') {
+            enterStartedPersistence()
+            return await persisted
+          }
+          return { status: 'updated', receipt: { ...next, revision: next.revision + 1 } }
+        },
+      },
+      processes: {
+        ...base.value.processes,
+        start: async value => ({ status: 'started', handle: { sessionId: value.sessionId, finished: new Promise(() => undefined) } }),
+        terminate,
+      },
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
+      audit: {
+        append: async record => {
+          if (!('key' in record) || record.key.requestId !== second.key.requestId) return
+          await secondAudit
+          throw new Error('audit unavailable')
+        },
+      },
+    })
+    const actions = collect(createSessionLauncher(subject.value).recover())
+    await startedPersistence
+    releaseSecondAudit()
+    await expect(actions).resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
+    expect(terminate).toHaveBeenCalledWith({ sessionId: 'session-1', cwd: '/worktrees/lane-01' })
+    releaseStartedPersistence({ status: 'updated', receipt: { ...first, revision: first.revision + 2, state: 'started', channelId: 'channel-1', sessionId: 'session-1' } })
+  })
+
+  it('terminates an owned process when recovery aborts between start commitment and handle observation', async () => {
+    const { sessionId: _sessionId, channelId: _channelId, ...firstBase } = recoveryReceipt()
+    const first: SessionReceipt = {
+      ...firstBase,
+      state: 'provisioned',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z' },
+    }
+    const { sessionId: _otherSessionId, channelId: _otherChannelId, ...secondBase } = recoveryReceipt()
+    const second: SessionReceipt = {
+      ...secondBase,
+      key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      request: { ...request, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      state: 'accepted',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
+      worktree: { phase: 'none' },
+    }
+    let releaseSecondAudit!: () => void
+    const secondAudit = new Promise<void>(resolve => { releaseSecondAudit = resolve })
+    let enteredSecondAudit!: () => void
+    const secondAuditEntered = new Promise<void>(resolve => { enteredSecondAudit = resolve })
+    const terminate = vi.fn(async () => 'terminated' as const)
+    const base = options()
+    const subject = options({
+      clock: { now: () => now, sleep: async () => await new Promise<void>(() => undefined) },
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => [first, second],
+        compact: async () => undefined,
+        replace: async (_revision, next) => ({ status: 'updated', receipt: { ...next, revision: next.revision + 1 } }),
+      },
+      processes: {
+        ...base.value.processes,
+        start: async value => {
+          await secondAuditEntered
+          releaseSecondAudit()
+          return { status: 'started', handle: { sessionId: value.sessionId, finished: new Promise(() => undefined) } }
+        },
+        terminate,
+      },
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
+      audit: {
+        append: async record => {
+          if (!('key' in record) || record.key.requestId !== second.key.requestId) return
+          enteredSecondAudit()
+          await secondAudit
+          throw new Error('audit unavailable')
+        },
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([
+      { kind: 'close-job-control', error: 'storage-unavailable' },
+    ])
+    expect(terminate).toHaveBeenCalledWith({ sessionId: 'session-1', cwd: '/worktrees/lane-01' })
   })
 
   it('marks mismatched recovery uncertain without spawn, terminate, or rollback', async () => {

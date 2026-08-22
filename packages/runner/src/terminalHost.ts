@@ -22,6 +22,13 @@ export type TerminalHostOptions = {
   flow?: Partial<FlowPolicy>
   replayLines?: number
   pollMs?: number
+  onSessionExit?: (exit: TerminalExitInfo) => void
+}
+
+export type TerminalExitInfo = {
+  channelId: string
+  exitCode: number | null
+  signal: number | null
 }
 
 export type TerminalBindingInfo = {
@@ -64,9 +71,11 @@ export class TerminalHost {
   private shutdown: Promise<string[]> | undefined
   private readonly policy: SessionPolicy
   private readonly seam: SpawnSeam
+  private readonly onSessionExit: ((exit: TerminalExitInfo) => void) | undefined
 
   constructor(private readonly client: RunnerClient, options: TerminalHostOptions) {
     this.seam = options.seam
+    this.onSessionExit = options.onSessionExit
     this.policy = {
       flow: validatedFlow({ ...DEFAULT_FLOW, ...options.flow }),
       replayLines: validatedLines(options.replayLines ?? DEFAULT_REPLAY_LINES),
@@ -81,12 +90,22 @@ export class TerminalHost {
 
   launch(spec: TerminalLaunchSpec) {
     this.assertOpen()
-    return this.track(this.bind(channel => TerminalSession.launch(spec, this.policy, this.sessionEvents(channel), this.seam)))
+    return this.launchOn(this.client.openChannel('terminal'), spec)
+  }
+
+  launchOn(channel: ChannelHandle, spec: TerminalLaunchSpec) {
+    this.assertOpen()
+    return this.track(this.bind(channel, bound => TerminalSession.launch(spec, this.policy, this.sessionEvents(bound), this.seam)))
   }
 
   adopt(ref: TmuxRef, spec: TerminalAdoptSpec) {
     this.assertOpen()
-    return this.track(this.bind(channel => TerminalSession.adopt(ref, spec, this.policy, this.sessionEvents(channel), this.seam)))
+    return this.adoptOn(this.client.openChannel('terminal'), ref, spec)
+  }
+
+  adoptOn(channel: ChannelHandle, ref: TmuxRef, spec: TerminalAdoptSpec) {
+    this.assertOpen()
+    return this.track(this.bind(channel, bound => TerminalSession.adopt(ref, spec, this.policy, this.sessionEvents(bound), this.seam)))
   }
 
   // Starting a session while the host is killing them would race the shutdown
@@ -158,14 +177,22 @@ export class TerminalHost {
 
   // Release the viewer path without touching the session: the tmux session keeps
   // running for a later adopt, exactly like a runner restart would leave it.
-  detach(channelId: string) {
+  detach(channelId: string, retainSupervision = false) {
     const binding = this.bindings.get(channelId)
     if (!binding) return
+    if (retainSupervision) {
+      this.pendingRelease.add(channelId)
+      try {
+        binding.channel.close('detached')
+      } catch {}
+      return
+    }
     // A kill in flight or unconfirmed outranks a detach: stopping the watcher
     // here would strand a possibly-live command, exactly as it would in
     // releaseBinding. Keep it observed until the session actually ends.
     if (binding.session.needsSupervision()) this.pendingRelease.add(channelId)
     else {
+      this.pendingRelease.delete(channelId)
       this.bindings.delete(channelId)
       void binding.session.dispose(false)
     }
@@ -174,8 +201,7 @@ export class TerminalHost {
     } catch {}
   }
 
-  private async bind(create: (channel: ChannelHandle) => Promise<TerminalSession>) {
-    const channel = this.client.openChannel('terminal')
+  private async bind(channel: ChannelHandle, create: (channel: ChannelHandle) => Promise<TerminalSession>) {
     this.pending.add(channel.id)
     try {
       const session = await create(channel)
@@ -219,8 +245,19 @@ export class TerminalHost {
 
   private sessionEvents(channel: ChannelHandle): TerminalSessionEvents {
     return {
-      send: message => this.deliver(channel, message),
+      send: message => {
+        this.deliver(channel, message)
+        if (message.type === 'EXIT') this.reportExit(channel.id, message)
+      },
       onExited: () => this.finishBinding(channel.id),
+    }
+  }
+
+  private reportExit(channelId: string, message: Extract<TerminalServerMessage, { type: 'EXIT' }>) {
+    try {
+      this.onSessionExit?.({ channelId, exitCode: message.exitCode, signal: message.signal })
+    } catch {
+      // A lifecycle observer cannot take down terminal delivery; shutdown still supervises the pane.
     }
   }
 
@@ -263,6 +300,7 @@ export class TerminalHost {
     }
     const binding = this.bindings.get(channelId)
     if (!binding) return
+    if (this.pendingRelease.has(channelId)) return
     // A session whose kill is still in flight, or whose kill could not be
     // confirmed, stays bound and observed: disposing it here would stop the
     // watcher on a command that may still be running and remove the entry the

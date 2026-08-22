@@ -252,7 +252,7 @@ async function* recoverProcess(
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return
   }
-  const inspected = await safe(() => options.processes.inspect(sessionId))
+  const inspected = await safe(() => options.processes.inspect({ sessionId, cwd: worktree.resolvedCwdPath }))
   if (recoverySignal.aborted) return
   if (!inspected.ok || inspected.value !== 'exact') {
     yield await fail(options, startingReceipt, 'recovery-uncertain')
@@ -566,18 +566,29 @@ async function* startProvisioned(
   }
   receipt = correlated
   const plan: LaunchPlan = freshAccess.value.plan
+  const processRequest = {
+    requestId: receipt.request.requestId,
+    sessionId,
+    channelId,
+    terminalProfile: receipt.request.terminalProfile,
+    cwd: worktree.resolvedCwdPath,
+    plan,
+  }
   const stopClosingOnAbort = closeChannelOnAbort(options, channelId, parentSignal)
+  let stopTerminatingOnAbort: () => void = () => undefined
+  const releasePreStartGuards = () => {
+    stopClosingOnAbort()
+    stopTerminatingOnAbort()
+  }
   try {
-    const started = await timed(options, LAUNCH_PROGRESS_MS, signal => options.processes.start({
-      requestId: receipt.request.requestId,
-      sessionId,
-      channelId,
-      terminalProfile: receipt.request.terminalProfile,
-      cwd: worktree.resolvedCwdPath,
-      plan,
-    }, signal), parentSignal)
+    const started = await timed(options, LAUNCH_PROGRESS_MS, signal => options.processes.start(processRequest, signal), parentSignal)
     if (!started.ok) {
-      const reason = await compensateProcess(options, sessionId, channelId, started.timeout ? 'launch-timeout' : 'spawn-failed')
+      const reason = await compensateProcess(
+        options,
+        { sessionId: processRequest.sessionId, cwd: processRequest.cwd },
+        channelId,
+        started.timeout ? 'launch-timeout' : 'spawn-failed',
+      )
       yield await fail(options, receipt, reason)
       return
     }
@@ -587,9 +598,14 @@ async function* startProvisioned(
       yield await fail(options, receipt, closed.ok ? reason : 'recovery-uncertain')
       return
     }
-    yield* publishStarted(options, receipt, worktree, channelId, sessionId, started.value.handle, parentSignal, stopClosingOnAbort)
+    stopTerminatingOnAbort = terminateProcessOnAbort(
+      options,
+      { sessionId: processRequest.sessionId, cwd: processRequest.cwd },
+      parentSignal,
+    )
+    yield* publishStarted(options, receipt, worktree, channelId, sessionId, started.value.handle, parentSignal, releasePreStartGuards)
   } finally {
-    stopClosingOnAbort()
+    releasePreStartGuards()
   }
 }
 
@@ -637,11 +653,11 @@ async function* publishStarted(
 
 async function compensateProcess(
   options: SessionLauncherOptions,
-  sessionId: string,
+  identity: { sessionId: string; cwd: string },
   channelId: string,
   definiteReason: Extract<SessionFailureReason, 'launch-timeout' | 'spawn-failed'>,
 ): Promise<SessionFailureReason> {
-  const termination = await safe(() => options.processes.terminate(sessionId))
+  const termination = await safe(() => options.processes.terminate(identity))
   const closed = await safe(() => options.channels.close(channelId, definiteReason))
   if (!termination.ok || termination.value === 'uncertain' || !closed.ok) return 'recovery-uncertain'
   return definiteReason
@@ -770,6 +786,17 @@ function closeChannelOnAbort(
   if (signal?.aborted) close()
   else signal?.addEventListener('abort', close, { once: true })
   return () => signal?.removeEventListener('abort', close)
+}
+
+function terminateProcessOnAbort(
+  options: SessionLauncherOptions,
+  identity: { sessionId: string; cwd: string },
+  signal?: AbortSignal,
+): () => void {
+  const terminate = () => { void safe(() => options.processes.terminate(identity)) }
+  if (signal?.aborted) terminate()
+  else signal?.addEventListener('abort', terminate, { once: true })
+  return () => signal?.removeEventListener('abort', terminate)
 }
 
 async function auditTombstone(options: SessionLauncherOptions, tombstone: SessionReceiptTombstone): Promise<boolean> {
