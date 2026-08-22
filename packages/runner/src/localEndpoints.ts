@@ -168,12 +168,14 @@ function assertEndpointConfig(config: LocalEndpointConfig) {
 
 function inventoryUrl(config: LocalEndpointConfig): URL | null {
   const path = INVENTORY_PATHS[config.kind]
-  if (path === undefined) return null
+  if (path === undefined || typeof config.baseUrl !== 'string' || config.baseUrl.length > 2_048 || hasControlCharacter(config.baseUrl)) return null
+  if (config.baseUrl.includes('?') || config.baseUrl.includes('#')) return null
   try {
+    const base = new URL(config.baseUrl)
+    if ((base.protocol !== 'http:' && base.protocol !== 'https:') || base.username || base.password || base.search || base.hash) return null
     // Concatenated rather than resolved: a base URL carrying a path prefix is part of the
     // address the operator configured, and resolving an absolute path would discard it.
-    const url = new URL(`${String(config.baseUrl).replace(/\/+$/, '')}${path}`)
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null
+    return new URL(`${config.baseUrl.replace(/\/+$/, '')}${path}`)
   } catch {
     return null
   }

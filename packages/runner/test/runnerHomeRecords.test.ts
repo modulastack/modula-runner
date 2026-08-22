@@ -125,13 +125,20 @@ describe('runner-home logical records', () => {
       keys: createMemoryApiKeyStore(),
     })).resolves.toEqual({ status: 'failed', code: 'config-duplicate' })
 
-    const incomplete = memoryStorage({ policy: signedPolicy(), configuration: { revision: 1, profiles: [{}], endpoints: [] } })
-    await expect(openRunnerHomeRecords({
-      storage: incomplete.storage,
-      clock,
-      pairing: pairingStore(),
-      keys: createMemoryApiKeyStore(),
-    })).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
+    const invalidConfigurations = [
+      { revision: 1, profiles: [{}], endpoints: [] },
+      { revision: 1, profiles: [{ modelProfileId: 'keyed', runtime: 'claude', access: 'api-key' }], endpoints: [] },
+      { revision: 1, profiles: [], endpoints: [{ endpointId: 'lab', kind: 'openai-compatible', baseUrl: 'https://user:secret@example.test' }] },
+    ]
+    for (const configuration of invalidConfigurations) {
+      const incomplete = memoryStorage({ policy: signedPolicy(), configuration })
+      await expect(openRunnerHomeRecords({
+        storage: incomplete.storage,
+        clock,
+        pairing: pairingStore(),
+        keys: createMemoryApiKeyStore(),
+      })).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
+    }
   })
 
   it('rejects access-mode profiles that omit required local bindings', async () => {

@@ -122,6 +122,7 @@ function validateConfiguration(value: unknown, keys: ApiKeyStore): RunnerLocalCo
   const profileIds = profiles.map(profile => profile.modelProfileId)
   const endpointIds = endpoints.map(endpoint => endpoint.endpointId)
   if (!profileIds.every(id => typeof id === 'string') || !endpointIds.every(id => typeof id === 'string')) invalidConfiguration()
+  if (!profiles.every(isCompleteLocalModelProfile)) invalidConfiguration()
   if (duplicated(profileIds) || duplicated(endpointIds)) {
     throw new HomeRecordError('config-duplicate')
   }

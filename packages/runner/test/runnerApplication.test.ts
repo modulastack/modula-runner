@@ -12,7 +12,9 @@ import {
   type PairingContractService,
   type RunnerApplicationOptions,
   type RunnerHome,
+  type RunnerConfigurationStore,
   type RunnerHomeState,
+  type RunnerLocalConfiguration,
   type RunnerRuntimePort,
 } from '../src/index.js'
 
@@ -88,7 +90,10 @@ function application(
   return { value: createRunnerApplication(options), open, close }
 }
 
-function invocation(args: string[], options: { tty?: boolean; hidden?: string; cwd?: string; runnerHome?: string } = {}) {
+function invocation(
+  args: string[],
+  options: { tty?: boolean; hidden?: string; cwd?: string; runnerHome?: string; endpointUrl?: string } = {},
+) {
   const stdout: string[] = []
   const stderr: string[] = []
   const readHidden = vi.fn(async () => options.hidden ?? '')
@@ -96,7 +101,10 @@ function invocation(args: string[], options: { tty?: boolean; hidden?: string; c
     value: {
       args,
       cwd: options.cwd ?? '/tmp',
-      environment: { ...(options.runnerHome ? { runnerHome: options.runnerHome } : {}) },
+      environment: {
+        ...(options.runnerHome ? { runnerHome: options.runnerHome } : {}),
+        ...(options.endpointUrl ? { endpointUrl: options.endpointUrl } : {}),
+      },
       io: {
         inputIsTTY: options.tty ?? false,
         readHidden,
@@ -238,6 +246,25 @@ describe('core runner application commands', () => {
     await expect(app.value.execute(unsafe.value)).resolves.toBe(1)
     expect(unsafe.stdout).toEqual([])
     expect(unsafe.stderr.join('')).not.toContain(unsafeCwd)
+  })
+
+  it('routes profile and environment-only endpoint mutations through complete configuration CAS', async () => {
+    let configuration: RunnerLocalConfiguration = { revision: 1, profiles: [], endpoints: [] }
+    const store: RunnerConfigurationStore = {
+      snapshot: async () => structuredClone(configuration),
+      replace: async (revision, candidate) => {
+        if (revision !== configuration.revision) return { status: 'conflict' as const, current: structuredClone(configuration) }
+        configuration = { ...structuredClone(candidate), revision: revision + 1 }
+        return { status: 'updated' as const, configuration: structuredClone(configuration) }
+      },
+    }
+    const app = application(pairing(), projectRegistry(), { configuration: store })
+    const profile = invocation(['profile', 'add', 'daily', '--runtime', 'claude', '--access', 'subscription'])
+    await expect(app.value.execute(profile.value)).resolves.toBe(0)
+    const endpoint = invocation(['endpoint', 'add', 'lab', '--kind', 'openai-compatible'], { endpointUrl: 'http://127.0.0.1:8000' })
+    await expect(app.value.execute(endpoint.value)).resolves.toBe(0)
+    expect(endpoint.stdout.join('')).not.toContain('127.0.0.1')
+    expect(configuration).toMatchObject({ revision: 3, profiles: [{ modelProfileId: 'daily' }], endpoints: [{ endpointId: 'lab' }] })
   })
 
   it('uses stable home failure codes and closes state before emitting success', async () => {

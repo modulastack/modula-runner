@@ -164,6 +164,7 @@ export {
   AccessResolver,
   accessRefusalGuidance,
   isAccessRefusal,
+  isCompleteLocalModelProfile,
   type AccessRefusal,
   type AccessResolution,
   type AccessResolverOptions,

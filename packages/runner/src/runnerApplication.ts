@@ -12,6 +12,12 @@ import {
   type CommandResult,
 } from './cli.js'
 import { PairingContractError, type PairingContractService } from './pairingContract.js'
+import {
+  endpointCommandSyntax,
+  profileCommandSyntax,
+  runEndpointCommand,
+  runProfileCommand,
+} from './runnerConfigurationCommands.js'
 import { assertProviderName } from './apiKeys.js'
 import type { RunnerClock } from './runtimeClock.js'
 import type { RunnerHome, RunnerHomeFailure, RunnerHomeState } from './runnerHome.js'
@@ -134,7 +140,7 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
   if (command === '--help' || command === 'help') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: helpText() })
   if (command === '--version' || command === 'version') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: options.version })
   if (!command) return emit(invocation.io, usage())
-  if (!['pair', 'status', 'project', 'key', 'grant'].includes(command)) {
+  if (!['pair', 'status', 'project', 'key', 'grant', 'profile', 'endpoint'].includes(command)) {
     if ((RUNNER_TOP_LEVEL_COMMANDS as readonly string[]).includes(command)) throw new RunnerApplicationNotImplementedError()
     return emit(invocation.io, usage())
   }
@@ -181,7 +187,9 @@ async function runOpened(
   if (command === 'status') return await statusCommand(options.composition.pairing(home), args[0] === '--json')
   if (command === 'project') return await projectCommand(home, invocation.cwd, args)
   if (command === 'key') return await keyCommand(home, invocation, args)
-  return await grantCommand(home, invocation.cwd, args)
+  if (command === 'grant') return await grantCommand(home, invocation.cwd, args)
+  if (command === 'profile') return await runProfileCommand(args, home.configuration)
+  return await runEndpointCommand(args, invocation.environment.endpointUrl, home.configuration)
 }
 
 function commandSyntax(command: string, args: readonly string[], invocation: RunnerCliInvocation): CommandOutcome | null {
@@ -197,6 +205,14 @@ function commandSyntax(command: string, args: readonly string[], invocation: Run
   }
   if (command === 'key') return keySyntax(args, invocation)
   if (command === 'grant') return grantSyntax(args)
+  if (command === 'profile') {
+    const message = profileCommandSyntax(args)
+    return message ? usage(message) : null
+  }
+  if (command === 'endpoint') {
+    const message = endpointCommandSyntax(args, invocation.environment.endpointUrl)
+    return message ? usage(message) : null
+  }
   return null
 }
 
