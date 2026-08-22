@@ -128,7 +128,7 @@ export function recordLaunchScenarioEvidence(
   if (scenario.fixture.includes('known-started') && hasStartedCorrelation(observed.actions, evidence, false, request.requestId)) {
     record('action.started:stable-correlation')
   }
-  if (scenario.fixture === 'recover-exact-session' && hasNewChannelStableSession(observed.actions, evidence, request.requestId)) {
+  if (scenario.fixture.startsWith('recover-exact-session') && hasNewChannelStableSession(observed.actions, evidence, request.requestId)) {
     record('action.started:new-channel+stable-session')
   }
   if (scenario.fixture === 'refusal-vocabulary' && hasOnlyClosedReasons(observed.actions)) record('action.refusal-vocabulary:closed')

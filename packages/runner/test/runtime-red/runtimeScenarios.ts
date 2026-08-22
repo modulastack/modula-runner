@@ -244,7 +244,22 @@ add(
     ['terminal.sequence:replay-next-contiguous', 'channel.close:after-exit-replay'],
   ],
 )
-add('G1-C12', 'terminal-host', 'terminal-resume', 'terminal:resumed', ['terminal.resume:same-channel+token+sequence'], ['terminal.replacement'])
+add(
+  'G1-C12',
+  'terminal-host',
+  'terminal-resume',
+  'terminal:resumed',
+  [
+    'terminal.sequence:pre-disconnect-high-water:',
+    'terminal.sequence:post-reconnect:',
+    'terminal.resume:same-channel+token+sequence',
+  ],
+  ['terminal.replacement'],
+  [
+    ['terminal.sequence:pre-disconnect-high-water:', 'terminal.sequence:post-reconnect:'],
+    ['terminal.sequence:post-reconnect:', 'terminal.resume:same-channel+token+sequence'],
+  ],
+)
 add(
   'G1-C13',
   'terminal-host',
@@ -252,6 +267,7 @@ add(
   'terminal:reset',
   [
     'terminal.sequence:pre-disconnect-high-water:',
+    'terminal.sequence:reset:',
     'terminal.reset:forward-only',
     'terminal.reset:watermark-advances-pre-disconnect',
     'terminal.post-reset:all-advance',
@@ -259,7 +275,8 @@ add(
   ],
   [],
   [
-    ['terminal.sequence:pre-disconnect-high-water:', 'terminal.reset:watermark-advances-pre-disconnect'],
+    ['terminal.sequence:pre-disconnect-high-water:', 'terminal.sequence:reset:'],
+    ['terminal.sequence:reset:', 'terminal.reset:watermark-advances-pre-disconnect'],
     ['terminal.reset:watermark-advances-pre-disconnect', 'terminal.post-reset:all-advance'],
   ],
 )

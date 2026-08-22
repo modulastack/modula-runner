@@ -163,6 +163,7 @@ async function observeReset(
   await until(() => restarted.resets.some(entry => entry.channel === info.channelId), 10_000)
   const reset = restarted.resets.find(entry => entry.channel === info.channelId)
   if (!reset || reset.seq <= highestBeforeDisconnect) throw new Error('terminal RESET did not advance past the pre-disconnect watermark')
+  recorder.record(`terminal.sequence:reset:[${reset.seq}]`)
   recorder.record('terminal.reset:forward-only')
   recorder.record('terminal.reset:watermark-advances-pre-disconnect')
   await until(() => postResetFramesAdvance(restarted, info.channelId, reset.seq, highestBeforeDisconnect), 10_000)

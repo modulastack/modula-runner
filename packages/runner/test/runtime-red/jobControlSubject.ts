@@ -2,6 +2,7 @@ import type { Payload, SessionStartMessage } from '@modulastack/runner-protocol'
 import {
   SessionJobControlNotImplementedError,
   createSessionJobControl,
+  type SessionJobControlContext,
   type SessionJobControlEffect,
   type SessionJobControlPhase,
   type SessionLaunchAction,
@@ -52,6 +53,154 @@ export async function observeJobControlScenario(scenario: RuntimeScenario): Prom
   }
 }
 
+export async function observeJobControlOverflowProbe(
+  stream: 'dispatch' | 'recovery',
+): Promise<RuntimeObservation> {
+  const recorder = createRecorder()
+  const request = validRequest('G1-R08')
+  const producer = createPacedOverflowProducer(request.requestId)
+  const launcher: SessionLauncher = {
+    handle() {
+      return producer.values
+    },
+    recover() {
+      return producer.values
+    },
+  }
+  const context: SessionJobControlContext = {
+    connectionId: 'connection-overflow',
+    channelId: 'job-control-overflow',
+    phase: 'active',
+    selectedProtocolVersion: 2,
+  }
+  const subject = createSessionJobControl({ launcher })
+  const effects = stream === 'dispatch'
+    ? subject.dispatch({ context, payload: json(request) })
+    : subject.recover(context)
+  const iterator = effects[Symbol.asyncIterator]()
+  try {
+    const first = await iterator.next()
+    if (first.done) {
+      return { status: 'observed', subject: 'job-control', result: 'job-control:overflow-accepted', events: recorder.events, output: recorder.output }
+    }
+    const collected = collectionResult(collectJobControlEffects(withFirstEffect(first.value, iterator)))
+    await driveOverflowToNinth(producer)
+    const outcome = await collected
+    if (outcome.status === 'accepted') {
+      return { status: 'observed', subject: 'job-control', result: 'job-control:overflow-accepted', events: recorder.events, output: recorder.output }
+    }
+    if (!(outcome.error instanceof Error) || !outcome.error.message.includes('maximum is 8')) throw outcome.error
+    recorder.record(`overflow.${stream}:yielded:${producer.yielded()}`)
+    if (producer.closed()) recorder.record(`overflow.${stream}:producer-closed`)
+    return {
+      status: 'observed',
+      subject: 'job-control',
+      result: producer.closed() ? 'job-control:overflow-rejected' : 'job-control:overflow-unterminated',
+      events: recorder.events,
+      output: recorder.output,
+    }
+  } catch (error) {
+    if (error instanceof SessionJobControlNotImplementedError) {
+      return { status: 'missing-production-runtime', subject: 'job-control', error: error.name }
+    }
+    throw error
+  } finally {
+    producer.stop()
+    if (producer.yielded() > 0) await waitFor(() => producer.closed())
+  }
+}
+
+async function* withFirstEffect(
+  first: SessionJobControlEffect,
+  rest: AsyncIterator<SessionJobControlEffect>,
+): AsyncGenerator<SessionJobControlEffect> {
+  let complete = false
+  try {
+    yield first
+    for (;;) {
+      const next = await rest.next()
+      if (next.done) {
+        complete = true
+        return
+      }
+      yield next.value
+    }
+  } finally {
+    if (!complete) await rest.return?.()
+  }
+}
+
+type OverflowCollection =
+  | { status: 'accepted' }
+  | { status: 'rejected'; error: unknown }
+
+function collectionResult(values: Promise<SessionJobControlEffect[]>): Promise<OverflowCollection> {
+  return values.then(
+    () => ({ status: 'accepted' }),
+    error => ({ status: 'rejected', error }),
+  )
+}
+
+type PacedOverflowProducer = {
+  values: AsyncIterable<SessionLaunchAction>
+  yielded: () => number
+  closed: () => boolean
+  waiting: () => boolean
+  advance: () => void
+  stop: () => void
+}
+
+function createPacedOverflowProducer(requestId: string): PacedOverflowProducer {
+  let count = 0
+  let didClose = false
+  let stopped = false
+  let release: (() => void) | undefined
+  const waitForAdvance = () => new Promise<void>(resolve => { release = resolve })
+  async function* values(): AsyncGenerator<SessionLaunchAction> {
+    try {
+      while (!stopped) {
+        count += 1
+        yield { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId } }
+        await waitForAdvance()
+      }
+    } finally {
+      didClose = true
+    }
+  }
+  const advance = () => {
+    const next = release
+    release = undefined
+    next?.()
+  }
+  return {
+    values: values(),
+    yielded: () => count,
+    closed: () => didClose,
+    waiting: () => release !== undefined,
+    advance,
+    stop: () => {
+      stopped = true
+      advance()
+    },
+  }
+}
+
+async function driveOverflowToNinth(producer: PacedOverflowProducer): Promise<void> {
+  for (let expected = 1; expected < 9; expected += 1) {
+    await waitFor(() => producer.yielded() === expected && producer.waiting())
+    producer.advance()
+  }
+  await waitFor(() => producer.yielded() === 9)
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('overflow probe timed out')
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+}
+
 function jobControlInput(scenario: RuntimeScenario) {
   const channelId = `job-control-${scenario.obligationId.toLowerCase()}`
   const phase: SessionJobControlPhase = scenario.fixture === 'pre-welcome-session'
@@ -64,6 +213,7 @@ function jobControlInput(scenario: RuntimeScenario) {
       channelId,
       phase,
       selectedProtocolVersion,
+      authenticatedBindingId: runtimeRedBindingId,
     },
     payload: jobControlPayloadForScenario(scenario),
   }
