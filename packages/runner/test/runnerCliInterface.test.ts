@@ -4,7 +4,6 @@ import {
   RUNNER_HOME_FAILURES,
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
-  SessionLaunchNotImplementedError,
   SessionReceiptStorageUnavailableError,
   createPairingContractService,
   createRunnerApplication,
@@ -127,7 +126,7 @@ describe('G2 runner CLI composition interface', () => {
 
   it('exposes launch and negotiated job-control ports without activating protocol v2', async () => {
     const launcher = createSessionLauncher(sessionOptions)
-    await expect(next(launcher.recover())).rejects.toBeInstanceOf(SessionLaunchNotImplementedError)
+    await expect(next(launcher.recover())).resolves.toEqual({ value: undefined, done: true })
     const jobControl = createSessionJobControl({ launcher, audit: { append: async () => undefined }, clock })
     await expect(next(jobControl.dispatch({
       context: {

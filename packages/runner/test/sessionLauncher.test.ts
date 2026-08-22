@@ -130,6 +130,49 @@ function trackWorktreeConcurrency(worktrees: SessionLauncherOptions['worktrees']
   return { worktrees: { ...worktrees, prepare }, maximum: () => maximum }
 }
 
+function recoveryReceipt(): SessionReceipt {
+  return {
+    schemaVersion: 1,
+    revision: 3,
+    key: { bindingId: request.bindingId, requestId: request.requestId },
+    fingerprint: sessionStartFingerprint(request),
+    request,
+    state: 'spawn-intent',
+    phaseTimestamps: {
+      accepted: '2026-08-21T00:00:00Z',
+      provisioned: '2026-08-21T00:00:01Z',
+      'spawn-intent': '2026-08-21T00:00:02Z',
+    },
+    project,
+    worktree: {
+      phase: 'verified', ownership: 'created', branch: 'feat/lane-01', branchRef: 'refs/heads/feat/lane-01',
+      baseBranch: 'main', headCommit: 'a'.repeat(40), expectedBaseCommit: 'a'.repeat(40), gitCommonDir: '/repos/modulastack/.git',
+      worktreePath: '/worktrees/lane-01', worktreeIdentity: { device: '8', inode: '101' },
+      worktreeGitDir: '/repos/modulastack/.git/worktrees/lane-01', gitEntryIdentity: { device: '8', inode: '102' },
+      relativeCwd: '.', resolvedCwdPath: '/worktrees/lane-01', resolvedCwdIdentity: { device: '8', inode: '101' }, clean: true,
+    },
+    sessionId: 'session-stable',
+    channelId: 'channel-old',
+  }
+}
+
+function recoveryReceipts(receipt: SessionReceipt) {
+  let current = structuredClone(receipt)
+  return {
+    value: {
+      lookup: async () => ({ status: 'receipt' as const, receipt: structuredClone(current) }),
+      claim: async () => ({ status: 'known' as const, value: structuredClone(current) }),
+      replace: async (_revision: number, next: SessionReceipt) => {
+        current = { ...structuredClone(next), revision: next.revision + 1 }
+        return { status: 'updated' as const, receipt: structuredClone(current) }
+      },
+      recover: async () => [structuredClone(current)],
+      compact: async () => undefined,
+    },
+    current: () => structuredClone(current),
+  }
+}
+
 async function collect(values: AsyncIterable<SessionLaunchAction>) {
   const actions: SessionLaunchAction[] = []
   for await (const action of values) actions.push(action)
@@ -309,6 +352,140 @@ describe('production session launcher', () => {
     expect(lateSpawned).toBe(false)
     expect(terminate).toHaveBeenCalledWith('session-1')
     expect(subject.held.image().receipts[0]?.state).toBe('uncertain')
+  })
+
+  it('adopts only an exact surviving session under its stable id and a new channel', async () => {
+    const held = recoveryReceipts(recoveryReceipt())
+    const adopt = vi.fn(async value => ({
+      status: 'started' as const,
+      handle: { sessionId: value.sessionId, finished: Promise.resolve({ exitCode: 0, signal: null }) },
+    }))
+    const base = options()
+    const subject = options({
+      receipts: held.value,
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
+      processes: { ...base.value.processes, inspect: async () => 'exact', adopt },
+    })
+    const actions = await collect(createSessionLauncher(subject.value).recover())
+    expect(actions[0]).toEqual({
+      kind: 'message', message: { type: 'SESSION_STARTED', requestId: request.requestId, channelId: 'channel-1', sessionId: 'session-stable' },
+    })
+    expect(actions.at(-1)).toMatchObject({ kind: 'message', message: { type: 'SESSION_FINISHED' } })
+    expect(adopt).toHaveBeenCalledOnce()
+    expect(held.current()).toMatchObject({ state: 'finished', sessionId: 'session-stable', channelId: 'channel-1' })
+  })
+
+  it('closes a pre-start recovery channel when another recovery stream aborts the job control', async () => {
+    const first = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, ...secondBase } = recoveryReceipt()
+    const second: SessionReceipt = {
+      ...secondBase,
+      key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      request: { ...request, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      state: 'accepted',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
+      worktree: { phase: 'none' },
+    }
+    let persist!: (value: { status: 'updated'; receipt: SessionReceipt }) => void
+    const persisted = new Promise<{ status: 'updated'; receipt: SessionReceipt }>(resolve => { persist = resolve })
+    let releaseSecondAudit!: () => void
+    const secondAudit = new Promise<void>(resolve => { releaseSecondAudit = resolve })
+    let opened!: () => void
+    const firstOpened = new Promise<void>(resolve => { opened = resolve })
+    const close = vi.fn(async () => undefined)
+    const base = options()
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => [first, second],
+        compact: async () => undefined,
+        replace: async (_revision, next) => {
+          if (next.key.requestId === first.key.requestId && next.channelId === 'channel-1') return await persisted
+          return { status: 'storage-unavailable' }
+        },
+      },
+      channels: { open: async () => { opened(); return { status: 'opened', channelId: 'channel-1' } }, close },
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
+      audit: {
+        append: async record => {
+          if (!('key' in record) || record.key.requestId !== second.key.requestId) return
+          await secondAudit
+          throw new Error('audit unavailable')
+        },
+      },
+    })
+    const actions = collect(createSessionLauncher(subject.value).recover())
+    await firstOpened
+    releaseSecondAudit()
+    await expect(actions).resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
+    persist({ status: 'updated', receipt: { ...first, revision: first.revision + 1, channelId: 'channel-1' } })
+    await Promise.resolve()
+    expect(close).toHaveBeenCalledWith('channel-1', 'storage-unavailable')
+  })
+
+  it('closes a correlated channel when recovery aborts while process start is pending', async () => {
+    const first = recoveryReceipt()
+    const { sessionId: _sessionId, channelId: _channelId, ...secondBase } = recoveryReceipt()
+    const second: SessionReceipt = {
+      ...secondBase,
+      key: { bindingId: request.bindingId, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      request: { ...request, requestId: '223e4567-e89b-42d3-a456-426614174002' },
+      state: 'accepted',
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
+      worktree: { phase: 'none' },
+    }
+    let releaseSecondAudit!: () => void
+    const secondAudit = new Promise<void>(resolve => { releaseSecondAudit = resolve })
+    let started!: () => void
+    const firstStarted = new Promise<void>(resolve => { started = resolve })
+    const close = vi.fn(async () => undefined)
+    const base = options()
+    const subject = options({
+      clock: { now: () => now, sleep: async () => await new Promise<void>(() => undefined) },
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => [first, second],
+        compact: async () => undefined,
+        replace: async (_revision, next) => ({ status: 'updated', receipt: { ...next, revision: next.revision + 1 } }),
+      },
+      channels: { open: async () => ({ status: 'opened', channelId: 'channel-1' }), close },
+      processes: { ...base.value.processes, adopt: async () => { started(); return await new Promise(() => undefined) } },
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact' },
+      audit: {
+        append: async record => {
+          if (!('key' in record) || record.key.requestId !== second.key.requestId) return
+          await secondAudit
+          throw new Error('audit unavailable')
+        },
+      },
+    })
+    const actions = collect(createSessionLauncher(subject.value).recover())
+    await firstStarted
+    releaseSecondAudit()
+    await expect(actions).resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
+    expect(close).toHaveBeenCalledWith('channel-1', 'storage-unavailable')
+  })
+
+  it('marks mismatched recovery uncertain without spawn, terminate, or rollback', async () => {
+    const held = recoveryReceipts(recoveryReceipt())
+    const adopt = vi.fn(async () => { throw new Error('must not adopt') })
+    const terminate = vi.fn(async () => 'terminated' as const)
+    const rollback = vi.fn(async () => 'rolled-back' as const)
+    const base = options()
+    const subject = options({
+      receipts: held.value,
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact', rollback },
+      processes: { ...base.value.processes, inspect: async () => 'mismatch', adopt, terminate },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_FAILED', requestId: request.requestId, reason: 'recovery-uncertain' },
+    }])
+    expect(adopt).not.toHaveBeenCalled()
+    expect(terminate).not.toHaveBeenCalled()
+    expect(rollback).not.toHaveBeenCalled()
+    expect(held.current().state).toBe('uncertain')
   })
 
   it('refuses binding mismatch before receipt lookup or process work', async () => {

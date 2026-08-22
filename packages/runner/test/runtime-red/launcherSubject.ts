@@ -233,7 +233,7 @@ export async function observeLauncherScenario(scenario: RuntimeScenario): Promis
         return { status: 'ready', snapshot: verifiedSnapshot(snapshot.ownership) }
       },
       async inspect() {
-        const result = scenario.fixture.includes('mismatch') ? 'mismatch' : 'exact'
+        const result = scenario.fixture === 'recover-worktree-mismatch' ? 'mismatch' : 'exact'
         recorder.record(`worktree.inspect:${result}`)
         return result
       },
