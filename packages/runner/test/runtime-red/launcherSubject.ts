@@ -259,6 +259,20 @@ export async function observeLauncherScenario(scenario: RuntimeScenario): Promis
         recorder.record('channel.close')
       },
     },
+    recoveryChannels: {
+      async open() {
+        return { status: 'opened', channelId: 'unexpected-recovery-channel' }
+      },
+      async close() {},
+      async status(channelId, generation) {
+        return channelId === 'channel-old' && generation === 1 ? recoveryChannelLifecycle(scenario) : 'unknown'
+      },
+      async closeExact(channelId, generation) {
+        if (channelId === 'channel-old' && generation === 1) return recoveryChannelLifecycle(scenario)
+        recorder.record('channel.close')
+        return 'closed'
+      },
+    },
     processes: {
       async start(request) {
         processStarts += 1
@@ -539,9 +553,14 @@ function recoveryReceipts(scenario: RuntimeScenario, request: SessionStartMessag
     state: 'spawn-intent',
     phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z', 'spawn-intent': '2026-08-21T00:00:02Z' },
     sessionId: 'session-stable',
+    channel: { generation: 1, lifecycle: recoveryChannelLifecycle(scenario), channelId: 'channel-old' },
     channelId: 'channel-old',
     worktree: verifiedSnapshot('created'),
   }]
+}
+
+function recoveryChannelLifecycle(scenario: RuntimeScenario): 'closed' | 'lost' {
+  return scenario.fixture === 'recover-session-mismatch' ? 'lost' : 'closed'
 }
 
 function accessReason(fixture: string) {
