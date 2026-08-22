@@ -177,7 +177,7 @@ async function* recoverReceipt(
 async function* recoverProvisioning(
   options: SessionLauncherOptions,
   startingReceipt: SessionReceipt,
-  _project: LocalProjectRecord,
+  project: LocalProjectRecord,
   recoverySignal: AbortSignal,
 ): AsyncGenerator<SessionLaunchAction> {
   if (recoverySignal.aborted) return
@@ -188,7 +188,7 @@ async function* recoverProvisioning(
     const registered = await timed(
       options,
       LAUNCH_PROGRESS_MS,
-      operationSignal => options.worktrees.register(branch, operationSignal),
+      operationSignal => options.worktrees.register(branch, project, receipt.request.target, operationSignal),
       recoverySignal,
     )
     if (!registered.ok) {
@@ -463,7 +463,12 @@ async function* continueLaunchInLane(
   receipt = preparedReceipt
   if (snapshot.phase === 'branch-created') {
     const branch = snapshot
-    const registered = await timed(options, LAUNCH_PROGRESS_MS, signal => options.worktrees.register(branch, signal), parentSignal)
+    const registered = await timed(
+      options,
+      LAUNCH_PROGRESS_MS,
+      signal => options.worktrees.register(branch, project, receipt.request.target, signal),
+      parentSignal,
+    )
     if (!registered.ok) {
       yield await failProvisioning(options, receipt, branch, registered.timeout ? 'launch-timeout' : 'provision-failed')
       return
@@ -832,7 +837,7 @@ function validTargetSyntax(request: SessionStartMessage): boolean {
 
 function validBranch(value: string): boolean {
   if (!value || value.length > 255 || /[\u0000-\u0020\u007f~^:?*\\[]/.test(value)) return false
-  if (value === '@' || value.startsWith('/') || value.endsWith('/') || value.endsWith('.') || value.includes('..') || value.includes('@{')) return false
+  if (value === '@' || value.startsWith('-') || value.startsWith('/') || value.endsWith('/') || value.endsWith('.') || value.includes('..') || value.includes('@{')) return false
   return value.split('/').every(component => component && !component.startsWith('.') && !component.endsWith('.lock'))
 }
 

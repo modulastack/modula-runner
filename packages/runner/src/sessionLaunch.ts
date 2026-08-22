@@ -226,7 +226,12 @@ export interface SessionWorktreePort {
     target: SessionLaunchTarget,
     signal: AbortSignal,
   ): Promise<SessionWorktreeStep<SessionBranchCreatedSnapshot | SessionWorktreeRegisteredSnapshot>>
-  register(snapshot: SessionBranchCreatedSnapshot, signal: AbortSignal): Promise<SessionWorktreeStep<SessionWorktreeRegisteredSnapshot>>
+  register(
+    snapshot: SessionBranchCreatedSnapshot,
+    project: SessionProjectSnapshot,
+    target: SessionLaunchTarget,
+    signal: AbortSignal,
+  ): Promise<SessionWorktreeStep<SessionWorktreeRegisteredSnapshot>>
   verify(
     snapshot: SessionWorktreeRegisteredSnapshot,
     relativeCwd: string,

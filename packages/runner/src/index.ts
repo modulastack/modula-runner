@@ -12,6 +12,7 @@ export {
 } from './terminalSession.js'
 export { hasTmuxSession, killTmuxSession, tmuxSessionName, worktreeSocket, type TmuxRef } from './tmux.js'
 export { provisionWorktree, type WorktreeProvisionRequest, type WorktreeProvisionResult } from './worktrees.js'
+export { createSessionWorktreePort, type SessionWorktreePortOptions } from './sessionWorktrees.js'
 export {
   PAIRING_FAILURES,
   PairingError,
