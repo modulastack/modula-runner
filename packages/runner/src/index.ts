@@ -215,6 +215,7 @@ export {
   type WorktreeOwnershipPhase,
 } from './sessionLaunch.js'
 export { type RunnerClock } from './runtimeClock.js'
+export { MAX_PENDING_SESSION_LEDGER_OPERATIONS, createSessionReceiptLedger } from './sessionReceiptLedger.js'
 export {
   detectPreviewContainment,
   namespaceContainmentAvailable,
