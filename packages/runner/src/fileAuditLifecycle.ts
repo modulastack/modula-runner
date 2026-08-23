@@ -1,4 +1,10 @@
 import { constants, type BigIntStats, type Stats } from 'node:fs'
+import {
+  SESSION_LAUNCH_PROTOCOL_VERSION,
+  isRefusalReason,
+  isSafeIdentifier,
+  parseSessionLaunchServerMessage,
+} from '@modulastack/runner-protocol'
 import { createHash, randomBytes, type Hash } from 'node:crypto'
 import {
   lstat,
@@ -6,6 +12,7 @@ import {
   open,
   readdir,
   rename,
+  rm,
   unlink,
   type FileHandle,
 } from 'node:fs/promises'
@@ -35,6 +42,9 @@ import type { RunnerHomeStorage } from './runnerHome.js'
 const DIRECTORY_MODE = 0o700
 const FILE_MODE = 0o600
 const AUDIT_DIRECTORY = 'audit.jsonl'
+const LEGACY_BACKUP = 'audit.jsonl.legacy'
+const MIGRATING_DIRECTORY = 'audit.jsonl.migrating'
+const MIGRATION_MARKER = 'migration.json'
 const SEQUENCE_WIDTH = 20
 const SEGMENT_PATTERN = /^segment-([0-9]{20})\.(open|jsonl|manifest\.json|commit\.json|ack\.json|tombstone\.json)$/
 const TEMP_METADATA_PATTERN = /^segment-([0-9]{20})\.(manifest|commit|ack|tombstone)\.tmp-[0-9a-f]{32}$/
@@ -77,12 +87,22 @@ type OpenCommit = {
   pendingRecordBase64?: string
 }
 
+type MigrationMarker = {
+  schemaVersion: 1
+  legacySha256: string
+  legacyBytes: number
+  legacyRecords: number
+  lastManifestSha256: string | null
+}
+
 type RecoveredSealed = {
   resident: SealedSegment[]
   metadataBytes: number
   lastSequence: number
   lastRecordSequence: string | null
   previousManifestSha256: string | null
+  legacyRecords: number
+  legacyLastManifestSha256: string | null
 }
 
 type RecoveredLifecycle = {
@@ -510,7 +530,246 @@ async function writeLifecycleMetadata(
   }
 }
 
+async function migrateLegacyAudit(root: string, uid: number | undefined): Promise<void> {
+  const auditPath = path.join(root, AUDIT_DIRECTORY)
+  const legacyPath = path.join(root, LEGACY_BACKUP)
+  const migratingPath = path.join(root, MIGRATING_DIRECTORY)
+  const audit = await lstat(auditPath, { bigint: true }).catch(error => missingOnly(error))
+  const legacy = await lstat(legacyPath, { bigint: true }).catch(error => missingOnly(error))
+  const migrating = await lstat(migratingPath, { bigint: true }).catch(error => missingOnly(error))
+  if (audit?.isDirectory()) {
+    if (!secureDirectory(audit, uid)) throw new Error('insecure migrated audit directory')
+    if (legacy) await finishLegacyCleanup(root, auditPath, legacyPath, uid)
+    if (migrating) await removeMigrationDirectory(root, migratingPath, migrating, uid)
+    return
+  }
+  if (audit) {
+    if (!secureRecord(audit, uid) || legacy) throw new Error('ambiguous legacy audit source')
+    const source = await readLegacyAudit(auditPath, uid)
+    if (migrating) await removeMigrationDirectory(root, migratingPath, migrating, uid)
+    await buildMigrationDirectory(root, migratingPath, source, uid)
+    await rename(auditPath, legacyPath)
+    await syncParentDirectory(root)
+    await rename(migratingPath, auditPath)
+    await syncParentDirectory(root)
+    await finishLegacyCleanup(root, auditPath, legacyPath, uid)
+    return
+  }
+  if (legacy) {
+    if (!migrating?.isDirectory() || !secureDirectory(migrating, uid)) throw new Error('incomplete legacy audit migration')
+    await verifyMigrationDirectory(migratingPath, legacyPath, uid)
+    await rename(migratingPath, auditPath)
+    await syncParentDirectory(root)
+    await finishLegacyCleanup(root, auditPath, legacyPath, uid)
+    return
+  }
+  if (migrating) throw new Error('orphaned legacy audit migration')
+}
+
+async function buildMigrationDirectory(
+  root: string,
+  migratingPath: string,
+  source: { bytes: Buffer; records: Buffer[] },
+  uid: number | undefined,
+): Promise<void> {
+  await mkdir(migratingPath, { mode: DIRECTORY_MODE })
+  await syncParentDirectory(root)
+  const directory = await open(migratingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  const info = await directory.stat({ bigint: true })
+  if (!secureDirectory(info, uid)) {
+    await directory.close()
+    throw new Error('insecure migration directory')
+  }
+  const recovered: RecoveryPath = { directory, directoryIdentity: identityOf(info), directoryPath: migratingPath, uid }
+  try {
+    const chunks = legacyChunks(source.records)
+    if (chunks.length >= MAX_RESIDENT_AUDIT_SEGMENTS) throw new Error('legacy audit exceeds resident migration capacity')
+    let previousManifestSha256: string | null = null
+    let firstRecord = 1
+    for (let index = 0; index < chunks.length; index += 1) {
+      const sequence = index + 1
+      const bytes = Buffer.concat(chunks[index]!)
+      await writeMigrationSegment(recovered, sequence, bytes)
+      const lastRecord = firstRecord + chunks[index]!.length - 1
+      const manifest: AuditSegmentManifest = {
+        schemaVersion: 1,
+        sequence: String(sequence),
+        state: 'sealed',
+        recordSchemaVersion: 1,
+        bytes: bytes.byteLength,
+        records: chunks[index]!.length,
+        sha256: sha256(bytes),
+        firstRecordSequence: String(firstRecord),
+        lastRecordSequence: String(lastRecord),
+        previousManifestSha256,
+      }
+      const manifestBytes = await writeManifest(recovered, manifest)
+      previousManifestSha256 = sha256(manifestBytes)
+      firstRecord = lastRecord + 1
+    }
+    const current = await createOpenSegment(recovered, chunks.length + 1)
+    await current.handle.close()
+    const marker: MigrationMarker = {
+      schemaVersion: 1,
+      legacySha256: sha256(source.bytes),
+      legacyBytes: source.bytes.byteLength,
+      legacyRecords: source.records.length,
+      lastManifestSha256: previousManifestSha256,
+    }
+    await writeMigrationMarker(recovered, marker)
+  } finally {
+    await directory.close()
+  }
+}
+
+function legacyChunks(records: readonly Buffer[]): Buffer[][] {
+  const chunks: Buffer[][] = []
+  let current: Buffer[] = []
+  let bytes = 0
+  for (const record of records) {
+    if (current.length >= MAX_AUDIT_SEGMENT_RECORDS || bytes + record.byteLength + 1 > MAX_AUDIT_SEGMENT_BYTES) {
+      chunks.push(current)
+      current = []
+      bytes = 0
+    }
+    current.push(Buffer.concat([record, Buffer.from('\n')]))
+    bytes += record.byteLength + 1
+  }
+  if (current.length) chunks.push(current)
+  return chunks
+}
+
+async function writeMigrationSegment(recovered: RecoveryPath, sequence: number, bytes: Buffer): Promise<void> {
+  const target = path.join(recovered.directoryPath, segmentName(sequence, 'jsonl'))
+  const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+  try {
+    await writeAll(handle, bytes)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  await syncDirectory(recovered)
+}
+
+async function readLegacyAudit(target: string, uid: number | undefined): Promise<{ bytes: Buffer; records: Buffer[] }> {
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const info = await handle.stat({ bigint: true })
+    const maximum = (MAX_RESIDENT_AUDIT_SEGMENTS - 1) * MAX_AUDIT_SEGMENT_BYTES
+    if (!secureRecord(info, uid) || info.size > BigInt(maximum)) throw new Error('invalid legacy audit file')
+    const bytes = await readAll(handle, Number(info.size))
+    const records = splitRecordLines(bytes)
+    for (const record of records) {
+      if (record.byteLength > 64 * 1024 || !validLegacyAuditRecord(record)) throw new Error('invalid legacy audit record')
+    }
+    return { bytes, records }
+  } finally {
+    await handle.close()
+  }
+}
+
+async function verifyMigrationDirectory(migratingPath: string, legacyPath: string, uid: number | undefined): Promise<void> {
+  await verifyMigrationState(migratingPath, await readLegacyAudit(legacyPath, uid), uid)
+}
+
+async function finishLegacyCleanup(root: string, auditPath: string, legacyPath: string, uid: number | undefined): Promise<void> {
+  await verifyMigrationState(auditPath, await readLegacyAudit(legacyPath, uid), uid)
+  await unlink(legacyPath)
+  await syncParentDirectory(root)
+}
+
+async function verifyMigrationState(
+  directoryPath: string,
+  source: { bytes: Buffer; records: Buffer[] },
+  uid: number | undefined,
+): Promise<void> {
+  const directory = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    const info = await directory.stat({ bigint: true })
+    if (!secureDirectory(info, uid)) throw new Error('insecure migration directory')
+    const recovered: RecoveryPath = { directory, directoryIdentity: identityOf(info), directoryPath, uid }
+    const marker = await readMigrationMarker(recovered)
+    if (!migrationMatches(marker.value, source)) throw new Error('legacy migration marker mismatch')
+    const grouped = classifyEntries(await readdir(directoryPath))
+    if (grouped.acknowledgements.length || grouped.tombstones.length
+      || grouped.segments.some(sequence => !grouped.manifests.includes(sequence))
+      || grouped.commits.some(sequence => !grouped.opens.includes(sequence))) {
+      throw new Error('migration staging contains non-migration state')
+    }
+    const sealed = await recoverSealed(recovered, grouped)
+    if (sealed.legacyRecords !== source.records.length
+      || sealed.legacyLastManifestSha256 !== marker.value.lastManifestSha256
+      || grouped.opens.length !== 1 || grouped.opens[0] !== sealed.lastSequence + 1) {
+      throw new Error('migration staging chain mismatch')
+    }
+    const current = await openExistingSegment(recovered, grouped.opens[0], grouped.commits.includes(grouped.opens[0]))
+    try {
+      if (current.records !== 0 || current.byteCount !== 0) throw new Error('migration staging open segment is not empty')
+    } finally {
+      await current.handle.close()
+    }
+  } finally {
+    await directory.close()
+  }
+}
+
+async function removeMigrationDirectory(root: string, target: string, info: BigIntStats, uid: number | undefined): Promise<void> {
+  if (!secureDirectory(info, uid)) throw new Error('insecure migration directory')
+  await rm(target, { recursive: true })
+  await syncParentDirectory(root)
+}
+
+async function writeMigrationMarker(recovered: RecoveryPath, marker: MigrationMarker): Promise<void> {
+  const bytes = metadataBytesFor(marker)
+  const target = path.join(recovered.directoryPath, MIGRATION_MARKER)
+  const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+  try {
+    await writeAll(handle, bytes)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  await syncDirectory(recovered)
+}
+
+async function readMigrationMarker(recovered: RecoveryPath): Promise<{ value: MigrationMarker; bytes: Buffer }> {
+  const target = path.join(recovered.directoryPath, MIGRATION_MARKER)
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const info = await handle.stat({ bigint: true })
+    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid migration marker')
+    const bytes = await readAll(handle, Number(info.size))
+    const value = JSON.parse(bytes.toString('utf8')) as MigrationMarker
+    if (!Buffer.from(`${JSON.stringify(value)}\n`).equals(bytes)
+      || value.schemaVersion !== 1 || !sha256Value(value.legacySha256)
+      || !Number.isSafeInteger(value.legacyBytes) || value.legacyBytes < 0
+      || !Number.isSafeInteger(value.legacyRecords) || value.legacyRecords < 0
+      || (value.lastManifestSha256 !== null && !sha256Value(value.lastManifestSha256))) {
+      throw new Error('invalid migration marker')
+    }
+    return { value, bytes }
+  } finally {
+    await handle.close()
+  }
+}
+
+function migrationMatches(marker: MigrationMarker, source: { bytes: Buffer; records: readonly Buffer[] }): boolean {
+  return marker.legacySha256 === sha256(source.bytes)
+    && marker.legacyBytes === source.bytes.byteLength
+    && marker.legacyRecords === source.records.length
+}
+
+async function syncParentDirectory(root: string): Promise<void> {
+  const directory = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    await directory.sync()
+  } finally {
+    await directory.close()
+  }
+}
+
 async function recoverLifecycle(root: string, uid: number | undefined): Promise<RecoveredLifecycle> {
+  await migrateLegacyAudit(root, uid)
   const directoryPath = path.join(root, AUDIT_DIRECTORY)
   await ensureAuditDirectory(directoryPath, uid)
   const directory = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
@@ -520,12 +779,18 @@ async function recoverLifecycle(root: string, uid: number | undefined): Promise<
   try {
     await removeInterruptedTemps(recovered)
     const entries = await readdir(directoryPath)
+    const migration = entries.includes(MIGRATION_MARKER) ? await readMigrationMarker(recovered) : undefined
     const grouped = classifyEntries(entries)
     if (grouped.commits.some(sequence => !grouped.segments.includes(sequence) && !grouped.opens.includes(sequence))) {
       throw new Error('audit commit has no segment')
     }
     const recoveredSealed = await recoverSealed(recovered, grouped)
-    if (recoveredSealed.metadataBytes > MAX_AUDIT_METADATA_BYTES
+    if (migration && (migration.value.legacyRecords !== recoveredSealed.legacyRecords
+      || migration.value.lastManifestSha256 !== recoveredSealed.legacyLastManifestSha256)) {
+      throw new Error('legacy audit migration chain changed')
+    }
+    const recoveredMetadataBytes = recoveredSealed.metadataBytes + (migration?.bytes.byteLength ?? 0)
+    if (recoveredMetadataBytes > MAX_AUDIT_METADATA_BYTES
       || recoveredSealed.resident.length >= MAX_RESIDENT_AUDIT_SEGMENTS) {
       throw new Error('audit metadata capacity exhausted')
     }
@@ -547,7 +812,7 @@ async function recoverLifecycle(root: string, uid: number | undefined): Promise<
       sealed: recoveredSealed.resident,
       current,
       nextRecordSequence: lastRecord ? Number(lastRecord) + 1 : 1,
-      metadataBytes: recoveredSealed.metadataBytes + current.commitBytes,
+      metadataBytes: recoveredMetadataBytes + current.commitBytes,
       previousManifestSha256,
     }
   } catch (error) {
@@ -580,7 +845,7 @@ function classifyEntries(entries: readonly string[]) {
   const tombstones: number[] = []
   const opens: number[] = []
   for (const entry of entries) {
-    if (TEMP_METADATA_PATTERN.test(entry)) continue
+    if (entry === MIGRATION_MARKER || TEMP_METADATA_PATTERN.test(entry)) continue
     const matched = SEGMENT_PATTERN.exec(entry)
     if (!matched) throw new Error('unknown audit lifecycle entry')
     const sequence = parseSegmentSequence(matched[1]!)
@@ -613,19 +878,30 @@ async function recoverSealed(
   let metadataBytes = 0
   let previousManifestSha256: string | null = null
   let previousRecord = 0
+  let legacyRecords = 0
+  let legacyLastManifestSha256: string | null = null
+  let sawSchemaV2 = false
   for (let sequence = 1; sequence <= maxSequence; sequence += 1) {
-    let scan = grouped.segments.includes(sequence) ? await scanSegment(recovered, sequence, 'jsonl') : null
-    if (scan && (scan.records === 0 || !scan.firstRecordSequence || !scan.lastRecordSequence)) throw new Error('empty sealed audit segment')
     let manifest: AuditSegmentManifest
     let manifestBytes: Buffer
+    let scan: SegmentScan | null
     if (grouped.manifests.includes(sequence)) {
       ;({ manifest, bytes: manifestBytes } = await readManifest(recovered, sequence))
+      scan = grouped.segments.includes(sequence)
+        ? manifest.recordSchemaVersion === 1
+          ? await scanLegacySegment(recovered, sequence, Number(manifest.firstRecordSequence), Number(manifest.lastRecordSequence))
+          : await scanSegment(recovered, sequence, 'jsonl')
+        : null
     } else {
+      scan = grouped.segments.includes(sequence) ? await scanSegment(recovered, sequence, 'jsonl') : null
       if (!scan || sequence !== maxSequence) throw new Error('interrupted nonterminal audit seal')
       manifest = manifestFor(sequence, scan, previousManifestSha256)
       manifestBytes = await writeManifest(recovered, manifest)
     }
+    if (scan && (scan.records === 0 || !scan.firstRecordSequence || !scan.lastRecordSequence)) throw new Error('empty sealed audit segment')
     if (!manifestChainMatches(manifest, sequence, previousRecord, previousManifestSha256)) throw new Error('audit manifest chain mismatch')
+    if (manifest.recordSchemaVersion === 1 && sawSchemaV2) throw new Error('legacy audit segment follows schema v2')
+    if (manifest.recordSchemaVersion === 2) sawSchemaV2 = true
     if (scan && !manifestMatches(manifest, sequence, scan, previousManifestSha256)) throw new Error('audit manifest mismatch')
     const acknowledgement = grouped.acknowledgements.includes(sequence)
       ? await readAcknowledgement(recovered, sequence, manifest, manifestBytes)
@@ -650,6 +926,10 @@ async function recoverSealed(
     metadataBytes += manifestBytes.byteLength + (acknowledgement?.bytes.byteLength ?? 0) + (tombstone?.bytes.byteLength ?? 0)
     previousManifestSha256 = sha256(manifestBytes)
     previousRecord = Number(manifest.lastRecordSequence)
+    if (manifest.recordSchemaVersion === 1) {
+      legacyRecords += manifest.records
+      legacyLastManifestSha256 = previousManifestSha256
+    }
   }
   return {
     resident,
@@ -657,6 +937,8 @@ async function recoverSealed(
     lastSequence: maxSequence,
     lastRecordSequence: maxSequence === 0 ? null : String(previousRecord),
     previousManifestSha256,
+    legacyRecords,
+    legacyLastManifestSha256,
   }
 }
 
@@ -753,6 +1035,99 @@ async function scanSegment(
   } finally {
     await handle.close()
   }
+}
+
+async function scanLegacySegment(
+  recovered: RecoveryPath,
+  sequence: number,
+  firstRecordSequence: number,
+  lastRecordSequence: number,
+): Promise<SegmentScan> {
+  const target = path.join(recovered.directoryPath, segmentName(sequence, 'jsonl'))
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const info = await handle.stat({ bigint: true })
+    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_SEGMENT_BYTES)) throw new Error('invalid legacy audit segment')
+    const bytes = await readAll(handle, Number(info.size))
+    const records = splitRecordLines(bytes)
+    if (records.length === 0 || records.length > MAX_AUDIT_SEGMENT_RECORDS
+      || lastRecordSequence - firstRecordSequence + 1 !== records.length) throw new Error('invalid legacy audit record count')
+    for (const record of records) {
+      if (record.byteLength > 64 * 1024 || !validLegacyAuditRecord(record)) throw new Error('invalid legacy audit record')
+    }
+    return {
+      bytes,
+      byteCount: bytes.byteLength,
+      records: records.length,
+      firstRecordSequence: String(firstRecordSequence),
+      lastRecordSequence: String(lastRecordSequence),
+      sha256: sha256(bytes),
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
+function validLegacyAuditRecord(bytes: Buffer): boolean {
+  try {
+    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
+    if (!isRecord(value) || Buffer.from(JSON.stringify(value)).compare(bytes) !== 0 || !validTimestamp(value.at)) return false
+    if (value.kind === 'spawn-admitted') {
+      return exactKeys(value, ['kind', 'spawnId', 'spawnKind', 'requestId', 'executable', 'recipeId', 'cwd', 'at'], ['spawnKind', 'requestId'])
+        && isSafeIdentifier(value.spawnId) && nullableText(value.executable) && nullableText(value.recipeId)
+        && typeof value.cwd === 'string'
+    }
+    if (value.kind === 'spawn-outcome') {
+      return exactKeys(value, ['kind', 'spawnId', 'outcome', 'at']) && isSafeIdentifier(value.spawnId) && validLegacyOutcome(value.outcome)
+    }
+    if (value.kind === 'refused') {
+      return exactKeys(value, ['kind', 'requestId', 'spawnKind', 'executable', 'recipeId', 'cwd', 'reason', 'at'], ['spawnKind'])
+        && nullableIdentifier(value.requestId) && nullableText(value.executable) && nullableText(value.recipeId)
+        && nullableText(value.cwd) && isRefusalReason(value.reason)
+    }
+    if (value.kind === 'kill') {
+      return exactKeys(value, ['kind', 'confirmed', 'details', 'at'])
+        && typeof value.confirmed === 'boolean' && typeof value.details === 'string'
+    }
+    if (value.kind === 'session-connection-refusal') {
+      return exactKeys(value, ['kind', 'connectionId', 'channelId', 'requestId', 'reason', 'selectedProtocolVersion', 'phase', 'at'])
+        && isSafeIdentifier(value.connectionId) && isSafeIdentifier(value.channelId) && nullableIdentifier(value.requestId)
+    }
+    if (value.kind === 'session-launch') {
+      return exactKeys(value, ['kind', 'key', 'state', 'at', 'sessionId', 'result'], ['sessionId', 'result'])
+        && isRecord(value.key) && isSafeIdentifier(value.key.bindingId) && isSafeIdentifier(value.key.requestId)
+        && (value.sessionId === undefined || isSafeIdentifier(value.sessionId))
+        && (value.result === undefined || parseSessionLaunchServerMessage(value.result, SESSION_LAUNCH_PROTOCOL_VERSION) !== null)
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+function validLegacyOutcome(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (value.spawnFailed === true) return Object.keys(value).length === 1
+  return (nonnegativeInteger(value.exitCode) && value.signal === null)
+    || (nonnegativeInteger(value.signal) && value.exitCode === null)
+}
+
+function nullableIdentifier(value: unknown): boolean {
+  return value === null || isSafeIdentifier(value)
+}
+
+function nullableText(value: unknown): boolean {
+  return value === null || typeof value === 'string'
+}
+
+function nonnegativeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], optional: readonly string[] = []): boolean {
+  const keys = Object.keys(value)
+  return keys.every(key => allowed.includes(key))
+    && allowed.every(key => optional.includes(key) || keys.includes(key))
 }
 
 function scanAuditBytes(bytes: Buffer): SegmentScan {
@@ -931,7 +1306,7 @@ function manifestChainMatches(
   return manifest.schemaVersion === AUDIT_SEGMENT_SCHEMA_VERSION
     && manifest.sequence === String(sequence)
     && manifest.state === 'sealed'
-    && manifest.recordSchemaVersion === 2
+    && (manifest.recordSchemaVersion === 1 || manifest.recordSchemaVersion === 2)
     && Number.isSafeInteger(manifest.bytes) && manifest.bytes > 0 && manifest.bytes <= MAX_AUDIT_SEGMENT_BYTES
     && Number.isSafeInteger(manifest.records) && manifest.records > 0 && manifest.records <= MAX_AUDIT_SEGMENT_RECORDS
     && sha256Value(manifest.sha256)
@@ -949,7 +1324,6 @@ function manifestMatches(
   return manifest.schemaVersion === AUDIT_SEGMENT_SCHEMA_VERSION
     && manifest.sequence === String(sequence)
     && manifest.state === 'sealed'
-    && manifest.recordSchemaVersion === 2
     && manifest.bytes === scan.byteCount
     && manifest.records === scan.records
     && manifest.sha256 === scan.sha256
@@ -1149,6 +1523,10 @@ function numeric(left: number, right: number): number {
 function missingOnly(error: unknown): null {
   if (isCode(error, 'ENOENT')) return null
   throw error
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function isCode(error: unknown, code: string): boolean {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -34,6 +34,20 @@ describe('installed runner application', () => {
     await expect(app.execute(version.value)).resolves.toBe(0)
     expect(help.stdout.join('')).toContain('local pairing, state, and foreground runner commands')
     expect(version.stdout).toEqual(['9.8.7\n'])
+  })
+
+  it('runs the offline archive command without requiring foreground policy state', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'runner-installed-'))
+    roots.push(root)
+    const home = path.join(root, 'home')
+    const destination = path.join(root, 'archive')
+    await mkdir(destination, { mode: 0o700 })
+    const app = createInstalledRunnerApplication({ version: '0.1.0', defaultHomeRoot: home })
+    const archive = invocation(['audit', 'archive', '--output', destination], home)
+
+    await expect(app.execute(archive.value)).resolves.toBe(0)
+    expect(JSON.parse(archive.stdout.join(''))).toEqual({ status: 'nothing-to-archive' })
+    expect(archive.stderr).toEqual([])
   })
 
   it('preflights trusted policy before status or run can reach a connection', async () => {

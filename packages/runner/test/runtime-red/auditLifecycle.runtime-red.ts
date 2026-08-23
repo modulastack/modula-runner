@@ -1,4 +1,4 @@
-import { appendFile, chmod, mkdtemp, rm } from 'node:fs/promises'
+import { appendFile, chmod, cp, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -158,6 +158,29 @@ describe('audit lifecycle and replacement-channel production subjects are intent
       await expect(openRunnerAuditLifecycle({ runnerHome })).resolves.toEqual({ status: 'storage-unavailable' })
     } finally {
       await rm(runnerHome, { recursive: true, force: true })
+    }
+  })
+
+  it('[AL-12] preserves the legacy backup when a staged manifest is corrupt', async () => {
+    const stagingRoot = await mkdtemp(join(tmpdir(), 'runner-audit-migration-stage-'))
+    const runnerHome = await mkdtemp(join(tmpdir(), 'runner-audit-migration-home-'))
+    await Promise.all([chmod(stagingRoot, 0o700), chmod(runnerHome, 0o700)])
+    const legacy = '{"kind":"kill","confirmed":true,"details":"operator stop","at":"2026-08-22T00:00:00.000Z"}\n'
+    try {
+      await writeFile(join(stagingRoot, 'audit.jsonl'), legacy, { mode: 0o600 })
+      const staged = await openRunnerAuditLifecycle({ runnerHome: stagingRoot })
+      if (staged.status !== 'ready') throw new Error('staging migration did not complete')
+      await staged.audit.close()
+      await writeFile(join(runnerHome, 'audit.jsonl.legacy'), legacy, { mode: 0o600 })
+      await cp(join(stagingRoot, 'audit.jsonl'), join(runnerHome, 'audit.jsonl.migrating'), { recursive: true })
+      const manifestPath = join(runnerHome, 'audit.jsonl.migrating', 'segment-00000000000000000001.manifest.json')
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      await writeFile(manifestPath, `${JSON.stringify({ ...manifest, sha256: '0'.repeat(64) })}\n`, { mode: 0o600 })
+
+      await expect(openRunnerAuditLifecycle({ runnerHome })).resolves.toEqual({ status: 'storage-unavailable' })
+      expect((await lstat(join(runnerHome, 'audit.jsonl.legacy'))).isFile()).toBe(true)
+    } finally {
+      await Promise.all([rm(stagingRoot, { recursive: true, force: true }), rm(runnerHome, { recursive: true, force: true })])
     }
   })
 
