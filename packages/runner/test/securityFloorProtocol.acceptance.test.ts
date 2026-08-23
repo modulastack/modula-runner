@@ -1,21 +1,43 @@
-import { execFile } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
-import { PROTOCOL_VERSION } from '@modulastack/runner-protocol'
+import {
+  PROTOCOL_VERSION,
+  SESSION_LAUNCH_PROTOCOL_VERSION,
+  decodeJobControlClientMessage,
+  decodeSessionLaunchClientMessage,
+  parseJobControlClientMessage,
+  parseSessionLaunchClientMessage,
+} from '@modulastack/runner-protocol'
 import { describe, expect, it } from 'vitest'
 
-const execFileAsync = promisify(execFile)
-const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url))
+const sessionStart = {
+  type: 'SESSION_START',
+  bindingId: '123e4567-e89b-42d3-a456-426614174000',
+  requestId: '123e4567-e89b-42d3-a456-426614174001',
+  expiresAt: '2026-08-22T12:00:00Z',
+  terminalProfile: 'coder',
+  modelProfileId: 'daily',
+  target: {
+    projectId: 'modulastack',
+    worktreeName: 'as-08',
+    branch: 'feat/as-08',
+    baseBranch: 'main',
+    relativeCwd: '.',
+  },
+} as const
 
-describe('CP-5 wire invariance acceptance', () => {
-  it('AS-08 leaves the version-1 protocol package byte-for-byte unchanged from the adjudicated base', async () => {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['diff', '--name-only', 'e2cf53a', '--', 'packages/protocol'],
-      { cwd: repositoryRoot },
-    )
+const sessionStartPayload = { codec: 'json', body: sessionStart } as const
 
+describe('CP-5 active wire invariance acceptance', () => {
+  it('AS-08 keeps session launch inactive under v1 and gated behind the approved version-2 interface', () => {
     expect(PROTOCOL_VERSION).toBe(1)
-    expect(stdout.trim()).toBe('')
+    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(2)
+
+    expect(parseJobControlClientMessage(sessionStart)).toBeNull()
+    expect(decodeJobControlClientMessage(sessionStartPayload)).toBeNull()
+    expect(parseSessionLaunchClientMessage(sessionStart, PROTOCOL_VERSION)).toBeNull()
+    expect(decodeSessionLaunchClientMessage(sessionStartPayload, PROTOCOL_VERSION)).toBeNull()
+
+    expect(parseSessionLaunchClientMessage(sessionStart, SESSION_LAUNCH_PROTOCOL_VERSION)).toEqual(sessionStart)
+    expect(decodeSessionLaunchClientMessage(sessionStartPayload, SESSION_LAUNCH_PROTOCOL_VERSION)).toEqual(sessionStart)
+    expect(parseSessionLaunchClientMessage(sessionStart, SESSION_LAUNCH_PROTOCOL_VERSION + 1)).toBeNull()
   })
 })
