@@ -2,6 +2,7 @@ import { open, type FileHandle } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RefusalReason } from '@modulastack/runner-protocol'
+import type { SessionLaunchAuditRecord } from './sessionLaunch.js'
 
 // The local audit log: every command the runner spawns, and every request it refuses, lands
 // here — a file the operator owns, on their machine, that the control plane cannot read or
@@ -53,6 +54,7 @@ export type AuditRecord =
       at: string
     }
   | { kind: 'kill'; confirmed: boolean; details: string; at: string }
+  | SessionLaunchAuditRecord
 
 // The writer. Deliberately narrow: `append` is the only mutation, so there is no rewrite or
 // truncate path to reason about — the append-only property is a shape of the interface, not a

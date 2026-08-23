@@ -25,6 +25,27 @@ export {
   type RunnerBinding,
 } from './pairing.js'
 export { createEncryptedPairingStore, createMemoryPairingStore, type EncryptedStoreOptions } from './identityStore.js'
+export {
+  PAIRING_CONTRACT_FAILURES,
+  PairingContractError,
+  PairingContractNotImplementedError,
+  createPairingContractService,
+  createUnimplementedPairingContractService,
+  type ContractPairingIdentity,
+  type ContractPairingRecord,
+  type ContractPairingSnapshot,
+  type ContractPairingState,
+  type PairingContractFailure,
+  type PairingContractService,
+  type PairingContractServiceOptions,
+  type PairingContractStore,
+  type PairingContractTransport,
+  type PairingHttpRequest,
+  type PairingHttpResponse,
+  type PairingMutation,
+  type PairingResponseMediaType,
+  type PairingReservation,
+} from './pairingContract.js'
 export { createPairedClient, type PairedClientOptions } from './pairedClient.js'
 export { PresenceTracker, type PresenceSnapshot, type PresenceState, type PresenceTrackerOptions } from './presence.js'
 export {
@@ -214,8 +235,68 @@ export {
   type SessionWorktreeVerifiedSnapshot,
   type WorktreeOwnershipPhase,
 } from './sessionLaunch.js'
-export { type RunnerClock } from './runtimeClock.js'
 export { MAX_PENDING_SESSION_LEDGER_OPERATIONS, createSessionReceiptLedger } from './sessionReceiptLedger.js'
+export {
+  SESSION_JOB_CONTROL_ERRORS,
+  SessionJobControlNotImplementedError,
+  createSessionJobControl,
+  type SessionJobControl,
+  type SessionJobControlContext,
+  type SessionJobControlEffect,
+  type SessionJobControlError,
+  type SessionJobControlInput,
+  type SessionJobControlOptions,
+  type SessionJobControlPhase,
+} from './sessionJobControl.js'
+export { type RunnerClock } from './runtimeClock.js'
+export {
+  RUNNER_HOME_FAILURES,
+  RUNNER_HOME_RECORDS,
+  RUNNER_HOME_STATE_RECORDS,
+  RunnerHomeNotImplementedError,
+  createRunnerHome,
+  type RunnerConfigurationReplace,
+  type RunnerConfigurationStore,
+  type RunnerHome,
+  type RunnerHomeEntryInspection,
+  type RunnerHomeFailure,
+  type RunnerHomeInspection,
+  type RunnerHomeOpen,
+  type RunnerHomeOptions,
+  type RunnerHomeRecord,
+  type RunnerHomeStateRecord,
+  type RunnerHomeSelection,
+  type RunnerHomeState,
+  type RunnerHomeStorage,
+  type RunnerHomeStorageRead,
+  type RunnerHomeStorageWrite,
+  type RunnerLocalConfiguration,
+  type RunnerPolicyReplace,
+  type RunnerPolicySnapshot,
+  type RunnerPolicyStore,
+} from './runnerHome.js'
+export {
+  RUNNER_PROJECT_COMMANDS,
+  RUNNER_TOP_LEVEL_COMMANDS,
+  RunnerApplicationNotImplementedError,
+  RunnerRuntimeNotImplementedError,
+  createRunnerApplication,
+  createRunnerRuntime,
+  createUnimplementedRunnerApplication,
+  type RunnerApplication,
+  type RunnerApplicationOptions,
+  type RunnerCliEnvironment,
+  type RunnerCliInvocation,
+  type RunnerCliIo,
+  type RunnerComposition,
+  type RunnerExitCode,
+  type RunnerRuntimeHandle,
+  type RunnerProjectCommand,
+  type RunnerRuntimeOptions,
+  type RunnerRuntimePort,
+  type RunnerShutdownResult,
+  type RunnerTopLevelCommand,
+} from './runnerApplication.js'
 export {
   detectPreviewContainment,
   namespaceContainmentAvailable,
