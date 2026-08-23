@@ -2,6 +2,7 @@ import { open, type FileHandle } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RefusalReason } from '@modulastack/runner-protocol'
+import type { AuditSpawnKind } from './auditLifecycle.js'
 import type { SessionConnectionAuditRecord } from './sessionJobControl.js'
 import type { SessionLaunchAuditRecord } from './sessionLaunch.js'
 
@@ -35,6 +36,8 @@ export type AuditRecord =
   | {
       kind: 'spawn-admitted'
       spawnId: string
+      spawnKind: AuditSpawnKind
+      requestId: string | null
       // The executable the runner is about to spawn, or the recipe id for a preview. One of
       // the two is always present so a reader knows what ran without guessing.
       executable: string | null
@@ -48,6 +51,7 @@ export type AuditRecord =
       // Correlates to the wire request where one exists, so a REFUSED frame and its audit line
       // name the same event.
       requestId: string | null
+      spawnKind: AuditSpawnKind
       executable: string | null
       recipeId: string | null
       cwd: string | null

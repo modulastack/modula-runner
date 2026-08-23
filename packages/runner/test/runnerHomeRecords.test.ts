@@ -9,6 +9,7 @@ import {
   openRunnerHomeRecords,
   signAllowlist,
   SessionReceiptStorageUnavailableError,
+  type AuditRecordInputV2,
   type PairingContractStore,
   type RunnerHomeRecord,
   type RunnerHomeStorage,
@@ -32,7 +33,8 @@ function pairingStore(): PairingContractStore {
 
 function memoryStorage(initial: Partial<Record<RunnerHomeRecord, unknown>> = {}) {
   const records = new Map<RunnerHomeRecord, Uint8Array>()
-  const audit: string[] = []
+  const audit: AuditRecordInputV2[] = []
+  let auditUnavailable = false
   for (const [record, value] of Object.entries(initial)) records.set(record as RunnerHomeRecord, Buffer.from(JSON.stringify(value)))
   const storage: RunnerHomeStorage = {
     inspect: async () => ({ rootKind: 'directory', rootOwner: 'current-user', rootMode: 0o700, entries: [] }),
@@ -47,12 +49,22 @@ function memoryStorage(initial: Partial<Record<RunnerHomeRecord, unknown>> = {})
       records.set(record, structuredClone(bytes))
       return { status: 'written', sha256: digest(bytes) }
     },
-    append: async (_record, bytes) => {
-      audit.push(Buffer.from(bytes).toString('utf8'))
-      return 'appended'
-    },
+    append: async () => 'storage-unavailable',
+    openAuditLifecycle: async () => auditUnavailable
+      ? { status: 'storage-unavailable' }
+      : {
+          status: 'ready',
+          audit: {
+            append: async record => {
+              if (auditUnavailable) throw new Error('audit unavailable')
+              audit.push(record)
+            },
+            snapshot: async () => ({ state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }),
+            close: async () => undefined,
+          },
+        },
   }
-  return { storage, audit, records }
+  return { storage, audit, records, failAudit: () => { auditUnavailable = true } }
 }
 
 function signedPolicy(): { revision: number; allowlist: SignedAllowlist; trustAnchors: TrustAnchor[] } {
@@ -96,15 +108,14 @@ describe('runner-home logical records', () => {
     await expect(opened.home.receipts.recover()).rejects.toBeInstanceOf(SessionReceiptStorageUnavailableError)
 
     await opened.home.audit.append({ kind: 'kill', confirmed: true, details: 'operator stop', at: '2026-08-22T00:00:00Z' })
-    expect(held.audit).toEqual(['{"kind":"kill","confirmed":true,"details":"operator stop","at":"2026-08-22T00:00:00Z"}\n'])
+    expect(held.audit).toHaveLength(1)
+    expect(held.audit[0]).toMatchObject({ kind: 'kill', confirmed: true, targetCount: 0 })
+    expect(JSON.stringify(held.audit)).not.toContain('operator stop')
   })
 
   it('retries unrelated project compare-and-set conflicts across registry instances', async () => {
     const held = memoryStorage({ policy: signedPolicy() })
-    const [first, second] = await Promise.all([
-      openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() }),
-      openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() }),
-    ])
+    const [first, second] = await Promise.all([openRecords(held), openRecords(held)])
     if (first.status !== 'ready' || second.status !== 'ready') throw new Error('homes did not open')
     const created = await Promise.all([
       first.home.projects.create({ projectId: 'first', repoPath: '/repos/first', worktreesRoot: '/worktrees/first' }),
@@ -150,12 +161,7 @@ describe('runner-home logical records', () => {
     ]
     for (const profile of profiles) {
       const held = memoryStorage({ policy: signedPolicy(), configuration: { revision: 1, profiles: [profile], endpoints: [] } })
-      await expect(openRunnerHomeRecords({
-        storage: held.storage,
-        clock,
-        pairing: pairingStore(),
-        keys: createMemoryApiKeyStore(),
-      })).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
+      await expect(openRecords(held)).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
     }
   })
 
@@ -174,7 +180,7 @@ describe('runner-home logical records', () => {
           records: [{ path: await realpath(first), alias: path.resolve(alias), grantedAt: '2026-08-22T00:00:00Z' }],
         },
       })
-      const opened = await openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+      const opened = await openRecords(held)
       if (opened.status !== 'ready') throw new Error(opened.code)
       await unlink(alias)
       await symlink(second, alias)
@@ -198,7 +204,7 @@ describe('runner-home logical records', () => {
       }
       return await replace(record, expectedSha256, bytes)
     }
-    const opened = await openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const opened = await openRecords(held)
     if (opened.status !== 'ready') throw new Error(opened.code)
     const request = {
       type: 'SESSION_START' as const,
@@ -264,10 +270,10 @@ describe('runner-home logical records', () => {
     }
 
     const held = memoryStorage({ policy: signedPolicy() })
-    held.storage.append = async () => 'storage-unavailable'
     const opened = await openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
     if (opened.status !== 'ready') throw new Error(opened.code)
-    await expect(opened.home.audit.append({ kind: 'kill', confirmed: false, details: 'uncertain', at: '2026-08-22T00:00:00Z' })).rejects.toThrow('audit-unavailable')
+    held.failAudit()
+    await expect(opened.home.audit.append({ kind: 'kill', confirmed: false, details: 'uncertain', at: '2026-08-22T00:00:00Z' })).rejects.toThrow('audit unavailable')
   })
 })
 

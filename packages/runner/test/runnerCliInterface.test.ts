@@ -60,7 +60,6 @@ const homeOptions = {
     }),
     read: async () => ({ status: 'missing' }),
     replace: async () => ({ status: 'storage-unavailable' }),
-    append: async () => 'storage-unavailable',
   },
 } satisfies RunnerHomeOptions
 
@@ -114,7 +113,7 @@ describe('G2 runner CLI composition interface', () => {
     expect(manifest.bin).toEqual({ 'modula-runner': 'packages/runner/dist/bin/modula-runner.js' })
     expect((await readFile('packages/runner/src/bin/modula-runner.ts', 'utf8')).startsWith('#!/usr/bin/env node\n')).toBe(true)
     expect(RUNNER_TOP_LEVEL_COMMANDS).toEqual([
-      'help', 'version', 'pair', 'status', 'run', 'key', 'project', 'profile', 'endpoint', 'grant', 'allowlist',
+      'help', 'version', 'pair', 'status', 'run', 'key', 'project', 'profile', 'endpoint', 'grant', 'allowlist', 'audit',
     ])
     expect(RUNNER_PROJECT_COMMANDS).toEqual(['create', 'list', 'remove'])
   })

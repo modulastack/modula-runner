@@ -87,9 +87,6 @@ export function createHomeFixtureStorage(fixture: string, record: (event: string
       }
       return { status: 'written', sha256: 'a'.repeat(64) }
     },
-    async append() {
-      return 'storage-unavailable'
-    },
   }
 }
 

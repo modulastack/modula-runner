@@ -74,6 +74,7 @@ function application(
   projects = projectRegistry(),
   stateOverrides: Partial<RunnerHomeState> = {},
   runtimeOverride?: RunnerRuntimePort,
+  applicationOverrides: Partial<Pick<RunnerApplicationOptions, 'auditArchive'>> = {},
 ) {
   const state = { projects, ...stateOverrides } as unknown as RunnerHomeState
   const open = vi.fn<RunnerHome['open']>(async () => ({ status: 'ready', home: state }))
@@ -90,6 +91,7 @@ function application(
       jobControl: () => ({ async *dispatch() {}, async *recover() {} }),
       runtime,
     },
+    ...applicationOverrides,
   }
   return { value: createRunnerApplication(options), open, close }
 }
@@ -149,6 +151,31 @@ describe('core runner application commands', () => {
     await expect(app.value.execute(version.value)).resolves.toBe(0)
     expect(help.stdout.join('')).toContain('modula-runner')
     expect(version.stdout).toEqual(['0.1.0\n'])
+    expect(app.open).not.toHaveBeenCalled()
+  })
+
+  it('archives audit segments offline without opening the foreground home', async () => {
+    const archive = vi.fn(async () => ({ status: 'archived' as const, segments: 2, bytes: 4096, acknowledgementDigests: ['a'.repeat(64)] }))
+    const app = application(pairing(), projectRegistry(), {}, undefined, { auditArchive: { archive } })
+    const input = invocation(['audit', 'archive', '--output', './archive'], { cwd: '/operator', runnerHome: '/runner-home' })
+
+    await expect(app.value.execute(input.value)).resolves.toBe(0)
+    expect(archive).toHaveBeenCalledWith({ override: '/runner-home' }, '/operator/archive')
+    expect(app.open).not.toHaveBeenCalled()
+    expect(input.stdout).toEqual([`${JSON.stringify({ status: 'archived', segments: 2, bytes: 4096 })}\n`])
+    expect(input.stdout.join('')).not.toContain('a'.repeat(64))
+  })
+
+  it('fails archive syntax and storage errors without opening mutable state', async () => {
+    const archive = vi.fn(async () => ({ status: 'storage-unavailable' as const }))
+    const app = application(pairing(), projectRegistry(), {}, undefined, { auditArchive: { archive } })
+    const invalid = invocation(['audit', 'archive', '--output'])
+    await expect(app.value.execute(invalid.value)).resolves.toBe(2)
+    expect(archive).not.toHaveBeenCalled()
+
+    const failed = invocation(['audit', 'archive', '--output', '/archive'])
+    await expect(app.value.execute(failed.value)).resolves.toBe(1)
+    expect(failed.stderr).toEqual(['audit-unavailable: archive failed closed\n'])
     expect(app.open).not.toHaveBeenCalled()
   })
 

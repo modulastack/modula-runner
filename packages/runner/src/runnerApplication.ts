@@ -24,8 +24,9 @@ import {
   runProfileCommand,
 } from './runnerConfigurationCommands.js'
 import { assertProviderName } from './apiKeys.js'
+import type { RunnerAuditArchiveResult } from './auditLifecycle.js'
 import type { RunnerClock } from './runtimeClock.js'
-import type { RunnerHome, RunnerHomeFailure, RunnerHomeState } from './runnerHome.js'
+import type { RunnerHome, RunnerHomeFailure, RunnerHomeSelection, RunnerHomeState } from './runnerHome.js'
 import type { SessionJobControl } from './sessionJobControl.js'
 import type { SessionLauncher } from './sessionLaunch.js'
 
@@ -41,6 +42,7 @@ export const RUNNER_TOP_LEVEL_COMMANDS = [
   'endpoint',
   'grant',
   'allowlist',
+  'audit',
 ] as const
 export type RunnerTopLevelCommand = (typeof RUNNER_TOP_LEVEL_COMMANDS)[number]
 
@@ -117,11 +119,16 @@ export type RunnerComposition = {
   runtime: RunnerRuntimePort
 }
 
+export interface RunnerAuditArchivePort {
+  archive(selection: RunnerHomeSelection, destination: string): Promise<RunnerAuditArchiveResult>
+}
+
 export type RunnerApplicationOptions = {
   version: string
   home: RunnerHome
   clock: RunnerClock
   composition: RunnerComposition
+  auditArchive?: RunnerAuditArchivePort
 }
 
 export class RunnerApplicationNotImplementedError extends Error {
@@ -150,12 +157,13 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
   if (command === '--help' || command === 'help') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: helpText() })
   if (command === '--version' || command === 'version') return emit(invocation.io, args.length ? usage() : { exitCode: 0, stdout: options.version })
   if (!command) return emit(invocation.io, usage())
-  if (!['pair', 'status', 'run', 'project', 'key', 'grant', 'profile', 'endpoint', 'allowlist'].includes(command)) {
+  if (!['pair', 'status', 'run', 'project', 'key', 'grant', 'profile', 'endpoint', 'allowlist', 'audit'].includes(command)) {
     if ((RUNNER_TOP_LEVEL_COMMANDS as readonly string[]).includes(command)) throw new RunnerApplicationNotImplementedError()
     return emit(invocation.io, usage())
   }
   const syntax = commandSyntax(command, args, invocation)
   if (syntax) return emit(invocation.io, syntax)
+  if (command === 'audit') return emit(invocation.io, await auditArchiveCommand(options, invocation, args[2]!))
   if (command === 'allowlist' && args[0] === 'init') {
     try {
       return emit(invocation.io, await runAllowlistInit(options.home, homeSelection(invocation), invocation.cwd, args))
@@ -242,11 +250,31 @@ function commandSyntax(command: string, args: readonly string[], invocation: Run
     const message = endpointCommandSyntax(args, invocation.environment.endpointUrl)
     return message ? usage(message) : null
   }
+  if (command === 'audit') {
+    if (args.length !== 3 || args[0] !== 'archive' || args[1] !== '--output'
+      || !args[2] || hasControlCharacter(args[2])) return usage('usage: modula-runner audit archive --output <directory>')
+  }
   if (command === 'allowlist') {
     const message = allowlistCommandSyntax(args, invocation.cwd)
     return message ? usage(message) : null
   }
   return null
+}
+
+async function auditArchiveCommand(
+  options: RunnerApplicationOptions,
+  invocation: RunnerCliInvocation,
+  destination: string,
+): Promise<CommandOutcome> {
+  if (!options.auditArchive) return { exitCode: 1, stderr: 'audit-unavailable: archive adapter is unavailable' }
+  try {
+    const result = await options.auditArchive.archive(homeSelection(invocation), path.resolve(invocation.cwd, destination))
+    if (result.status === 'storage-unavailable') return { exitCode: 1, stderr: 'audit-unavailable: archive failed closed' }
+    if (result.status === 'nothing-to-archive') return { exitCode: 0, stdout: JSON.stringify({ status: result.status }) }
+    return { exitCode: 0, stdout: JSON.stringify({ status: result.status, segments: result.segments, bytes: result.bytes }) }
+  } catch {
+    return { exitCode: 1, stderr: 'audit-unavailable: archive failed closed' }
+  }
 }
 
 async function pairCommand(
@@ -496,7 +524,7 @@ function homeFailure(code: RunnerHomeFailure): CommandOutcome {
   return { exitCode: 1, stderr: `${code}: runner home preflight failed` }
 }
 
-function usage(message = 'usage: modula-runner <help|version|pair|status|run|key|project|profile|endpoint|grant|allowlist>'): CommandOutcome {
+function usage(message = 'usage: modula-runner <help|version|pair|status|run|key|project|profile|endpoint|grant|allowlist|audit>'): CommandOutcome {
   return { exitCode: 2, stderr: message }
 }
 

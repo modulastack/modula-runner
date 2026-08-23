@@ -175,6 +175,7 @@ describe('CP-5 IC-4 credential boundaries', () => {
     const auditRecords: AuditRecord[] = [{
       kind: 'refused',
       requestId: 'representative-job',
+      spawnKind: 'pane',
       executable: null,
       recipeId: null,
       cwd: null,

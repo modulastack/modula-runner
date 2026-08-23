@@ -3,7 +3,6 @@ import { PROTOCOL_VERSION } from '@modulastack/runner-protocol'
 import {
   AUDIT_RECORD_SCHEMA_VERSION,
   AUDIT_SEGMENT_STATES,
-  AuditLifecycleNotImplementedError,
   MAX_AUDIT_METADATA_BYTES,
   MAX_AUDIT_RECORD_BYTES,
   MAX_AUDIT_SEGMENT_BYTES,
@@ -29,11 +28,11 @@ describe('audit lifecycle interface checkpoint', () => {
     expect(AUDIT_SEGMENT_STATES).toEqual(['open', 'sealed', 'acked', 'reclaimed'])
   })
 
-  it('fails closed for an unusable lifecycle root and keeps offline archive inactive', async () => {
+  it('fails closed for unusable lifecycle and archive roots', async () => {
     await expect(openRunnerAuditLifecycle({ runnerHome: '/inactive' }))
       .resolves.toEqual({ status: 'storage-unavailable' })
     await expect(archiveRunnerAudit({ runnerHome: '/inactive', destination: '/inactive-archive' }))
-      .rejects.toBeInstanceOf(AuditLifecycleNotImplementedError)
+      .resolves.toEqual({ status: 'storage-unavailable' })
   })
 
   it('does not classify a channel event without a current receipt', async () => {

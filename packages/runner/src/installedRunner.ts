@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { archiveRunnerAudit } from './fileAuditLifecycle.js'
 import { createFileRunnerHome } from './fileRunnerHome.js'
 import { createPairingContractService } from './pairingContract.js'
 import { createPairingHttpTransport } from './pairingHttpTransport.js'
@@ -20,10 +21,8 @@ export type InstalledRunnerOptions = {
 
 export function createInstalledRunnerApplication(options: InstalledRunnerOptions): RunnerApplication {
   const clock = systemClock()
-  const home = createFileRunnerHome({
-    defaultRoot: path.resolve(options.defaultHomeRoot ?? path.join(homedir(), '.modula-runner')),
-    clock,
-  })
+  const defaultHomeRoot = path.resolve(options.defaultHomeRoot ?? path.join(homedir(), '.modula-runner'))
+  const home = createFileRunnerHome({ defaultRoot: defaultHomeRoot, clock })
   const transport = createPairingHttpTransport()
   const composition: RunnerComposition = {
     pairing: state => createPairingContractService({ store: state.pairing, transport, clock }),
@@ -31,7 +30,18 @@ export function createInstalledRunnerApplication(options: InstalledRunnerOptions
     jobControl: launcher => createSessionJobControl({ launcher }),
     runtime: createRunnerRuntime({ clock }),
   }
-  return createRunnerApplication({ version: options.version, home, clock, composition })
+  return createRunnerApplication({
+    version: options.version,
+    home,
+    clock,
+    composition,
+    auditArchive: {
+      archive: (selection, destination) => archiveRunnerAudit({
+        runnerHome: path.resolve(selection.override ?? defaultHomeRoot),
+        destination,
+      }),
+    },
+  })
 }
 
 function systemClock(): RunnerClock {

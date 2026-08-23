@@ -153,10 +153,3 @@ export type RunnerAuditArchiveResult =
   | { status: 'archived'; segments: number; bytes: number; acknowledgementDigests: readonly string[] }
   | { status: 'nothing-to-archive' }
   | { status: 'storage-unavailable' }
-
-export class AuditLifecycleNotImplementedError extends Error {
-  constructor() {
-    super('the segmented audit lifecycle is interface-only and is not active')
-    this.name = 'AuditLifecycleNotImplementedError'
-  }
-}

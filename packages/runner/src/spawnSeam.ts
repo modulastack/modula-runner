@@ -157,6 +157,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
     options.audit.append({
       kind: 'refused',
       requestId: request.requestId ?? null,
+      spawnKind: request.kind,
       // A refusal names what the request named, not what it resolved to — an unknown recipe has
       // no command to record, and a refused executable is exactly the one asked for.
       executable: request.recipeId !== undefined ? null : (request.executable ?? null),
@@ -198,6 +199,8 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
       await options.audit.append({
         kind: 'spawn-admitted',
         spawnId,
+        spawnKind: request.kind,
+        requestId: request.requestId ?? null,
         executable: request.recipeId !== undefined ? resolved.command : (request.executable ?? null),
         recipeId: request.recipeId ?? null,
         cwd,

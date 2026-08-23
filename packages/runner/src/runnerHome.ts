@@ -1,5 +1,6 @@
 import type { ApiKeyStore } from './apiKeys.js'
 import type { LocalModelProfile } from './accessProfiles.js'
+import type { RunnerAuditLifecycleOpen } from './auditLifecycle.js'
 import type { AuditLog } from './auditLog.js'
 import type { CommandPolicy, SignedAllowlist, TrustAnchor } from './allowlist.js'
 import type { Grants } from './consent.js'
@@ -144,7 +145,7 @@ export interface RunnerHomeStorage {
   close?(): Promise<void>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
-  append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'>
+  openAuditLifecycle?(): Promise<RunnerAuditLifecycleOpen>
 }
 
 export type RunnerHomeOptions = {
@@ -251,17 +252,17 @@ async function failedInitialization(
 async function releaseAndClose(storage: RunnerHomeStorage, lease: { held: boolean }): Promise<boolean> {
   let clean = true
   let released = !lease.held
-  if (lease.held && storage.release) {
+  if (storage.close) {
     try {
-      await storage.release()
+      await storage.close()
       released = true
     } catch {
       clean = false
     }
   }
-  if (storage.close) {
+  if (lease.held && storage.release) {
     try {
-      await storage.close()
+      await storage.release()
       released = true
     } catch {
       clean = false

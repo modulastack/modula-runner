@@ -4,6 +4,7 @@ import { constants, type BigIntStats, type Stats } from 'node:fs'
 import { lstat, mkdir, open, readFile, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { RunnerAuditLifecycle } from './auditLifecycle.js'
 import {
   RUNNER_HOME_RECORDS,
   type RunnerHomeCustodyInspection,
@@ -74,6 +75,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   private rootHandle: FileHandle | null = null
   private rootIdentity: RootIdentity | null = null
   private lockHandle: FileHandle | null = null
+  private auditLifecycle: RunnerAuditLifecycle | null = null
   private readonly uid: number | undefined
 
   constructor(private readonly options: FileRunnerHomeStorageOptions) {
@@ -95,6 +97,8 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   close(): Promise<void> {
     return this.serialize(async () => {
+      await this.auditLifecycle?.close()
+      this.auditLifecycle = null
       await this.releaseLock()
       await this.rootHandle?.close()
       this.rootHandle = null
@@ -124,6 +128,21 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'> {
     return this.serialize(async () => await this.appendAudit(record, bytes))
+  }
+
+  openAuditLifecycle() {
+    return this.serialize(async () => {
+      if (this.auditLifecycle || !this.root || !this.lockHandle || !(await this.boundRoot())) {
+        return { status: 'storage-unavailable' as const }
+      }
+      const { openBoundRunnerAuditLifecycle } = await import('./fileAuditLifecycle.js')
+      const opened = await openBoundRunnerAuditLifecycle({
+        runnerHome: this.root,
+        ...(this.uid === undefined ? {} : { currentUserId: this.uid }),
+      })
+      if (opened.status === 'ready') this.auditLifecycle = opened.audit
+      return opened
+    })
   }
 
   private async inspectSelected(selection: RunnerHomeSelection): Promise<RunnerHomeInspection> {

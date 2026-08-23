@@ -17,9 +17,10 @@ import {
   MAX_AUDIT_SEGMENT_BYTES,
   MAX_AUDIT_SEGMENT_RECORDS,
   MAX_RESIDENT_AUDIT_SEGMENTS,
-  AuditLifecycleNotImplementedError,
+  type AuditArchiveAcknowledgement,
   type AuditLifecycleSnapshot,
   type AuditRecordInputV2,
+  type AuditReclamationTombstone,
   type AuditSegmentManifest,
   type RunnerAuditArchiveOptions,
   type RunnerAuditArchiveResult,
@@ -35,10 +36,16 @@ const DIRECTORY_MODE = 0o700
 const FILE_MODE = 0o600
 const AUDIT_DIRECTORY = 'audit.jsonl'
 const SEQUENCE_WIDTH = 20
-const SEGMENT_PATTERN = /^segment-([0-9]{20})\.(open|jsonl|manifest\.json|commit\.json)$/
-const TEMP_METADATA_PATTERN = /^segment-([0-9]{20})\.(manifest|commit)\.tmp-[0-9a-f]{32}$/
+const SEGMENT_PATTERN = /^segment-([0-9]{20})\.(open|jsonl|manifest\.json|commit\.json|ack\.json|tombstone\.json)$/
+const TEMP_METADATA_PATTERN = /^segment-([0-9]{20})\.(manifest|commit|ack|tombstone)\.tmp-[0-9a-f]{32}$/
 
 type DirectoryIdentity = { device: bigint; inode: bigint }
+type ArchiveDestination = {
+  path: string
+  directory: FileHandle
+  identity: DirectoryIdentity
+  uid: number | undefined
+}
 type SegmentSummary = {
   byteCount: number
   records: number
@@ -47,7 +54,11 @@ type SegmentSummary = {
   sha256: string
 }
 type SegmentScan = SegmentSummary & { bytes: Buffer }
-type SealedSegment = { manifest: AuditSegmentManifest; manifestBytes: Buffer }
+type SealedSegment = {
+  manifest: AuditSegmentManifest
+  manifestBytes: Buffer
+  acknowledgement?: { value: AuditArchiveAcknowledgement; bytes: Buffer }
+}
 type OpenSegment = Omit<SegmentSummary, 'sha256'> & {
   sequence: number
   handle: FileHandle
@@ -64,6 +75,14 @@ type OpenCommit = {
   lastRecordSequence: string | null
   sha256: string
   pendingRecordBase64?: string
+}
+
+type RecoveredSealed = {
+  resident: SealedSegment[]
+  metadataBytes: number
+  lastSequence: number
+  lastRecordSequence: string | null
+  previousManifestSha256: string | null
 }
 
 type RecoveredLifecycle = {
@@ -93,8 +112,36 @@ export async function openRunnerAuditLifecycle(options: RunnerAuditLifecycleOpti
   }
 }
 
-export async function archiveRunnerAudit(_options: RunnerAuditArchiveOptions): Promise<RunnerAuditArchiveResult> {
-  throw new AuditLifecycleNotImplementedError()
+export async function openBoundRunnerAuditLifecycle(
+  options: RunnerAuditLifecycleOptions,
+): Promise<RunnerAuditLifecycleOpen> {
+  try {
+    const recovered = await recoverLifecycle(path.resolve(options.runnerHome), options.currentUserId ?? process.getuid?.())
+    return { status: 'ready', audit: new FileRunnerAuditLifecycle(null, recovered) }
+  } catch {
+    return { status: 'storage-unavailable' }
+  }
+}
+
+export async function archiveRunnerAudit(options: RunnerAuditArchiveOptions): Promise<RunnerAuditArchiveResult> {
+  const root = path.resolve(options.runnerHome)
+  const storage = createFileRunnerHomeStorage({
+    defaultRoot: root,
+    ...(options.currentUserId === undefined ? {} : { currentUserId: options.currentUserId }),
+  })
+  let recovered: RecoveredLifecycle | undefined
+  let destination: ArchiveDestination | undefined
+  try {
+    destination = await openArchiveDestination(root, options.destination, options.currentUserId ?? process.getuid?.())
+    await storage.inspect({ override: root })
+    if (await storage.acquire?.() !== 'acquired') return await unavailableArchive(storage, destination)
+    recovered = await recoverLifecycle(root, options.currentUserId ?? process.getuid?.())
+    const result = await archiveSealed(recovered, destination, options.now ?? Date.now)
+    await closeArchiveResources(storage, recovered, destination)
+    return result
+  } catch {
+    return await unavailableArchive(storage, destination, recovered)
+  }
 }
 
 class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
@@ -108,7 +155,7 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
   private previousManifestSha256: string | null
 
   constructor(
-    private readonly storage: RunnerHomeStorage,
+    private readonly storage: RunnerHomeStorage | null,
     private readonly recovered: RecoveredLifecycle,
   ) {
     this.sealed = [...recovered.sealed]
@@ -240,13 +287,226 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     } catch (error) {
       failure = error
     }
-    try {
-      await this.storage.release?.()
-      await this.storage.close?.()
-    } catch (error) {
-      failure ??= error
+    if (this.storage) {
+      try {
+        await this.storage.release?.()
+        await this.storage.close?.()
+      } catch (error) {
+        failure ??= error
+      }
     }
     if (failure) throw failure
+  }
+}
+
+async function archiveSealed(
+  recovered: RecoveredLifecycle,
+  destination: ArchiveDestination,
+  now: () => number,
+): Promise<RunnerAuditArchiveResult> {
+  if (recovered.sealed.length === 0) return { status: 'nothing-to-archive' }
+  const at = new Date(now())
+  if (!Number.isFinite(at.getTime())) throw new Error('invalid archive clock')
+  let metadataBytes = recovered.metadataBytes
+  let archivedBytes = 0
+  const acknowledgementDigests: string[] = []
+  for (const segment of recovered.sealed) {
+    let acknowledgement = segment.acknowledgement
+    if (!acknowledgement) {
+      const source = await readResidentSegment(recovered, segment.manifest)
+      const artifactSha256 = await copyArchiveArtifact(destination, segment, source)
+      const value: AuditArchiveAcknowledgement = {
+        schemaVersion: 1,
+        segmentSequence: segment.manifest.sequence,
+        segmentSha256: segment.manifest.sha256,
+        manifestSha256: sha256(segment.manifestBytes),
+        bytes: segment.manifest.bytes,
+        records: segment.manifest.records,
+        exportId: sha256(Buffer.concat([Buffer.from('runner-audit-export-v1\0'), segment.manifestBytes])),
+        artifactSha256,
+        acknowledgedAt: at.toISOString(),
+      }
+      const bytes = metadataBytesFor(value)
+      if (metadataBytes + bytes.byteLength > MAX_AUDIT_METADATA_BYTES) throw new Error('audit metadata capacity exhausted')
+      await writeLifecycleMetadata(recovered, Number(segment.manifest.sequence), 'ack.json', bytes)
+      acknowledgement = { value, bytes }
+      metadataBytes += bytes.byteLength
+    }
+    const tombstone: AuditReclamationTombstone = {
+      schemaVersion: 1,
+      segmentSequence: segment.manifest.sequence,
+      segmentSha256: segment.manifest.sha256,
+      acknowledgementSha256: sha256(acknowledgement.bytes),
+      reclaimedAt: at.toISOString(),
+    }
+    const tombstoneBytes = metadataBytesFor(tombstone)
+    if (metadataBytes + tombstoneBytes.byteLength > MAX_AUDIT_METADATA_BYTES) throw new Error('audit metadata capacity exhausted')
+    await writeLifecycleMetadata(recovered, Number(segment.manifest.sequence), 'tombstone.json', tombstoneBytes)
+    metadataBytes += tombstoneBytes.byteLength
+    await unlink(path.join(recovered.directoryPath, segmentName(Number(segment.manifest.sequence), 'jsonl')))
+    await syncDirectory(recovered)
+    archivedBytes += segment.manifest.bytes
+    acknowledgementDigests.push(sha256(acknowledgement.bytes))
+  }
+  return { status: 'archived', segments: recovered.sealed.length, bytes: archivedBytes, acknowledgementDigests }
+}
+
+async function readResidentSegment(recovered: RecoveryPath, manifest: AuditSegmentManifest): Promise<Buffer> {
+  const sequence = Number(manifest.sequence)
+  const target = path.join(recovered.directoryPath, segmentName(sequence, 'jsonl'))
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const info = await handle.stat({ bigint: true })
+    if (!secureRecord(info, recovered.uid) || Number(info.size) !== manifest.bytes) throw new Error('resident audit segment changed')
+    const bytes = await readAll(handle, Number(info.size))
+    if (sha256(bytes) !== manifest.sha256) throw new Error('resident audit segment digest changed')
+    return bytes
+  } finally {
+    await handle.close()
+  }
+}
+
+async function copyArchiveArtifact(
+  destination: ArchiveDestination,
+  segment: SealedSegment,
+  source: Buffer,
+): Promise<string> {
+  const prefix = `segment-${String(segment.manifest.sequence).padStart(SEQUENCE_WIDTH, '0')}-${segment.manifest.sha256}`
+  await copyArchiveFile(destination, `${prefix}.jsonl`, source)
+  await copyArchiveFile(destination, `${prefix}.manifest.json`, segment.manifestBytes)
+  return sha256(Buffer.concat([Buffer.from('runner-audit-artifact-v1\0'), source, segment.manifestBytes]))
+}
+
+async function copyArchiveFile(destination: ArchiveDestination, name: string, bytes: Buffer): Promise<void> {
+  await assertArchiveDestination(destination)
+  const target = path.join(destination.path, name)
+  const existing = await lstat(target).catch(error => missingOnly(error))
+  if (existing !== null) {
+    const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      const info = await handle.stat({ bigint: true })
+      if (!secureRecord(info, destination.uid) || Number(info.size) !== bytes.byteLength
+        || !(await readAll(handle, bytes.byteLength)).equals(bytes)) throw new Error('archive artifact conflicts')
+    } finally {
+      await handle.close()
+    }
+    return
+  }
+  const temporary = path.join(destination.path, `.tmp-${randomBytes(16).toString('hex')}`)
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+    await writeAll(handle, bytes)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(temporary, target)
+    await destination.directory.sync()
+    await assertArchiveDestination(destination)
+  } catch (error) {
+    // A failed copy has no acknowledgement; its private temporary cannot authorize reclamation.
+    await handle?.close().catch(() => undefined)
+    // The final artifact name is the only destination commit marker.
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+}
+
+async function openArchiveDestination(
+  runnerHome: string,
+  selected: string,
+  uid: number | undefined,
+): Promise<ArchiveDestination> {
+  const destinationPath = path.resolve(selected)
+  if (containsPath(runnerHome, destinationPath) || containsPath(destinationPath, runnerHome)) {
+    throw new Error('archive destination overlaps runner home')
+  }
+  const info = await lstat(destinationPath, { bigint: true })
+  if (!secureDirectory(info, uid)) throw new Error('insecure archive destination')
+  const directory = await open(destinationPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  const held = await directory.stat({ bigint: true })
+  if (!secureDirectory(held, uid) || held.dev !== info.dev || held.ino !== info.ino) {
+    await directory.close()
+    throw new Error('archive destination identity changed')
+  }
+  return { path: destinationPath, directory, identity: identityOf(held), uid }
+}
+
+async function assertArchiveDestination(destination: ArchiveDestination): Promise<void> {
+  const [held, current] = await Promise.all([
+    destination.directory.stat({ bigint: true }),
+    lstat(destination.path, { bigint: true }),
+  ])
+  if (!secureDirectory(held, destination.uid) || !secureDirectory(current, destination.uid)
+    || held.dev !== destination.identity.device || held.ino !== destination.identity.inode
+    || current.dev !== destination.identity.device || current.ino !== destination.identity.inode) {
+    throw new Error('archive destination identity changed')
+  }
+}
+
+function containsPath(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate)
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+}
+
+async function closeArchiveResources(
+  storage: RunnerHomeStorage,
+  recovered: RecoveredLifecycle,
+  destination: ArchiveDestination,
+): Promise<void> {
+  await recovered.current.handle.sync()
+  await recovered.current.handle.close()
+  await recovered.directory.close()
+  await destination.directory.close()
+  await storage.release?.()
+  await storage.close?.()
+}
+
+async function unavailableArchive(
+  storage: RunnerHomeStorage,
+  destination?: ArchiveDestination,
+  recovered?: RecoveredLifecycle,
+): Promise<RunnerAuditArchiveResult> {
+  // The result is already fail-closed; cleanup errors cannot authorize reclamation.
+  await recovered?.current.handle.close().catch(() => undefined)
+  // The source directory descriptor carries no state after the operation is unavailable.
+  await recovered?.directory.close().catch(() => undefined)
+  // Destination cleanup cannot change whether an acknowledgement was durably written.
+  await destination?.directory.close().catch(() => undefined)
+  // A failed archive operation must release its exclusive lease for operator retry.
+  await storage.release?.().catch(() => undefined)
+  // Closing an already-unavailable adapter cannot make the archive successful.
+  await storage.close?.().catch(() => undefined)
+  return { status: 'storage-unavailable' }
+}
+
+function metadataBytesFor(value: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(value)}\n`)
+}
+
+async function writeLifecycleMetadata(
+  recovered: RecoveryPath,
+  sequence: number,
+  extension: 'ack.json' | 'tombstone.json',
+  bytes: Buffer,
+): Promise<void> {
+  const finalPath = path.join(recovered.directoryPath, segmentName(sequence, extension))
+  const temporary = `${finalPath.replace(/\.json$/, '')}.tmp-${randomBytes(16).toString('hex')}`
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+    await writeAll(handle, bytes)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(temporary, finalPath)
+    await syncDirectory(recovered)
+  } catch (error) {
+    // Only the final metadata name is authoritative.
+    await handle?.close().catch(() => undefined)
+    // An interrupted private temp is removed or ignored by recovery.
+    await unlink(temporary).catch(() => undefined)
+    throw error
   }
 }
 
@@ -264,28 +524,30 @@ async function recoverLifecycle(root: string, uid: number | undefined): Promise<
     if (grouped.commits.some(sequence => !grouped.segments.includes(sequence) && !grouped.opens.includes(sequence))) {
       throw new Error('audit commit has no segment')
     }
-    const sealed = await recoverSealed(recovered, grouped.segments, grouped.manifests, grouped.commits)
-    const sealedMetadataBytes = sealed.reduce((total, segment) => total + segment.manifestBytes.byteLength, 0)
-    if (sealedMetadataBytes > MAX_AUDIT_METADATA_BYTES || sealed.length >= MAX_RESIDENT_AUDIT_SEGMENTS) throw new Error('audit metadata capacity exhausted')
-    const expectedOpen = sealed.length + 1
+    const recoveredSealed = await recoverSealed(recovered, grouped)
+    if (recoveredSealed.metadataBytes > MAX_AUDIT_METADATA_BYTES
+      || recoveredSealed.resident.length >= MAX_RESIDENT_AUDIT_SEGMENTS) {
+      throw new Error('audit metadata capacity exhausted')
+    }
+    const expectedOpen = recoveredSealed.lastSequence + 1
     if (grouped.opens.length > 1 || (grouped.opens[0] !== undefined && grouped.opens[0] !== expectedOpen)) {
       throw new Error('ambiguous audit open segment')
     }
     const current = grouped.opens.length === 0
       ? await createOpenSegment(recovered, expectedOpen)
       : await openExistingSegment(recovered, expectedOpen, grouped.commits.includes(expectedOpen))
-    const previousManifestSha256 = sealed.length ? sha256(sealed.at(-1)!.manifestBytes) : null
-    const previousRecord = sealed.at(-1)?.manifest.lastRecordSequence
+    const previousManifestSha256 = recoveredSealed.previousManifestSha256
+    const previousRecord = recoveredSealed.lastRecordSequence ?? undefined
     if (previousRecord && current.firstRecordSequence && Number(current.firstRecordSequence) !== Number(previousRecord) + 1) {
       throw new Error('audit record sequence gap')
     }
     const lastRecord = current.lastRecordSequence ?? previousRecord
     return {
       ...recovered,
-      sealed,
+      sealed: recoveredSealed.resident,
       current,
       nextRecordSequence: lastRecord ? Number(lastRecord) + 1 : 1,
-      metadataBytes: sealedMetadataBytes + current.commitBytes,
+      metadataBytes: recoveredSealed.metadataBytes + current.commitBytes,
       previousManifestSha256,
     }
   } catch (error) {
@@ -314,6 +576,8 @@ function classifyEntries(entries: readonly string[]) {
   const segments: number[] = []
   const manifests: number[] = []
   const commits: number[] = []
+  const acknowledgements: number[] = []
+  const tombstones: number[] = []
   const opens: number[] = []
   for (const entry of entries) {
     if (TEMP_METADATA_PATTERN.test(entry)) continue
@@ -323,54 +587,77 @@ function classifyEntries(entries: readonly string[]) {
     if (matched[2] === 'open') opens.push(sequence)
     else if (matched[2] === 'jsonl') segments.push(sequence)
     else if (matched[2] === 'manifest.json') manifests.push(sequence)
-    else commits.push(sequence)
+    else if (matched[2] === 'commit.json') commits.push(sequence)
+    else if (matched[2] === 'ack.json') acknowledgements.push(sequence)
+    else tombstones.push(sequence)
   }
   return {
     segments: segments.sort(numeric),
     manifests: manifests.sort(numeric),
     commits: commits.sort(numeric),
+    acknowledgements: acknowledgements.sort(numeric),
+    tombstones: tombstones.sort(numeric),
     opens: opens.sort(numeric),
   }
 }
 
 async function recoverSealed(
   recovered: RecoveryPath,
-  segments: readonly number[],
-  manifests: readonly number[],
-  commits: readonly number[],
-): Promise<SealedSegment[]> {
-  if (segments.some((sequence, index) => sequence !== index + 1)) throw new Error('audit segment sequence gap')
-  if (manifests.some(sequence => !segments.includes(sequence))) throw new Error('audit manifest has no segment')
-  const sealed: SealedSegment[] = []
+  grouped: ReturnType<typeof classifyEntries>,
+): Promise<RecoveredSealed> {
+  const maxSequence = Math.max(0, ...grouped.segments, ...grouped.manifests)
+  if (grouped.manifests.some((sequence, index) => sequence !== index + 1)) throw new Error('audit manifest sequence gap')
+  if (grouped.acknowledgements.some(sequence => !grouped.manifests.includes(sequence))) throw new Error('audit acknowledgement has no manifest')
+  if (grouped.tombstones.some(sequence => !grouped.acknowledgements.includes(sequence))) throw new Error('audit tombstone has no acknowledgement')
+  const resident: SealedSegment[] = []
+  let metadataBytes = 0
   let previousManifestSha256: string | null = null
   let previousRecord = 0
-  for (const sequence of segments) {
-    const scan = await scanSegment(recovered, sequence, 'jsonl')
-    if (scan.records === 0 || !scan.firstRecordSequence || !scan.lastRecordSequence) throw new Error('empty sealed audit segment')
-    if (commits.includes(sequence)) {
-      const { commit } = await readOpenCommit(recovered, sequence)
-      if (!commitMatches(commit, sequence, scan)) throw new Error('audit open commit mismatch')
-    }
-    if (Number(scan.firstRecordSequence) !== previousRecord + 1) throw new Error('audit record sequence gap')
+  for (let sequence = 1; sequence <= maxSequence; sequence += 1) {
+    let scan = grouped.segments.includes(sequence) ? await scanSegment(recovered, sequence, 'jsonl') : null
+    if (scan && (scan.records === 0 || !scan.firstRecordSequence || !scan.lastRecordSequence)) throw new Error('empty sealed audit segment')
     let manifest: AuditSegmentManifest
     let manifestBytes: Buffer
-    if (manifests.includes(sequence)) {
+    if (grouped.manifests.includes(sequence)) {
       ;({ manifest, bytes: manifestBytes } = await readManifest(recovered, sequence))
-      if (!manifestMatches(manifest, sequence, scan, previousManifestSha256)) throw new Error('audit manifest mismatch')
     } else {
-      if (sequence !== segments.at(-1)) throw new Error('interrupted nonterminal audit seal')
+      if (!scan || sequence !== maxSequence) throw new Error('interrupted nonterminal audit seal')
       manifest = manifestFor(sequence, scan, previousManifestSha256)
       manifestBytes = await writeManifest(recovered, manifest)
     }
-    if (commits.includes(sequence)) {
+    if (!manifestChainMatches(manifest, sequence, previousRecord, previousManifestSha256)) throw new Error('audit manifest chain mismatch')
+    if (scan && !manifestMatches(manifest, sequence, scan, previousManifestSha256)) throw new Error('audit manifest mismatch')
+    const acknowledgement = grouped.acknowledgements.includes(sequence)
+      ? await readAcknowledgement(recovered, sequence, manifest, manifestBytes)
+      : undefined
+    const tombstone = grouped.tombstones.includes(sequence)
+      ? await readTombstone(recovered, sequence, manifest, acknowledgement!)
+      : undefined
+    if (!scan && !tombstone) throw new Error('audit manifest has no resident or reclaimed segment')
+    if (grouped.commits.includes(sequence)) {
+      if (!scan) throw new Error('audit commit has no resident segment')
+      const { commit } = await readOpenCommit(recovered, sequence)
+      if (!commitMatches(commit, sequence, scan)) throw new Error('audit open commit mismatch')
       await unlink(path.join(recovered.directoryPath, segmentName(sequence, 'commit.json')))
       await syncDirectory(recovered)
     }
-    sealed.push({ manifest, manifestBytes })
+    if (scan && tombstone) {
+      await unlink(path.join(recovered.directoryPath, segmentName(sequence, 'jsonl')))
+      await syncDirectory(recovered)
+      scan = null
+    }
+    if (scan) resident.push({ manifest, manifestBytes, ...(acknowledgement ? { acknowledgement } : {}) })
+    metadataBytes += manifestBytes.byteLength + (acknowledgement?.bytes.byteLength ?? 0) + (tombstone?.bytes.byteLength ?? 0)
     previousManifestSha256 = sha256(manifestBytes)
-    previousRecord = Number(scan.lastRecordSequence)
+    previousRecord = Number(manifest.lastRecordSequence)
   }
-  return sealed
+  return {
+    resident,
+    metadataBytes,
+    lastSequence: maxSequence,
+    lastRecordSequence: maxSequence === 0 ? null : String(previousRecord),
+    previousManifestSha256,
+  }
 }
 
 async function createOpenSegment(recovered: RecoveryPath, sequence: number): Promise<OpenSegment> {
@@ -633,6 +920,26 @@ async function readManifest(recovered: RecoveryPath, sequence: number): Promise<
   }
 }
 
+function manifestChainMatches(
+  manifest: AuditSegmentManifest,
+  sequence: number,
+  previousRecord: number,
+  previousManifestSha256: string | null,
+): boolean {
+  const first = Number(manifest.firstRecordSequence)
+  const last = Number(manifest.lastRecordSequence)
+  return manifest.schemaVersion === AUDIT_SEGMENT_SCHEMA_VERSION
+    && manifest.sequence === String(sequence)
+    && manifest.state === 'sealed'
+    && manifest.recordSchemaVersion === 2
+    && Number.isSafeInteger(manifest.bytes) && manifest.bytes > 0 && manifest.bytes <= MAX_AUDIT_SEGMENT_BYTES
+    && Number.isSafeInteger(manifest.records) && manifest.records > 0 && manifest.records <= MAX_AUDIT_SEGMENT_RECORDS
+    && sha256Value(manifest.sha256)
+    && Number.isSafeInteger(first) && first === previousRecord + 1
+    && Number.isSafeInteger(last) && last - first + 1 === manifest.records
+    && manifest.previousManifestSha256 === previousManifestSha256
+}
+
 function manifestMatches(
   manifest: AuditSegmentManifest,
   sequence: number,
@@ -649,6 +956,65 @@ function manifestMatches(
     && manifest.firstRecordSequence === scan.firstRecordSequence
     && manifest.lastRecordSequence === scan.lastRecordSequence
     && manifest.previousManifestSha256 === previousManifestSha256
+}
+
+async function readAcknowledgement(
+  recovered: RecoveryPath,
+  sequence: number,
+  manifest: AuditSegmentManifest,
+  manifestBytes: Buffer,
+): Promise<{ value: AuditArchiveAcknowledgement; bytes: Buffer }> {
+  const { value, bytes } = await readMetadata(recovered, sequence, 'ack.json')
+  const acknowledgement = value as AuditArchiveAcknowledgement
+  if (acknowledgement.schemaVersion !== 1
+    || acknowledgement.segmentSequence !== String(sequence)
+    || acknowledgement.segmentSha256 !== manifest.sha256
+    || acknowledgement.manifestSha256 !== sha256(manifestBytes)
+    || acknowledgement.bytes !== manifest.bytes
+    || acknowledgement.records !== manifest.records
+    || !sha256Value(acknowledgement.exportId)
+    || !sha256Value(acknowledgement.artifactSha256)
+    || !validTimestamp(acknowledgement.acknowledgedAt)) {
+    throw new Error('invalid audit archive acknowledgement')
+  }
+  return { value: acknowledgement, bytes }
+}
+
+async function readTombstone(
+  recovered: RecoveryPath,
+  sequence: number,
+  manifest: AuditSegmentManifest,
+  acknowledgement: { value: AuditArchiveAcknowledgement; bytes: Buffer },
+): Promise<{ value: AuditReclamationTombstone; bytes: Buffer }> {
+  const { value, bytes } = await readMetadata(recovered, sequence, 'tombstone.json')
+  const tombstone = value as AuditReclamationTombstone
+  if (tombstone.schemaVersion !== 1
+    || tombstone.segmentSequence !== String(sequence)
+    || tombstone.segmentSha256 !== manifest.sha256
+    || tombstone.acknowledgementSha256 !== sha256(acknowledgement.bytes)
+    || !validTimestamp(tombstone.reclaimedAt)) {
+    throw new Error('invalid audit reclamation tombstone')
+  }
+  return { value: tombstone, bytes }
+}
+
+async function readMetadata(
+  recovered: RecoveryPath,
+  sequence: number,
+  extension: 'ack.json' | 'tombstone.json',
+): Promise<{ value: unknown; bytes: Buffer }> {
+  const target = path.join(recovered.directoryPath, segmentName(sequence, extension))
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const info = await handle.stat({ bigint: true })
+    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid audit metadata')
+    const bytes = await readAll(handle, Number(info.size))
+    const value = JSON.parse(bytes.toString('utf8')) as unknown
+    if (!Buffer.from(`${JSON.stringify(value)}\n`).equals(bytes)) throw new Error('noncanonical audit metadata')
+    return { value, bytes }
+  } finally {
+    await handle.close()
+  }
 }
 
 async function removeInterruptedTemps(recovered: RecoveryPath): Promise<void> {
@@ -736,7 +1102,10 @@ async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
   }
 }
 
-function segmentName(sequence: number, extension: 'open' | 'jsonl' | 'manifest.json' | 'commit.json'): string {
+function segmentName(
+  sequence: number,
+  extension: 'open' | 'jsonl' | 'manifest.json' | 'commit.json' | 'ack.json' | 'tombstone.json',
+): string {
   if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error('invalid audit segment sequence')
   return `segment-${String(sequence).padStart(SEQUENCE_WIDTH, '0')}.${extension}`
 }
@@ -761,6 +1130,16 @@ function identityOf(info: BigIntStats): DirectoryIdentity {
 
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+function sha256Value(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+}
+
+function validTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value
 }
 
 function numeric(left: number, right: number): number {
