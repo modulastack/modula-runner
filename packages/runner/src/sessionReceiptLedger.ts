@@ -91,7 +91,18 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
         const receipt = initialReceipt(request, fingerprint, currentTime)
         if (!isValidReceipt(receipt)) return { status: 'storage-unavailable' }
         if (isActiveBlock(image.capacityBlockedUntil, currentTime) || !hasReceiptCapacity(image, receipt)) {
-          return await this.blockAdmission(image, request.expiresAt)
+          const blockedUntil = laterTimestamp(image.capacityBlockedUntil, request.expiresAt)
+          if (blockedUntil === image.capacityBlockedUntil) return { status: 'at-capacity', blockedUntil }
+          const blocked = nextImage(image, { capacityBlockedUntil: blockedUntil })
+          if (!blocked) return { status: 'storage-unavailable' }
+          const stored = await this.options.storage.replace(image.revision, blocked)
+          if (stored.status === 'storage-unavailable') return { status: 'storage-unavailable' }
+          if (stored.status === 'conflict') {
+            if (!isValidImage(stored.current)) return { status: 'storage-unavailable' }
+            image = stored.current
+            continue
+          }
+          return { status: 'at-capacity', blockedUntil }
         }
         const next = nextImage(image, { capacityBlockedUntil: null, receipts: [...image.receipts, receipt] })
         if (!next) return { status: 'storage-unavailable' }
@@ -161,23 +172,6 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
       const stored = await this.options.storage.replace(image.revision, compacted)
       if (stored.status !== 'updated') throw new SessionReceiptStorageUnavailableError()
     })
-  }
-
-  private async blockAdmission(image: SessionReceiptLedgerImage, expiresAt: string): Promise<SessionReceiptClaim> {
-    let current = image
-    for (let attempt = 0; attempt < MAX_CLAIM_CAS_ATTEMPTS; attempt += 1) {
-      const blockedUntil = laterTimestamp(current.capacityBlockedUntil, expiresAt)
-      if (blockedUntil === current.capacityBlockedUntil) return { status: 'at-capacity', blockedUntil }
-      const next = nextImage(current, { capacityBlockedUntil: blockedUntil })
-      if (!next) return { status: 'storage-unavailable' }
-      const stored = await this.options.storage.replace(current.revision, next)
-      if (stored.status === 'updated') return { status: 'at-capacity', blockedUntil }
-      if (stored.status === 'storage-unavailable' || !isValidImage(stored.current)) {
-        return { status: 'storage-unavailable' }
-      }
-      current = stored.current
-    }
-    return { status: 'storage-unavailable' }
   }
 
   private currentTime(candidate: string): string {

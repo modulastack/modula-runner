@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   MAX_FULL_SESSION_RECEIPT_BYTES,
+  MAX_FULL_SESSION_RECEIPTS,
   MAX_IN_FLIGHT_SESSION_RECEIPTS,
   MAX_PENDING_SESSION_LEDGER_OPERATIONS,
   MAX_SESSION_LEDGER_JSON_DEPTH,
@@ -31,6 +32,31 @@ function memoryStorage(initial = emptyImage()): { storage: SessionReceiptStorage
       },
       async replace(expectedRevision, next) {
         if (expectedRevision !== image.revision) return { status: 'conflict', current: structuredClone(image) }
+        image = { ...structuredClone(next), revision: expectedRevision + 1 }
+        return { status: 'updated', image: structuredClone(image) }
+      },
+    },
+  }
+}
+
+function storageWithFirstConflict(
+  initial: SessionReceiptLedgerImage,
+  winner: (current: SessionReceiptLedgerImage) => SessionReceiptLedgerImage,
+): { storage: SessionReceiptStorage; image: () => SessionReceiptLedgerImage; writes: () => number } {
+  let image = structuredClone(initial)
+  let writes = 0
+  return {
+    image: () => structuredClone(image),
+    writes: () => writes,
+    storage: {
+      load: async () => ({ status: 'loaded', image: structuredClone(image) }),
+      replace: async (expectedRevision, next) => {
+        writes += 1
+        if (expectedRevision !== image.revision) return { status: 'conflict', current: structuredClone(image) }
+        if (writes === 1) {
+          image = { ...structuredClone(winner(image)), revision: image.revision + 1 }
+          return { status: 'conflict', current: structuredClone(image) }
+        }
         image = { ...structuredClone(next), revision: expectedRevision + 1 }
         return { status: 'updated', image: structuredClone(image) }
       },
@@ -328,6 +354,84 @@ describe('production session receipt ledger', () => {
     ])
     expect(outcomes.every(outcome => outcome.status === 'at-capacity')).toBe(true)
     expect(held.image().capacityBlockedUntil).toBe('2026-08-21T00:10:00Z')
+  })
+
+  it('restarts the complete claim after a capacity-block conflict frees an in-flight slot', async () => {
+    const initial = emptyImage()
+    initial.receipts = Array.from({ length: MAX_IN_FLIGHT_SESSION_RECEIPTS }, (_, index) => receipt(index + 1, 'accepted', '2026-08-21T00:00:00Z'))
+    const raced = storageWithFirstConflict(initial, current => ({
+      ...current,
+      receipts: [
+        receipt(1, 'finished', '2026-08-19T00:00:00Z'),
+        receipt(2, 'finished', '2026-08-19T00:00:00Z'),
+        ...current.receipts.slice(2),
+        receipt(101, 'accepted', '2026-08-21T00:00:00Z'),
+      ],
+    }))
+    await expect(createSessionReceiptLedger({ storage: raced.storage, clock })
+      .claim(request(100), 'f'.repeat(64), '2026-08-21T00:00:00Z'))
+      .resolves.toMatchObject({ status: 'claimed', receipt: { key: { requestId: request(100).requestId } } })
+    expect(raced.writes()).toBe(2)
+    expect(raced.image()).toMatchObject({ capacityBlockedUntil: null })
+  })
+
+  it('replays a same-key winner after a capacity-block conflict', async () => {
+    const initial = emptyImage()
+    initial.receipts = Array.from({ length: MAX_IN_FLIGHT_SESSION_RECEIPTS }, (_, index) => receipt(index + 1, 'accepted', '2026-08-21T00:00:00Z'))
+    const winner = { ...receipt(100, 'accepted', '2026-08-21T00:00:00Z'), fingerprint: 'f'.repeat(64) }
+    const raced = storageWithFirstConflict(initial, current => ({
+      ...current,
+      receipts: [receipt(1, 'finished', '2026-08-19T00:00:00Z'), ...current.receipts.slice(1), winner],
+    }))
+    await expect(createSessionReceiptLedger({ storage: raced.storage, clock })
+      .claim(request(100), winner.fingerprint, '2026-08-21T00:00:00Z'))
+      .resolves.toMatchObject({ status: 'known', value: { key: winner.key } })
+    expect(raced.writes()).toBe(1)
+    expect(raced.image().capacityBlockedUntil).toBeNull()
+  })
+
+  it('restarts the complete claim after compaction frees full-record capacity', async () => {
+    const terminalAt = '2026-08-19T00:00:00Z'
+    const initial = emptyImage()
+    initial.receipts = Array.from({ length: MAX_FULL_SESSION_RECEIPTS }, (_, index) => receipt(index + 1, 'finished', terminalAt))
+    const retired = initial.receipts[0]!
+    const raced = storageWithFirstConflict(initial, current => ({
+      ...current,
+      receipts: current.receipts.slice(1),
+      tombstones: [{
+        key: retired.key,
+        fingerprint: retired.fingerprint,
+        result: { type: 'SESSION_FINISHED', requestId: retired.key.requestId, exitCode: 0, signal: null },
+        ...(retired.sessionId ? { sessionId: retired.sessionId } : {}),
+        terminalAt,
+        deleteAfter: '2026-09-18T00:00:00.000Z',
+      }],
+    }))
+    await expect(createSessionReceiptLedger({ storage: raced.storage, clock })
+      .claim(request(5_000), 'e'.repeat(64), '2026-08-21T00:00:00Z'))
+      .resolves.toMatchObject({ status: 'claimed' })
+    expect(raced.writes()).toBe(2)
+    expect(raced.image()).toMatchObject({ capacityBlockedUntil: null })
+  })
+
+  it('uses one bounded retry budget for repeated capacity-block conflicts', async () => {
+    const initial = emptyImage()
+    initial.receipts = Array.from({ length: MAX_IN_FLIGHT_SESSION_RECEIPTS }, (_, index) => receipt(index + 1, 'accepted', '2026-08-21T00:00:00Z'))
+    let image = structuredClone(initial)
+    let writes = 0
+    const storage: SessionReceiptStorage = {
+      load: async () => ({ status: 'loaded', image: structuredClone(image) }),
+      replace: async () => {
+        writes += 1
+        image = { ...image, revision: image.revision + 1 }
+        return { status: 'conflict', current: structuredClone(image) }
+      },
+    }
+    await expect(createSessionReceiptLedger({ storage, clock })
+      .claim(request(100), 'f'.repeat(64), '2026-08-21T00:00:00Z'))
+      .resolves.toEqual({ status: 'storage-unavailable' })
+    expect(writes).toBe(8)
+    expect(image.capacityBlockedUntil).toBeNull()
   })
 
   it('extends an active capacity block to every later unknown request deadline', async () => {
