@@ -5,6 +5,7 @@ import {
   createRunnerHome,
   signAllowlist,
   type PairingContractStore,
+  type RunnerAuditLifecycle,
   type RunnerHomeInspection,
   type RunnerHomeStorage,
 } from '../../src/index.js'
@@ -26,6 +27,7 @@ export async function observeHomeScenario(scenario: RuntimeScenario): Promise<Ru
     },
     pairing: pairingStore,
     keys: createMemoryApiKeyStore(),
+    openAuditLifecycle: async () => ({ status: 'ready', audit: recordingAudit(recorder.record) }),
     storage,
   })
   try {
@@ -104,6 +106,18 @@ function homeInspection(fixture: string): RunnerHomeInspection {
     rootOwner: 'current-user',
     rootMode: 0o700,
     entries: [{ record: 'configuration', kind: 'regular', owner: 'current-user', mode: 0o600, links: 1 }],
+  }
+}
+
+function recordingAudit(record: (event: string) => void): RunnerAuditLifecycle {
+  return {
+    async append(entry) {
+      record(`audit.append:${entry.kind}`)
+    },
+    async snapshot() {
+      return { state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }
+    },
+    async close() {},
   }
 }
 

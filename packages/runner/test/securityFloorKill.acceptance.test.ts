@@ -13,7 +13,6 @@ import {
   createGrants,
   createMemoryGrantStore,
   createSpawnSeam,
-  openAuditLog,
   type AuditLog,
   type AuditRecord,
   type CommandPolicy,
@@ -21,6 +20,7 @@ import {
   type SpawnRequest,
   type VettedSpawn,
 } from '../src/index.js'
+import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
 import { StubControlPlane } from './stubControlPlane.js'
 
 const execFileAsync = promisify(execFile)
@@ -71,7 +71,7 @@ describe('CP-5 IC-3 kill switch and audit acceptance', () => {
   it('AS-15 severs a real runner connection and kills real visible terminal and preview children locally', async () => {
     const directory = await workspace()
     const auditPath = join(directory, 'audit.ndjson')
-    const audit = openAuditLog({ path: auditPath })
+    const audit = openAuditLogFixture({ path: auditPath })
     const controlPlane = await new StubControlPlane().start()
     controlPlanes.push(controlPlane)
     const client = new RunnerClient({
@@ -169,7 +169,7 @@ describe('CP-5 IC-3 kill switch and audit acceptance', () => {
   it('AS-17 does not resolve the kill action until its real audit record is durably appended', async () => {
     const directory = await workspace()
     const path = join(directory, 'audit.ndjson')
-    const realAudit = openAuditLog({ path })
+    const realAudit = openAuditLogFixture({ path })
     let releaseAppend!: () => void
     let observeAppend!: () => void
     const appendReleased = new Promise<void>(resolve => {
@@ -218,7 +218,7 @@ describe('CP-5 IC-3 kill switch and audit acceptance', () => {
     await grants.grant(directory)
     const seam = createSpawnSeam({
       policy: policy(id => (id === 'preview' ? { command: process.execPath, args: ['-e', 'process.stdout.write("preview")'] } : null)),
-      audit: openAuditLog({ path }),
+      audit: openAuditLogFixture({ path }),
       consent: grants,
       now: () => 1_700_000_000_000,
     })
@@ -251,7 +251,7 @@ describe('CP-5 IC-3 kill switch and audit acceptance', () => {
   it('AS-19 durably audits every security refusal reason when it is surfaced', async () => {
     const directory = await workspace()
     const path = join(directory, 'audit.ndjson')
-    const audit = openAuditLog({ path })
+    const audit = openAuditLogFixture({ path })
     const emptyConsent = createGrants({ store: createMemoryGrantStore() })
     const denied = createSpawnSeam({ policy: null, audit })
     const ungranted = createSpawnSeam({ policy: policy(), audit, consent: emptyConsent })

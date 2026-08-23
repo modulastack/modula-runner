@@ -8,13 +8,13 @@ import {
   PreviewHost,
   TerminalSession,
   createSpawnSeam,
-  openAuditLog,
   type AuditLog,
   type AuditRecord,
   type CommandPolicy,
   type SpawnOutcome,
   type SpawnSeam,
 } from '../src/index.js'
+import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
 import { permissiveConsent } from './spawnSeamSupport.js'
 
 const temporaryDirectories: string[] = []
@@ -64,7 +64,7 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
     const last = killRecord('last')
     const prefix = `${JSON.stringify(first)}\n`
     await writeFile(path, prefix, { mode: 0o600 })
-    const audit = openAuditLog({ path })
+    const audit = openAuditLogFixture({ path })
 
     await appendFile(path, `${JSON.stringify(external)}\n`)
     await audit.append(last)
@@ -99,7 +99,7 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
     }
 
     try {
-      const audit = openAuditLog({ path })
+      const audit = openAuditLogFixture({ path })
       let resolved = false
       const pending = audit.append(killRecord('durable')).then(() => {
         resolved = true
@@ -134,7 +134,7 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
 
     try {
       const failures: unknown[] = []
-      const audit = openAuditLog({ path, onFailure: (_record, error) => failures.push(error) })
+      const audit = openAuditLogFixture({ path, onFailure: (_record, error) => failures.push(error) })
       await expect(audit.append(killRecord('directory-durability'))).rejects.toThrow('directory fsync failed')
       expect(syncCalls).toBe(2)
       expect(failures).toHaveLength(1)
@@ -160,7 +160,7 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
     }
 
     try {
-      const audit = openAuditLog({ path })
+      const audit = openAuditLogFixture({ path })
       await audit.append(killRecord('before-rotation'))
       await rename(path, rotated)
       await audit.append(killRecord('after-rotation'))
@@ -842,7 +842,7 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
   it('AS-23 serializes concurrent appends into independently complete records in call order', async () => {
     const directory = await temporaryDirectory()
     const path = join(directory, 'audit.ndjson')
-    const audit = openAuditLog({ path })
+    const audit = openAuditLogFixture({ path })
     const records = Array.from({ length: 40 }, (_, index) => killRecord(`concurrent-${index}`))
 
     await Promise.all(records.map(record => audit.append(record)))

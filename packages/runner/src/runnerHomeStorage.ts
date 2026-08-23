@@ -4,7 +4,6 @@ import { constants, type BigIntStats, type Stats } from 'node:fs'
 import { lstat, mkdir, open, readFile, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { RunnerAuditLifecycle } from './auditLifecycle.js'
 import {
   RUNNER_HOME_RECORDS,
   type RunnerHomeCustodyInspection,
@@ -12,6 +11,7 @@ import {
   type RunnerHomeInspection,
   type RunnerHomeRecord,
   type RunnerHomeSelection,
+  type RunnerHomeStateRecord,
   type RunnerHomeStorage,
   type RunnerHomeStorageRead,
   type RunnerHomeStorageWrite,
@@ -27,7 +27,7 @@ const MUTATION_REAPER_FILE = '.records.reap'
 const MUTATION_LOCK_ATTEMPTS = 1_000
 const MUTATION_LOCK_BYTES = 1_024
 const MUTATION_LOCK_INITIALIZATION_MS = 1_000
-const RECORD_LIMITS: Readonly<Record<RunnerHomeRecord, number>> = {
+const RECORD_LIMITS: Readonly<Record<RunnerHomeStateRecord, number>> = {
   pairing: DEFAULT_RECORD_LIMIT,
   keys: 8 * 1024 * 1024,
   grants: DEFAULT_RECORD_LIMIT,
@@ -35,7 +35,6 @@ const RECORD_LIMITS: Readonly<Record<RunnerHomeRecord, number>> = {
   policy: DEFAULT_RECORD_LIMIT,
   projects: DEFAULT_RECORD_LIMIT,
   receipts: 25 * 1024 * 1024,
-  audit: 64 * 1024,
 }
 const RECORD_FILES: Readonly<Record<RunnerHomeRecord, string>> = {
   pairing: 'pairing.bin',
@@ -75,7 +74,6 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   private rootHandle: FileHandle | null = null
   private rootIdentity: RootIdentity | null = null
   private lockHandle: FileHandle | null = null
-  private auditLifecycle: RunnerAuditLifecycle | null = null
   private readonly uid: number | undefined
 
   constructor(private readonly options: FileRunnerHomeStorageOptions) {
@@ -97,8 +95,6 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   close(): Promise<void> {
     return this.serialize(async () => {
-      await this.auditLifecycle?.close()
-      this.auditLifecycle = null
       await this.releaseLock()
       await this.rootHandle?.close()
       this.rootHandle = null
@@ -107,13 +103,13 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     })
   }
 
-  read(record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
+  read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead> {
     return this.serialize(async () => await this.readRecord(record))
   }
 
-  replace(record: RunnerHomeRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite> {
+  replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite> {
     return this.serialize(async () => {
-      if (record === 'audit' || bytes.byteLength > RECORD_LIMITS[record]) return { status: 'storage-unavailable' }
+      if (bytes.byteLength > RECORD_LIMITS[record]) return { status: 'storage-unavailable' }
       const root = await this.boundRoot()
       if (!root) return { status: 'storage-unavailable' }
       return await this.withMutationLock(root, { status: 'storage-unavailable' }, async () => {
@@ -123,25 +119,6 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
         if (currentSha256 !== expectedSha256) return { status: 'conflict', currentSha256 }
         return await this.replaceRecord(root, record, bytes)
       })
-    })
-  }
-
-  append(record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'> {
-    return this.serialize(async () => await this.appendAudit(record, bytes))
-  }
-
-  openAuditLifecycle() {
-    return this.serialize(async () => {
-      if (this.auditLifecycle || !this.root || !this.lockHandle || !(await this.boundRoot())) {
-        return { status: 'storage-unavailable' as const }
-      }
-      const { openBoundRunnerAuditLifecycle } = await import('./fileAuditLifecycle.js')
-      const opened = await openBoundRunnerAuditLifecycle({
-        runnerHome: this.root,
-        ...(this.uid === undefined ? {} : { currentUserId: this.uid }),
-      })
-      if (opened.status === 'ready') this.auditLifecycle = opened.audit
-      return opened
     })
   }
 
@@ -239,13 +216,13 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       && await lockPathMatches(this.lockHandle, path.join(this.root!, LOCK_FILE), this.uid)
   }
 
-  private async readRecord(record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
+  private async readRecord(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead> {
     const root = await this.boundRoot()
     if (!root) return { status: 'storage-unavailable' }
     return await this.readRecordAt(root, record)
   }
 
-  private async readRecordAt(root: FileHandle, record: RunnerHomeRecord): Promise<RunnerHomeStorageRead> {
+  private async readRecordAt(root: FileHandle, record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead> {
     try {
       const handle = await openRecord(rootEntryPath(root, RECORD_FILES[record]))
       const result = handle ? await readSecure(handle, this.uid, RECORD_LIMITS[record]) : { status: 'missing' as const }
@@ -255,7 +232,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     }
   }
 
-  private async replaceRecord(root: FileHandle, record: RunnerHomeRecord, bytes: Uint8Array): Promise<RunnerHomeStorageWrite> {
+  private async replaceRecord(root: FileHandle, record: RunnerHomeStateRecord, bytes: Uint8Array): Promise<RunnerHomeStorageWrite> {
     const target = rootEntryPath(root, RECORD_FILES[record])
     const temporary = `${target}.tmp-${randomBytes(16).toString('hex')}`
     try {
@@ -269,21 +246,6 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       await unlink(temporary).catch(() => undefined)
       return { status: 'storage-unavailable' }
     }
-  }
-
-  private async appendAudit(_record: 'audit', bytes: Uint8Array): Promise<'appended' | 'storage-unavailable'> {
-    if (bytes.byteLength === 0 || bytes.byteLength > RECORD_LIMITS.audit) return 'storage-unavailable'
-    const root = await this.boundRoot()
-    if (!root) return 'storage-unavailable'
-    return await this.withMutationLock(root, 'storage-unavailable', async () => {
-      const current = await this.readRecordAt(root, 'audit')
-      if (current.status === 'storage-unavailable') return 'storage-unavailable'
-      const existing = current.status === 'found' ? Buffer.from(current.bytes) : Buffer.alloc(0)
-      const updated = Buffer.concat([existing, Buffer.from(bytes)])
-      if (updated.byteLength > RECORD_LIMITS.audit) return 'storage-unavailable'
-      const stored = await this.replaceRecord(root, 'audit', updated)
-      return stored.status === 'written' ? 'appended' : 'storage-unavailable'
-    })
   }
 
   private async withMutationLock<T>(root: FileHandle, unavailable: T, operation: () => Promise<T>): Promise<T> {

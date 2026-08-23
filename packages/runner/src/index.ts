@@ -91,7 +91,7 @@ export {
   readAllowlistSigningKeyFile,
   signingKeyOutsideHome,
 } from './allowlistKeyFile.js'
-export { openAuditLog, type AuditLog, type AuditLogOptions, type AuditRecord, type SpawnOutcome } from './auditLog.js'
+export { type AuditLog, type AuditRecord, type SpawnOutcome } from './auditLog.js'
 export {
   AUDIT_ARCHIVE_SCHEMA_VERSION,
   AUDIT_RECORD_SCHEMA_VERSION,
@@ -155,9 +155,7 @@ export {
   type VettedSpawn,
 } from './spawnSeam.js'
 export {
-  CapabilityProbeBatchNotImplementedError,
   createCapabilityProbeBatchSeam,
-  createUnimplementedCapabilityProbeBatchSeam,
   type CapabilityProbeBatchOptions,
   type CapabilityProbeBatchSeam,
   type CapabilityProbeCheck,

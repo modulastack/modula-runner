@@ -65,13 +65,6 @@ export interface CapabilityProbeBatchSeam {
   ): Promise<CapabilityRefreshBatchResult<T>>
 }
 
-export class CapabilityProbeBatchNotImplementedError extends Error {
-  constructor() {
-    super('capability probe batching is interface-only and is not active')
-    this.name = 'CapabilityProbeBatchNotImplementedError'
-  }
-}
-
 export function createCapabilityProbeBatchSeam(options: CapabilityProbeBatchOptions): CapabilityProbeBatchSeam {
   const at = () => new Date((options.now ?? Date.now)()).toISOString()
   return {
@@ -99,14 +92,6 @@ export function createCapabilityProbeBatchSeam(options: CapabilityProbeBatchOpti
       }
       if (!(await appendOutcome(options.audit, batch.refreshId, completed.outcome, at()))) return { status: 'storage-unavailable' }
       return { status: 'completed', value: completed.value }
-    },
-  }
-}
-
-export function createUnimplementedCapabilityProbeBatchSeam(): CapabilityProbeBatchSeam {
-  return {
-    async run(): Promise<never> {
-      throw new CapabilityProbeBatchNotImplementedError()
     },
   }
 }

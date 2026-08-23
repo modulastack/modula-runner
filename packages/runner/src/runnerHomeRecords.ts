@@ -1,10 +1,9 @@
 import { hasControlCharacter, isSafeIdentifier } from '@modulastack/runner-protocol'
-import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { AccessResolver, isCompleteLocalModelProfile, type LocalModelProfile } from './accessProfiles.js'
 import type { ApiKeyStore } from './apiKeys.js'
-import type { AuditRecordInputV2, RunnerAuditLifecycle } from './auditLifecycle.js'
-import type { AuditLog, AuditRecord } from './auditLog.js'
+import type { RunnerAuditLifecycle } from './auditLifecycle.js'
+import { adaptAuditLog } from './auditLogAdapter.js'
 import {
   decodeSignedAllowlist,
   trustSignedAllowlist,
@@ -51,6 +50,7 @@ export type RunnerHomeRecordComponents = {
 export type RunnerHomeRecordsOptions = RunnerHomeRecordComponents & {
   storage: RunnerHomeStorage
   clock: RunnerClock
+  audit: RunnerAuditLifecycle
 }
 
 export async function initializeRunnerPolicyRecord(
@@ -96,8 +96,6 @@ export async function openRunnerHomeRecords(options: RunnerHomeRecordsOptions): 
     await grants.read()
     const receipts = createSessionReceiptLedger({ storage: receiptStorage(options.storage), clock: options.clock })
     await receipts.recover()
-    const auditLifecycle = await options.storage.openAuditLifecycle?.()
-    if (!auditLifecycle || auditLifecycle.status !== 'ready') throw new HomeRecordError('audit-unavailable')
     return {
       status: 'ready',
       home: {
@@ -109,7 +107,7 @@ export async function openRunnerHomeRecords(options: RunnerHomeRecordsOptions): 
         policy,
         projects,
         receipts,
-        audit: auditLog(auditLifecycle.audit),
+        audit: adaptAuditLog(options.audit),
       },
     }
   } catch (error) {
@@ -392,64 +390,6 @@ function receiptStorage(storage: RunnerHomeStorage): SessionReceiptStorage {
 
 function emptyReceiptImage(): SessionReceiptLedgerImage {
   return { schemaVersion: 1, revision: 0, capacityBlockedUntil: null, receipts: [], tombstones: [] }
-}
-
-function auditLog(lifecycle: RunnerAuditLifecycle): AuditLog {
-  return { append: async record => await lifecycle.append(auditRecordV2(record)) }
-}
-
-function auditRecordV2(record: AuditRecord): AuditRecordInputV2 {
-  const base = { schemaVersion: 2 as const, eventId: randomUUID(), at: record.at }
-  if (record.kind === 'spawn-admitted') {
-    return {
-      ...base,
-      kind: record.kind,
-      spawnId: record.spawnId,
-      spawnKind: record.spawnKind,
-      subjectId: record.recipeId,
-      requestId: record.requestId,
-    }
-  }
-  if (record.kind === 'spawn-outcome') return { ...base, kind: record.kind, spawnId: record.spawnId, outcome: record.outcome }
-  if (record.kind === 'refused') {
-    return {
-      ...base,
-      kind: record.kind,
-      spawnKind: record.spawnKind,
-      subjectId: record.recipeId,
-      requestId: record.requestId,
-      reason: record.reason,
-    }
-  }
-  if (record.kind === 'kill') {
-    return {
-      ...base,
-      kind: record.kind,
-      confirmed: record.confirmed,
-      targetCount: 0,
-      targetsSha256: createHash('sha256').update(record.details).digest('hex'),
-    }
-  }
-  if (record.kind === 'session-connection-refusal') {
-    return {
-      ...base,
-      kind: record.kind,
-      connectionId: record.connectionId,
-      channelId: record.channelId,
-      requestId: record.requestId,
-      reason: record.reason,
-      selectedProtocolVersion: record.selectedProtocolVersion,
-      phase: record.phase,
-    }
-  }
-  return {
-    ...base,
-    kind: record.kind,
-    key: record.key,
-    state: record.state,
-    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
-    ...(record.result ? { result: record.result } : {}),
-  }
 }
 
 type JsonRead = { status: 'missing' } | { status: 'found'; value: unknown; sha256: string }

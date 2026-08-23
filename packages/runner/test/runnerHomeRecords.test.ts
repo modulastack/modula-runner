@@ -11,7 +11,8 @@ import {
   SessionReceiptStorageUnavailableError,
   type AuditRecordInputV2,
   type PairingContractStore,
-  type RunnerHomeRecord,
+  type RunnerAuditLifecycle,
+  type RunnerHomeStateRecord,
   type RunnerHomeStorage,
   type SignedAllowlist,
   type TrustAnchor,
@@ -31,11 +32,11 @@ function pairingStore(): PairingContractStore {
   }
 }
 
-function memoryStorage(initial: Partial<Record<RunnerHomeRecord, unknown>> = {}) {
-  const records = new Map<RunnerHomeRecord, Uint8Array>()
+function memoryStorage(initial: Partial<Record<RunnerHomeStateRecord, unknown>> = {}) {
+  const records = new Map<RunnerHomeStateRecord, Uint8Array>()
   const audit: AuditRecordInputV2[] = []
   let auditUnavailable = false
-  for (const [record, value] of Object.entries(initial)) records.set(record as RunnerHomeRecord, Buffer.from(JSON.stringify(value)))
+  for (const [record, value] of Object.entries(initial)) records.set(record as RunnerHomeStateRecord, Buffer.from(JSON.stringify(value)))
   const storage: RunnerHomeStorage = {
     inspect: async () => ({ rootKind: 'directory', rootOwner: 'current-user', rootMode: 0o700, entries: [] }),
     read: async record => {
@@ -49,22 +50,26 @@ function memoryStorage(initial: Partial<Record<RunnerHomeRecord, unknown>> = {})
       records.set(record, structuredClone(bytes))
       return { status: 'written', sha256: digest(bytes) }
     },
-    append: async () => 'storage-unavailable',
-    openAuditLifecycle: async () => auditUnavailable
-      ? { status: 'storage-unavailable' }
-      : {
-          status: 'ready',
-          audit: {
-            append: async record => {
-              if (auditUnavailable) throw new Error('audit unavailable')
-              audit.push(record)
-            },
-            snapshot: async () => ({ state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }),
-            close: async () => undefined,
-          },
-        },
   }
-  return { storage, audit, records, failAudit: () => { auditUnavailable = true } }
+  const lifecycle: RunnerAuditLifecycle = {
+    append: async record => {
+      if (auditUnavailable) throw new Error('audit unavailable')
+      audit.push(record)
+    },
+    snapshot: async () => ({ state: 'ready', residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }),
+    close: async () => undefined,
+  }
+  return { storage, lifecycle, audit, records, failAudit: () => { auditUnavailable = true } }
+}
+
+function openRecords(held: ReturnType<typeof memoryStorage>) {
+  return openRunnerHomeRecords({
+    storage: held.storage,
+    audit: held.lifecycle,
+    clock,
+    pairing: pairingStore(),
+    keys: createMemoryApiKeyStore(),
+  })
 }
 
 function signedPolicy(): { revision: number; allowlist: SignedAllowlist; trustAnchors: TrustAnchor[] } {
@@ -84,7 +89,7 @@ function signedPolicy(): { revision: number; allowlist: SignedAllowlist; trustAn
 describe('runner-home logical records', () => {
   it('opens trusted state and exposes durable configuration, project, receipt, and audit adapters', async () => {
     const held = memoryStorage({ policy: signedPolicy() })
-    const opened = await openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const opened = await openRecords(held)
     expect(opened.status).toBe('ready')
     if (opened.status !== 'ready') throw new Error(opened.code)
 
@@ -131,12 +136,7 @@ describe('runner-home logical records', () => {
       policy: signedPolicy(),
       configuration: { revision: 1, profiles: [profile, profile], endpoints: [] },
     })
-    await expect(openRunnerHomeRecords({
-      storage: held.storage,
-      clock,
-      pairing: pairingStore(),
-      keys: createMemoryApiKeyStore(),
-    })).resolves.toEqual({ status: 'failed', code: 'config-duplicate' })
+    await expect(openRecords(held)).resolves.toEqual({ status: 'failed', code: 'config-duplicate' })
 
     const invalidConfigurations = [
       { revision: 1, profiles: [{}], endpoints: [] },
@@ -145,12 +145,7 @@ describe('runner-home logical records', () => {
     ]
     for (const configuration of invalidConfigurations) {
       const incomplete = memoryStorage({ policy: signedPolicy(), configuration })
-      await expect(openRunnerHomeRecords({
-        storage: incomplete.storage,
-        clock,
-        pairing: pairingStore(),
-        keys: createMemoryApiKeyStore(),
-      })).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
+      await expect(openRecords(incomplete)).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
     }
   })
 
@@ -220,7 +215,7 @@ describe('runner-home logical records', () => {
 
   it('maps missing, foreign, tampered, and malformed policy to the stable startup vocabulary', async () => {
     const trusted = signedPolicy()
-    const cases: Array<readonly [string, Partial<Record<RunnerHomeRecord, unknown>>, string]> = [
+    const cases: Array<readonly [string, Partial<Record<RunnerHomeStateRecord, unknown>>, string]> = [
       ['missing', {}, 'policy-missing'],
       ['foreign', { policy: { ...trusted, allowlist: { ...trusted.allowlist, keyId: 'foreign' } } }, 'policy-unknown-key'],
       ['tampered', { policy: { ...trusted, allowlist: { ...trusted.allowlist, signature: 'AAAA' } } }, 'policy-bad-signature'],
@@ -228,21 +223,11 @@ describe('runner-home logical records', () => {
     ]
     for (const [name, initial, code] of cases) {
       const held = memoryStorage(initial)
-      await expect(openRunnerHomeRecords({
-        storage: held.storage,
-        clock,
-        pairing: pairingStore(),
-        keys: createMemoryApiKeyStore(),
-      }), name).resolves.toEqual({ status: 'failed', code })
+      await expect(openRecords(held), name).resolves.toEqual({ status: 'failed', code })
     }
     const invalidJson = memoryStorage()
     invalidJson.records.set('policy', Buffer.from('{'))
-    await expect(openRunnerHomeRecords({
-      storage: invalidJson.storage,
-      clock,
-      pairing: pairingStore(),
-      keys: createMemoryApiKeyStore(),
-    })).resolves.toEqual({ status: 'failed', code: 'policy-malformed' })
+    await expect(openRecords(invalidJson)).resolves.toEqual({ status: 'failed', code: 'policy-malformed' })
   })
 
   it('fails closed when a state record is malformed or its audit append is unavailable', async () => {
@@ -261,16 +246,11 @@ describe('runner-home logical records', () => {
       }),
     ]
     for (const invalid of invalidStates) {
-      await expect(openRunnerHomeRecords({
-        storage: invalid.storage,
-        clock,
-        pairing: pairingStore(),
-        keys: createMemoryApiKeyStore(),
-      })).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
+      await expect(openRecords(invalid)).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
     }
 
     const held = memoryStorage({ policy: signedPolicy() })
-    const opened = await openRunnerHomeRecords({ storage: held.storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const opened = await openRecords(held)
     if (opened.status !== 'ready') throw new Error(opened.code)
     held.failAudit()
     await expect(opened.home.audit.append({ kind: 'kill', confirmed: false, details: 'uncertain', at: '2026-08-22T00:00:00Z' })).rejects.toThrow('audit unavailable')

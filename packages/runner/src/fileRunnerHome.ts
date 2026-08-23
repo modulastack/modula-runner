@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { createEncryptedApiKeyStore } from './apiKeys.js'
+import { openBoundRunnerAuditLifecycle } from './fileAuditLifecycle.js'
 import { signingKeyOutsideHome } from './allowlistKeyFile.js'
 import { createEncryptedPairingContractStore } from './pairingContractStore.js'
 import {
@@ -61,6 +62,10 @@ function homeFor(options: FileRunnerHomeOptions, root: string): RunnerHome {
     clock: options.clock,
     pairing: createEncryptedPairingContractStore({ path: fileRunnerHomeRecordPath(root, 'pairing'), keyPath }),
     keys: createEncryptedApiKeyStore({ path: fileRunnerHomeRecordPath(root, 'keys'), keyPath }),
+    openAuditLifecycle: () => openBoundRunnerAuditLifecycle({
+      runnerHome: root,
+      ...(options.currentUserId === undefined ? {} : { currentUserId: options.currentUserId }),
+    }),
   })
 }
 

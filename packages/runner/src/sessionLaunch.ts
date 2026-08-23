@@ -340,8 +340,8 @@ export type SessionLauncherOptions = {
   access: SessionAccessPort
   worktrees: SessionWorktreePort
   channels: SessionChannelPort
-  // Additive until the replacement-channel implementation lands. Recovery treats omission as
-  // uncertainty rather than inferring closure from reconnect or elapsed time.
+  // Optional only for additive legacy composition; recovery treats omission as uncertainty rather
+  // than inferring closure from reconnect or elapsed time.
   recoveryChannels?: SessionRecoveryChannelPort
   channelEvents?: SessionChannelEventCoordinator
   processes: SessionProcessPort

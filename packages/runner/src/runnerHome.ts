@@ -1,6 +1,6 @@
 import type { ApiKeyStore } from './apiKeys.js'
 import type { LocalModelProfile } from './accessProfiles.js'
-import type { RunnerAuditLifecycleOpen } from './auditLifecycle.js'
+import type { RunnerAuditLifecycle, RunnerAuditLifecycleOpen } from './auditLifecycle.js'
 import type { AuditLog } from './auditLog.js'
 import type { CommandPolicy, SignedAllowlist, TrustAnchor } from './allowlist.js'
 import type { Grants } from './consent.js'
@@ -145,7 +145,6 @@ export interface RunnerHomeStorage {
   close?(): Promise<void>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
-  openAuditLifecycle?(): Promise<RunnerAuditLifecycleOpen>
 }
 
 export type RunnerHomeOptions = {
@@ -153,7 +152,10 @@ export type RunnerHomeOptions = {
   clock: RunnerClock
   pairing?: PairingContractStore
   keys?: ApiKeyStore
+  openAuditLifecycle?: () => Promise<RunnerAuditLifecycleOpen>
 }
+
+type HomeLease = { held: boolean; audit: RunnerAuditLifecycle | null }
 
 export class RunnerHomeNotImplementedError extends Error {
   constructor() {
@@ -163,7 +165,7 @@ export class RunnerHomeNotImplementedError extends Error {
 }
 
 export function createRunnerHome(options: RunnerHomeOptions): RunnerHome {
-  const lease = { held: false }
+  const lease: HomeLease = { held: false, audit: null }
   return {
     open: selection => openHome(options, lease, selection),
     initializePolicy: (selection, _signingKeyPath, policy) => initializeHomePolicy(options, lease, selection, policy),
@@ -175,7 +177,7 @@ export function createRunnerHome(options: RunnerHomeOptions): RunnerHome {
 
 async function openHome(
   options: RunnerHomeOptions,
-  lease: { held: boolean },
+  lease: HomeLease,
   selection: RunnerHomeSelection,
 ): Promise<RunnerHomeOpen> {
   if (lease.held) return { status: 'failed', code: 'state-io-failed' }
@@ -188,14 +190,20 @@ async function openHome(
     return await failedBeforeLease(options.storage, 'state-io-failed')
   }
   lease.held = true
-  if (!options.pairing || !options.keys) return await failedHomeOpen(options, lease, 'state-io-failed')
-  const opened = await openRunnerHomeRecords({ ...options, pairing: options.pairing, keys: options.keys })
+  if (!options.pairing || !options.keys || !options.openAuditLifecycle) {
+    return await failedHomeOpen(options, lease, 'state-io-failed')
+  }
+  // Adapter exceptions are the same fail-closed startup state as an explicit unavailable result.
+  const audit = await options.openAuditLifecycle().catch(() => ({ status: 'storage-unavailable' as const }))
+  if (audit.status !== 'ready') return await failedHomeOpen(options, lease, 'audit-unavailable')
+  lease.audit = audit.audit
+  const opened = await openRunnerHomeRecords({ ...options, pairing: options.pairing, keys: options.keys, audit: audit.audit })
   return opened.status === 'ready' ? opened : await failedHomeOpen(options, lease, opened.code)
 }
 
 async function failedHomeOpen(
   options: RunnerHomeOptions,
-  lease: { held: boolean },
+  lease: HomeLease,
   code: RunnerHomeFailure,
 ): Promise<RunnerHomeOpen> {
   return (await releaseAndClose(options.storage, lease))
@@ -205,7 +213,7 @@ async function failedHomeOpen(
 
 async function initializeHomePolicy(
   options: RunnerHomeOptions,
-  lease: { held: boolean },
+  lease: HomeLease,
   selection: RunnerHomeSelection,
   policy: RunnerPolicySnapshot,
 ): Promise<RunnerPolicyInitialization> {
@@ -241,7 +249,7 @@ async function failedInitializationBeforeLease(
 
 async function failedInitialization(
   storage: RunnerHomeStorage,
-  lease: { held: boolean },
+  lease: HomeLease,
   code: RunnerHomeFailure,
 ): Promise<RunnerPolicyInitialization> {
   return (await releaseAndClose(storage, lease))
@@ -249,9 +257,17 @@ async function failedInitialization(
     : { status: 'failed', code: 'state-io-failed' }
 }
 
-async function releaseAndClose(storage: RunnerHomeStorage, lease: { held: boolean }): Promise<boolean> {
+async function releaseAndClose(storage: RunnerHomeStorage, lease: HomeLease): Promise<boolean> {
   let clean = true
   let released = !lease.held
+  if (lease.audit) {
+    try {
+      await lease.audit.close()
+      lease.audit = null
+    } catch {
+      clean = false
+    }
+  }
   if (storage.close) {
     try {
       await storage.close()

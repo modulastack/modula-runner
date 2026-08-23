@@ -112,7 +112,6 @@ describe('allowlist signing-key custody and policy bootstrap', () => {
       close: async () => { closes += 1 },
       read: async () => ({ status: 'missing' }),
       replace: async () => ({ status: 'written', sha256: 'a'.repeat(64) }),
-      append: async () => 'appended',
     }
     const generated = generateAllowlistSigningKey()
     const policy = {

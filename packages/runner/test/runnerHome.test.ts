@@ -20,6 +20,14 @@ import {
 const roots: string[] = []
 const storages: RunnerHomeStorage[] = []
 const clock = { now: () => Date.parse('2026-08-22T00:00:00Z'), sleep: async () => undefined }
+const openAuditLifecycle = async () => ({
+  status: 'ready' as const,
+  audit: {
+    append: async () => undefined,
+    snapshot: async () => ({ state: 'ready' as const, residentSegments: 1, residentBytes: 0, metadataBytes: 0, openSequence: '1' }),
+    close: async () => undefined,
+  },
+})
 
 afterEach(async () => {
   await Promise.all(storages.splice(0).map(storage => storage.close?.()))
@@ -71,11 +79,17 @@ async function fileHome() {
 describe('production runner home', () => {
   it('opens complete trusted state while excluding a second foreground runner', async () => {
     const { root, storage } = await fileHome()
-    const first = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const first = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
     await expect(first.open({})).resolves.toMatchObject({ status: 'ready' })
 
     const competingStorage = createFileRunnerHomeStorage({ defaultRoot: root })
-    const competing = createRunnerHome({ storage: competingStorage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const competing = createRunnerHome({
+      storage: competingStorage,
+      clock,
+      pairing: pairingStore(),
+      keys: createMemoryApiKeyStore(),
+      openAuditLifecycle,
+    })
     await expect(competing.open({})).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
 
     await storage.release!()
@@ -103,7 +117,7 @@ describe('production runner home', () => {
     roots.push(root)
     await mkdir(path.join(root, 'audit.jsonl'), { mode: 0o700 })
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
-    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
     await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'policy-missing' })
   })
 
@@ -112,7 +126,7 @@ describe('production runner home', () => {
     roots.push(parent)
     const root = path.join(parent, 'home')
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
-    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
+    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
     await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'policy-missing' })
 
     const next = createFileRunnerHomeStorage({ defaultRoot: root })
@@ -137,7 +151,6 @@ describe('production runner home', () => {
         release: async () => undefined,
         read: async () => ({ status: 'missing' }),
         replace: async () => ({ status: 'storage-unavailable' }),
-        append: async () => 'storage-unavailable',
       }
       const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore() })
       await expect(home.open({})).resolves.toEqual({ status: 'failed', code })

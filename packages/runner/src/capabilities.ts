@@ -126,8 +126,8 @@ export type CapabilityMonitorOptions = {
   // Probing spawns third-party CLIs, so it passes the same allowlist gate every runner-owned
   // spawn does: a runtime whose command is not allowlisted is not probed and not advertised.
   seam: SpawnSeam
-  // Present only for the interface-first checkpoint. The implementation checkpoint makes this
-  // seam authoritative; omission preserves current behavior until verifier-owned specs exist.
+  // Production cadence composition supplies the aggregate seam. Omission retains the individual
+  // probe path for explicit one-shot callers and legacy fixtures; it is not an activation bypass.
   batchSeam?: CapabilityProbeBatchSeam
   runtimes?: readonly RuntimeSpec[]
   endpoints?: LocalEndpointRegistry
