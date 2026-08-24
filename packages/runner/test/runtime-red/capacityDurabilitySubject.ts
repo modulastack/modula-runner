@@ -2,11 +2,13 @@ import { sessionStartFingerprint, type SessionStartMessage } from '@modulastack/
 import {
   MAX_IN_FLIGHT_SESSION_RECEIPTS,
   SecretEnv,
+  SessionLaunchNotImplementedError,
   createSessionLauncher,
   type AuditRecord,
   createSessionReceiptLedger,
   type LocalProjectRecord,
   type SessionLaunchAction,
+  type SessionLauncher,
   type SessionLauncherOptions,
   type SessionReceipt,
   type SessionReceiptLedgerImage,
@@ -36,19 +38,31 @@ type CapacityCase = {
   processStarts: number
 }
 
-export async function observeCapacityDurabilityScenario(scenario: RuntimeScenario): Promise<RuntimeObservation> {
+type LauncherFactory = (options: SessionLauncherOptions) => SessionLauncher
+
+export async function observeCapacityDurabilityScenario(
+  scenario: RuntimeScenario,
+  createLauncher: LauncherFactory = createSessionLauncher,
+): Promise<RuntimeObservation> {
   const recorder = createRecorder()
-  const request = capacityRequest(scenario)
-  const success = await runCapacityCase('success', scenario, request, recorder)
-  const headerFailure = await runCapacityCase('header-failure', scenario, request, recorder)
-  const auditFailure = await runCapacityCase('audit-failure', scenario, request, recorder)
-  recordCapacityEvidence(recorder.record, request, success, headerFailure, auditFailure)
-  return {
-    status: 'observed',
-    subject: 'launcher',
-    result: 'launcher:capacity-durability',
-    events: recorder.events,
-    output: recorder.output,
+  try {
+    const request = capacityRequest(scenario)
+    const success = await runCapacityCase('success', scenario, request, recorder, createLauncher)
+    const headerFailure = await runCapacityCase('header-failure', scenario, request, recorder, createLauncher)
+    const auditFailure = await runCapacityCase('audit-failure', scenario, request, recorder, createLauncher)
+    recordCapacityEvidence(recorder.record, request, success, headerFailure, auditFailure)
+    return {
+      status: 'observed',
+      subject: 'launcher',
+      result: 'launcher:capacity-durability',
+      events: recorder.events,
+      output: recorder.output,
+    }
+  } catch (error) {
+    if (error instanceof SessionLaunchNotImplementedError) {
+      return { status: 'missing-production-runtime', subject: 'launcher', error: error.name }
+    }
+    throw error
   }
 }
 
@@ -57,8 +71,9 @@ async function runCapacityCase(
   scenario: RuntimeScenario,
   request: SessionStartMessage,
   recorder: ReturnType<typeof createRecorder>,
+  createLauncher: LauncherFactory,
 ): Promise<CapacityCase> {
-  const fixture = createCapacityFixture(mode, request, recorder)
+  const fixture = createCapacityFixture(mode, request, recorder, createLauncher)
   const observed = await collectLaunchStimuli(
     fixture.launcher.handle.bind(fixture.launcher),
     scenario,
@@ -78,6 +93,7 @@ function createCapacityFixture(
   mode: CapacityCaseMode,
   request: SessionStartMessage,
   recorder: ReturnType<typeof createRecorder>,
+  createLauncher: LauncherFactory,
 ) {
   let image = fullCapacityImage(request)
   let auditAttempts = 0
@@ -155,7 +171,7 @@ function createCapacityFixture(
     clock: { now: () => Date.parse(now), sleep: async () => undefined },
   }
   return {
-    launcher: createSessionLauncher(options),
+    launcher: createLauncher(options),
     auditAttempts: () => auditAttempts,
     image: () => structuredClone(image),
     processStarts: () => processStarts,
@@ -163,12 +179,14 @@ function createCapacityFixture(
 }
 
 export function capacityAuditMatchesRequest(record: AuditRecord, request: SessionStartMessage): boolean {
-  return record.kind === 'session-launch'
-    && record.key.bindingId === request.bindingId
+  if (record.kind !== 'session-launch') return false
+  const result = record.result
+  return record.key.bindingId === request.bindingId
     && record.key.requestId === request.requestId
     && record.state === 'refused'
-    && record.result?.type === 'SESSION_REFUSED'
-    && record.result.reason === 'at-capacity'
+    && result?.type === 'SESSION_REFUSED'
+    && result.requestId === request.requestId
+    && result.reason === 'at-capacity'
 }
 
 const unreachableWorktrees: SessionLauncherOptions['worktrees'] = {
