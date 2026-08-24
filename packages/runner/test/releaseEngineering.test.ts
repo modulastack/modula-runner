@@ -163,9 +163,10 @@ if test "$1" = ci; then
   exit 0
 fi
 if test "$1 $2" = 'run build'; then
-  mkdir -p packages/protocol/dist packages/runner/dist
+  mkdir -p packages/protocol/dist packages/runner/dist/bin
   printf 'A' > packages/protocol/dist/index.js
   printf 'A' > packages/runner/dist/index.js
+  printf '#!/usr/bin/env node\n' > packages/runner/dist/bin/modula-runner.js
   exit 0
 fi
 if test "$1" = pack; then
@@ -308,9 +309,10 @@ if test "$1 $2" = 'run build'; then
     current=$((current + 1)); printf '%s\\n' "$current" > "$NONCE_COUNT"
     printf '%s' "$current" > "$state"
   fi
-  mkdir -p packages/protocol/dist packages/runner/dist
+  mkdir -p packages/protocol/dist packages/runner/dist/bin
   cp "$state" packages/protocol/dist/index.js
   cp "$state" packages/runner/dist/index.js
+  printf '#!/usr/bin/env node\n' > packages/runner/dist/bin/modula-runner.js
   exit 0
 fi
 if test "$1" = pack; then
@@ -462,7 +464,8 @@ fi
 if test "$1 $2" = 'run build'; then
   effective_cache="$(env | awk -F= 'tolower($1) == "npm_config_cache" { sub(/^[^=]*=/, ""); value=$0 } END { print value }')"
   printf '%s\\n' "$effective_cache" >> "$CACHE_LOG"
-  mkdir -p "$effective_cache" packages/protocol/dist packages/runner/dist
+  mkdir -p "$effective_cache" packages/protocol/dist packages/runner/dist/bin
+  printf '#!/usr/bin/env node\n' > packages/runner/dist/bin/modula-runner.js
   if ! test -f "$effective_cache/value"; then
     current=0; if test -f "$NONCE_COUNT"; then current="$(cat "$NONCE_COUNT")"; fi
     current=$((current + 1)); printf '%s\\n' "$current" > "$NONCE_COUNT"
@@ -565,12 +568,13 @@ exit 33
 
   it('contains built packages without source, tests, or machine paths', () => {
     const listing = spawnSync('tar', ['-tzf', firstArtifact], { encoding: 'utf8' })
-    const contents = spawnSync('tar', ['-xOzf', firstArtifact], { encoding: 'buffer' })
+    const contents = spawnSync('tar', ['-xOzf', firstArtifact], { encoding: 'buffer', maxBuffer: 160 * 1024 * 1024 })
     expect(listing.status).toBe(0)
     expect(contents.status).toBe(0)
     expect(listing.stdout).toContain('package/npm-shrinkwrap.json')
     expect(listing.stdout).toContain('package/packages/protocol/dist/index.js')
     expect(listing.stdout).toContain('package/packages/runner/dist/index.js')
+    expect(listing.stdout).toContain('package/packages/runner/dist/bin/modula-runner.js')
     expect(listing.stdout).toContain('package/packages/runner/dist/previewForwarder.mjs')
     expect(listing.stdout).not.toContain('/src/')
     expect(listing.stdout).not.toContain('/test/')
@@ -584,6 +588,14 @@ exit 33
       expect(manifest.scripts).toBeUndefined()
       expect(manifest.devDependencies).toBeUndefined()
     }
+    const installManifest = archivedJson(firstArtifact, 'package/package.json')
+    expect(installManifest.name).toBe('modula-runner')
+    expect(installManifest.private).toBeUndefined()
+    expect(installManifest.bin).toEqual({ 'modula-runner': 'packages/runner/dist/bin/modula-runner.js' })
+    const binEntry = 'package/packages/runner/dist/bin/modula-runner.js'
+    const verbose = spawnSync('tar', ['-tvzf', firstArtifact, binEntry], { encoding: 'utf8' })
+    expect(verbose.status).toBe(0)
+    expect(verbose.stdout).toMatch(new RegExp(`^-rwxr-xr-x .* ${binEntry}$`, 'm'))
   })
 
   it('rejects a tag that does not match the package version', () => {

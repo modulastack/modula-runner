@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
-import { cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -83,14 +83,20 @@ async function copyPackage(packageName, staging, projectRoot) {
 }
 
 async function stageRelease(staging, version, toolchain, projectRoot) {
-  const rootPackage = stripBuildFields(await readJson('package.json', projectRoot))
+  const rootPackage = {
+    ...stripBuildFields(await readJson('package.json', projectRoot)),
+    name: 'modula-runner',
+    version,
+  }
+  delete rootPackage.private
   await mkdir(staging, { recursive: true })
-  await writeFile(join(staging, 'package.json'), `${JSON.stringify({ ...rootPackage, version }, null, 2)}\n`)
+  await writeFile(join(staging, 'package.json'), `${JSON.stringify(rootPackage, null, 2)}\n`)
   await copyFile(join(projectRoot, 'package-lock.json'), join(staging, 'npm-shrinkwrap.json'))
   await copyFile(join(projectRoot, 'README.md'), join(staging, 'README.md'))
   await copyFile(join(projectRoot, 'LICENSE'), join(staging, 'LICENSE'))
   await copyPackage('protocol', staging, projectRoot)
   await copyPackage('runner', staging, projectRoot)
+  await chmod(join(staging, 'packages', 'runner', 'dist', 'bin', 'modula-runner.js'), 0o755)
   const lockfileSha256 = await sha256(join(projectRoot, 'package-lock.json'))
   const metadata = { artifact: 'modula-runner', version, expectedTag: `v${version}`, toolchain, lockfileSha256 }
   await writeFile(join(staging, 'BUILD-METADATA.json'), `${JSON.stringify(metadata, null, 2)}\n`)
