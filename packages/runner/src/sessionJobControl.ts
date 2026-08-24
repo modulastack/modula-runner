@@ -141,7 +141,11 @@ async function* recover(
   context: SessionJobControlContext,
 ): AsyncGenerator<SessionJobControlEffect> {
   if (!launchNegotiated(context)) return
-  for await (const action of launcher.recover()) yield effectFor(context, action)
+  if (!context.authenticatedBindingId) {
+    yield storageClose(context)
+    return
+  }
+  for await (const action of launcher.recover(context.authenticatedBindingId)) yield effectFor(context, action)
 }
 
 function effectFor(context: SessionJobControlContext, action: SessionLaunchAction): SessionJobControlEffect {

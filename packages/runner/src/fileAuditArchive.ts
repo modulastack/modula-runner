@@ -1,6 +1,6 @@
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { lstat, open, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import {
   MAX_AUDIT_METADATA_BYTES,
@@ -51,12 +51,17 @@ export async function archiveRunnerAuditFile(
   let recovered: RecoveredLifecycle | undefined
   let destination: ArchiveDestination | undefined
   try {
-    destination = await openArchiveDestination(root, options.destination, options.currentUserId ?? process.getuid?.())
     await storage.inspect({ override: root })
+    destination = await openArchiveDestination(root, options.destination, options.currentUserId ?? process.getuid?.())
     if (await storage.acquire?.() !== 'acquired') return await unavailableArchive(storage, destination)
+    const leasedRoot = await storage.descriptorRoot?.()
+    if (!leasedRoot || await sameDirectoryIdentity(leasedRoot, destination)) return await unavailableArchive(storage, destination)
     const uid = options.currentUserId ?? process.getuid?.()
-    await migrate(root, uid)
-    recovered = await recoverLifecycle(root, uid)
+    await migrate(leasedRoot, uid)
+    recovered = await recoverLifecycle(leasedRoot, uid)
+    if (await sameHandleIdentity(recovered.directory, destination.directory)) {
+      return await unavailableArchive(storage, destination, recovered)
+    }
     const result = await archiveSealed(recovered, destination, options.now ?? Date.now)
     await closeArchiveResources(storage, recovered, destination)
     return result
@@ -77,10 +82,13 @@ async function archiveSealed(
   let archivedBytes = 0
   const acknowledgementDigests: string[] = []
   for (const segment of recovered.sealed) {
+    const source = await readResidentSegment(recovered, segment.manifest)
+    const artifactSha256 = await copyArchiveArtifact(destination, segment, source)
     let acknowledgement = segment.acknowledgement
+    if (acknowledgement && acknowledgement.value.artifactSha256 !== artifactSha256) {
+      throw new Error('archive acknowledgement no longer matches destination artifacts')
+    }
     if (!acknowledgement) {
-      const source = await readResidentSegment(recovered, segment.manifest)
-      const artifactSha256 = await copyArchiveArtifact(destination, segment, source)
       const value: AuditArchiveAcknowledgement = {
         schemaVersion: 1,
         segmentSequence: segment.manifest.sequence,
@@ -190,8 +198,8 @@ async function openArchiveDestination(
   selected: string,
   uid: number | undefined,
 ): Promise<ArchiveDestination> {
-  const destinationPath = path.resolve(selected)
-  if (containsPath(runnerHome, destinationPath) || containsPath(destinationPath, runnerHome)) {
+  const [canonicalHome, destinationPath] = await Promise.all([realpath(runnerHome), realpath(path.resolve(selected))])
+  if (containsPath(canonicalHome, destinationPath) || containsPath(destinationPath, canonicalHome)) {
     throw new Error('archive destination overlaps runner home')
   }
   const info = await lstat(destinationPath, { bigint: true })
@@ -203,6 +211,19 @@ async function openArchiveDestination(
     throw new Error('archive destination identity changed')
   }
   return { path: destinationPath, directory, identity: identityOf(held), uid }
+}
+
+async function sameDirectoryIdentity(root: string, destination: ArchiveDestination): Promise<boolean> {
+  const info = await lstat(root, { bigint: true })
+  return info.dev === destination.identity.device && info.ino === destination.identity.inode
+}
+
+async function sameHandleIdentity(first: FileHandle, second: FileHandle): Promise<boolean> {
+  const [firstInfo, secondInfo] = await Promise.all([
+    first.stat({ bigint: true }),
+    second.stat({ bigint: true }),
+  ])
+  return firstInfo.dev === secondInfo.dev && firstInfo.ino === secondInfo.ino
 }
 
 async function assertArchiveDestination(destination: ArchiveDestination): Promise<void> {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -117,6 +117,39 @@ describe('offline audit archive', () => {
     expect(await readdir(destination)).toHaveLength(2)
   }, 30_000)
 
+  it('recreates a missing acknowledged artifact before reclaiming the resident segment', async () => {
+    const root = await directory('runner-audit-source-')
+    const destination = await directory('runner-audit-destination-')
+    await sealOne(root)
+    const manifestBytes = await readFile(sourcePath(root, 1, 'manifest.json'))
+    const manifest = JSON.parse(manifestBytes.toString('utf8'))
+    const source = await readFile(sourcePath(root, 1, 'jsonl'))
+    const prefix = `segment-00000000000000000001-${manifest.sha256}`
+    const artifact = path.join(destination, `${prefix}.jsonl`)
+    await copyFile(sourcePath(root, 1, 'jsonl'), artifact)
+    await copyFile(sourcePath(root, 1, 'manifest.json'), path.join(destination, `${prefix}.manifest.json`))
+    const digest = createHash('sha256').update(Buffer.concat([
+      Buffer.from('runner-audit-artifact-v1\0'), source, manifestBytes,
+    ])).digest('hex')
+    const acknowledgement = {
+      schemaVersion: 1,
+      segmentSequence: manifest.sequence,
+      segmentSha256: manifest.sha256,
+      manifestSha256: createHash('sha256').update(manifestBytes).digest('hex'),
+      bytes: manifest.bytes,
+      records: manifest.records,
+      exportId: createHash('sha256').update(Buffer.concat([Buffer.from('runner-audit-export-v1\0'), manifestBytes])).digest('hex'),
+      artifactSha256: digest,
+      acknowledgedAt: '2026-08-22T00:10:00.000Z',
+    }
+    await writeFile(sourcePath(root, 1, 'ack.json'), `${JSON.stringify(acknowledgement)}\n`, { mode: 0o600 })
+    await unlink(artifact)
+
+    await expect(archiveRunnerAudit({ runnerHome: root, destination })).resolves.toMatchObject({ status: 'archived', segments: 1 })
+    expect(await readFile(artifact)).toEqual(source)
+    await expect(stat(sourcePath(root, 1, 'jsonl'))).rejects.toMatchObject({ code: 'ENOENT' })
+  }, 60_000)
+
   it('fails closed on a conflicting archive artifact without acknowledging or reclaiming', async () => {
     const root = await directory('runner-audit-source-')
     const destination = await directory('runner-audit-destination-')
@@ -134,6 +167,12 @@ describe('offline audit archive', () => {
     const root = await directory('runner-audit-source-')
     const destination = await directory('runner-audit-destination-')
     await expect(archiveRunnerAudit({ runnerHome: root, destination: root })).resolves.toEqual({ status: 'storage-unavailable' })
+    await sealOne(root)
+    const aliasRoot = await directory('runner-audit-alias-')
+    const alias = path.join(aliasRoot, 'runner')
+    await symlink(root, alias)
+    await expect(archiveRunnerAudit({ runnerHome: root, destination: path.join(alias, 'audit.jsonl') }))
+      .resolves.toEqual({ status: 'storage-unavailable' })
     await chmod(destination, 0o755)
     await expect(archiveRunnerAudit({ runnerHome: root, destination })).resolves.toEqual({ status: 'storage-unavailable' })
     await chmod(destination, 0o700)

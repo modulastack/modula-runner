@@ -335,6 +335,45 @@ describe('production session launcher', () => {
     expect(accepted.state).toBe('accepted')
   })
 
+  it('does not replay SESSION_STARTED for a channel already marked lost', async () => {
+    const lost: SessionReceipt = {
+      ...recoveryReceipt(),
+      state: 'started',
+      phaseTimestamps: { ...recoveryReceipt().phaseTimestamps, started: '2026-08-21T00:00:03Z' },
+    }
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'receipt', receipt: lost }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        replace: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => [],
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).handle(request))).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId },
+    }])
+  })
+
+  it('does not emit a refusal that lost its receipt compare-and-set', async () => {
+    const winner = recoveryReceipt()
+    const audit = vi.fn(async () => undefined)
+    const subject = options({
+      audit: { append: audit },
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        replace: async () => ({ status: 'conflict', current: winner }),
+        recover: async () => [],
+        compact: async () => undefined,
+      },
+    })
+    const expired = { ...request, expiresAt: '2020-01-01T00:00:00Z' }
+    await expect(collect(createSessionLauncher(subject.value).handle(expired)))
+      .resolves.toEqual([{ kind: 'close-job-control', error: 'storage-unavailable' }])
+    expect(audit).not.toHaveBeenCalled()
+  })
+
   it('closes storage-unavailable when required audit persistence fails before acknowledgement', async () => {
     const start = vi.fn(async () => ({ status: 'failed' as const, reason: 'spawn-failed' as const }))
     const subject = options({
@@ -407,6 +446,28 @@ describe('production session launcher', () => {
     expect(lateSpawned).toBe(false)
     expect(terminate).toHaveBeenCalledWith({ sessionId: 'session-1', cwd: '/worktrees/lane-01' })
     expect(subject.held.image().receipts[0]?.state).toBe('uncertain')
+  })
+
+  it('re-verifies provisioned worktree cleanliness before recovery starts a process', async () => {
+    const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...baseReceipt } = recoveryReceipt()
+    const receipt: SessionReceipt = {
+      ...baseReceipt,
+      state: 'provisioned',
+      revision: 2,
+      phaseTimestamps: { accepted: '2026-08-21T00:00:00Z', provisioned: '2026-08-21T00:00:01Z' },
+    }
+    const held = recoveryReceipts(receipt)
+    const base = options()
+    const verify = vi.fn(async () => ({ status: 'failed' as const, reason: 'worktree-conflict' as const }))
+    const subject = options({
+      receipts: held.value,
+      worktrees: { ...base.value.worktrees, inspect: async () => 'exact', verify },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_FAILED', requestId: request.requestId, reason: 'worktree-conflict' },
+    }])
+    expect(verify).toHaveBeenCalledOnce()
+    expect(subject.processStarts()).toBe(0)
   })
 
   it('adopts only an exact surviving session under its stable id and a new channel', async () => {
@@ -668,6 +729,14 @@ describe('production session launcher', () => {
     expect(adopt).not.toHaveBeenCalled()
     expect(terminate).not.toHaveBeenCalled()
     expect(rollback).not.toHaveBeenCalled()
+    expect(held.current().state).toBe('uncertain')
+  })
+
+  it('settles stale-binding recovery locally without disclosing its request id', async () => {
+    const held = recoveryReceipts(recoveryReceipt())
+    const subject = options({ receipts: held.value })
+    const otherBinding = '323e4567-e89b-42d3-a456-426614174002'
+    await expect(collect(createSessionLauncher(subject.value).recover(otherBinding))).resolves.toEqual([])
     expect(held.current().state).toBe('uncertain')
   })
 

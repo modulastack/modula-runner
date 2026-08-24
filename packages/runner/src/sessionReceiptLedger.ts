@@ -349,6 +349,11 @@ function validChannelTransition(left: SessionReceipt, right: SessionReceipt): bo
   }
   if (right.channel.generation !== left.channel.generation) return false
   if (left.channel.lifecycle === 'replacement-intent') {
+    if (right.channel.lifecycle === 'replacement-intent') {
+      return right.channel.channelId === null
+        && right.channelId === left.channelId
+        && right.result !== undefined
+    }
     return right.channel.lifecycle === 'live'
       && right.channel.channelId !== null
       && right.channelId === right.channel.channelId

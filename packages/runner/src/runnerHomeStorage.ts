@@ -1,9 +1,7 @@
-import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { constants, type BigIntStats, type Stats } from 'node:fs'
-import { lstat, mkdir, open, readFile, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import {
   RUNNER_HOME_RECORDS,
   type RunnerHomeCustodyInspection,
@@ -16,17 +14,19 @@ import {
   type RunnerHomeStorageRead,
   type RunnerHomeStorageWrite,
 } from './runnerHome.js'
+import {
+  acquireLinuxRootLifetime,
+  linuxDescriptorRootPath,
+  releaseLinuxRootLifetime,
+  withLinuxRootLease,
+} from './linuxRootLease.js'
 
 const DIRECTORY_MODE = 0o700
 const RECORD_MODE = 0o600
-const LOCK_FILE = 'runner.lock'
-const LOCK_BYTES = 1_024
 const DEFAULT_RECORD_LIMIT = 2 * 1024 * 1024
-const MUTATION_LOCK_FILE = '.records.lock'
-const MUTATION_REAPER_FILE = '.records.reap'
-const MUTATION_LOCK_ATTEMPTS = 1_000
-const MUTATION_LOCK_BYTES = 1_024
-const MUTATION_LOCK_INITIALIZATION_MS = 1_000
+const MAX_INTERRUPTED_TEMPS = 128
+const MAX_INTERRUPTED_TEMP_BYTES = 128 * 1024 * 1024
+const LEGACY_COORDINATION_ENTRIES = new Set(['.records.lock', '.records.reap'])
 const RECORD_LIMITS: Readonly<Record<RunnerHomeStateRecord, number>> = {
   pairing: DEFAULT_RECORD_LIMIT,
   keys: 8 * 1024 * 1024,
@@ -48,8 +48,6 @@ const RECORD_FILES: Readonly<Record<RunnerHomeRecord, string>> = {
 }
 
 type RootIdentity = { device: bigint; inode: bigint }
-
-const mutationQueues = new Map<string, Promise<void>>()
 
 export type FileRunnerHomeStorageOptions = {
   defaultRoot: string
@@ -73,7 +71,9 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   private root: string | null = null
   private rootHandle: FileHandle | null = null
   private rootIdentity: RootIdentity | null = null
-  private lockHandle: FileHandle | null = null
+  private foregroundLease = false
+  private poisoned = false
+  private closed = false
   private readonly uid: number | undefined
 
   constructor(private readonly options: FileRunnerHomeStorageOptions) {
@@ -95,11 +95,20 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   close(): Promise<void> {
     return this.serialize(async () => {
+      if (this.closed) return
+      this.closed = true
       await this.releaseLock()
       await this.rootHandle?.close()
       this.rootHandle = null
       this.rootIdentity = null
       this.root = null
+    })
+  }
+
+  descriptorRoot(): Promise<string | null> {
+    return this.serialize(async () => {
+      if (!this.foregroundLease || !(await this.rootStillBound())) return null
+      return this.rootHandle ? linuxDescriptorRootPath(this.rootHandle) : null
     })
   }
 
@@ -112,17 +121,25 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       if (bytes.byteLength > RECORD_LIMITS[record]) return { status: 'storage-unavailable' }
       const root = await this.boundRoot()
       if (!root) return { status: 'storage-unavailable' }
-      return await this.withMutationLock(root, { status: 'storage-unavailable' }, async () => {
-        const current = await this.readRecordAt(root, record)
-        if (current.status === 'storage-unavailable') return current
-        const currentSha256 = current.status === 'found' ? current.sha256 : null
-        if (currentSha256 !== expectedSha256) return { status: 'conflict', currentSha256 }
-        return await this.replaceRecord(root, record, bytes)
-      })
+      return await withLinuxRootLease(
+        root,
+        { status: 'storage-unavailable' },
+        async () => {
+          if (!(await cleanupInterruptedTemps(root, this.uid))) return { status: 'storage-unavailable' }
+          const current = await this.readRecordAt(root, record)
+          if (current.status === 'storage-unavailable') return current
+          const currentSha256 = current.status === 'found' ? current.sha256 : null
+          if (currentSha256 !== expectedSha256) return { status: 'conflict', currentSha256 }
+          return await this.replaceRecord(root, record, bytes)
+        },
+        result => result.status === 'written',
+        async () => await this.poison(),
+      )
     })
   }
 
   private async inspectSelected(selection: RunnerHomeSelection): Promise<RunnerHomeInspection> {
+    if (this.closed || this.poisoned) throw new Error('runner-home storage is closed')
     const root = path.resolve(selection.override ?? this.options.defaultRoot)
     if (this.root !== null && root !== this.root) throw new Error('cannot reselect a bound runner home')
     const initial = await lstat(root).catch(error => missingOnly(error))
@@ -157,63 +174,22 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   }
 
   private async acquireLock(): Promise<'acquired' | 'busy' | 'storage-unavailable'> {
-    if (this.lockHandle) return (await this.lockStillBound()) ? 'busy' : 'storage-unavailable'
+    if (this.foregroundLease) return 'busy'
     const root = await this.boundRoot()
     if (!root) return 'storage-unavailable'
-    const target = path.join(this.root!, LOCK_FILE)
-    const identity = await processIdentity(process.pid)
-    if (identity.status !== 'identified') return 'storage-unavailable'
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const created = await createLock(target, this.uid)
-      if (created.status === 'created') {
-        try {
-          await writeAll(created.handle, Buffer.from(`${JSON.stringify({ pid: process.pid, identity: identity.value })}\n`))
-          await created.handle.sync()
-          await root.sync()
-          this.lockHandle = created.handle
-          return (await this.lockStillBound()) ? 'acquired' : 'storage-unavailable'
-        } catch {
-          const owned = await lockPathMatches(created.handle, target, this.uid)
-          // The failed acquisition is already unavailable; closing must not hide that result.
-          await created.handle.close().catch(() => undefined)
-          if (owned) {
-            // A private incomplete lock is safe to remove; cleanup failure leaves startup closed.
-            await unlink(target).catch(() => undefined)
-          }
-          return 'storage-unavailable'
-        }
-      }
-      if (created.status === 'storage-unavailable') return 'storage-unavailable'
-      const owner = await readLockOwner(target, this.uid)
-      if (owner === null) {
-        await delay(5)
-        continue
-      }
-      const current = await processIdentity(owner.pid)
-      if (current.status === 'indeterminate') return 'storage-unavailable'
-      if (current.status === 'identified' && current.value === owner.identity) return 'busy'
-      if (!(await retireStaleLock(target, root))) return 'storage-unavailable'
-    }
-    return 'storage-unavailable'
+    const result = await acquireLinuxRootLifetime(root)
+    if (result === 'acquired') this.foregroundLease = true
+    return result === 'contended' ? 'busy' : result
   }
 
   private async releaseLock(): Promise<void> {
-    const handle = this.lockHandle
-    if (!handle) return
-    if (!(await lockPathMatches(handle, path.join(this.root!, LOCK_FILE), this.uid))) {
-      await handle.close()
-      this.lockHandle = null
-      throw new Error('runner-home lock identity changed')
+    if (!this.foregroundLease) return
+    const root = this.rootHandle
+    this.foregroundLease = false
+    if (!root || !(await releaseLinuxRootLifetime(root))) {
+      await this.poison()
+      throw new Error('runner-home foreground lease could not be released')
     }
-    await unlink(path.join(this.root!, LOCK_FILE))
-    await this.rootHandle?.sync()
-    await handle.close()
-    this.lockHandle = null
-  }
-
-  private async lockStillBound(): Promise<boolean> {
-    return this.lockHandle !== null
-      && await lockPathMatches(this.lockHandle, path.join(this.root!, LOCK_FILE), this.uid)
   }
 
   private async readRecord(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead> {
@@ -248,30 +224,23 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     }
   }
 
-  private async withMutationLock<T>(root: FileHandle, unavailable: T, operation: () => Promise<T>): Promise<T> {
-    // An unidentified root cannot share a trustworthy process-local queue key and stays unavailable.
-    const info = await root.stat({ bigint: true }).catch(() => null)
-    if (!info) return unavailable
-    return await serializeMutation(`${info.dev}:${info.ino}`, async () => {
-      const lock = await acquireMutationLock(root, this.uid)
-      if (!lock) return unavailable
-      try {
-        const result = (await this.rootStillBound()) ? await operation() : unavailable
-        return (await releaseMutationLock(root, lock, this.uid)) ? result : unavailable
-      } catch {
-        await releaseMutationLock(root, lock, this.uid)
-        return unavailable
-      }
-    })
+  private async poison(): Promise<void> {
+    this.poisoned = true
+    const root = this.rootHandle
+    this.rootHandle = null
+    this.rootIdentity = null
+    this.foregroundLease = false
+    // Poisoning rejects all future work; close errors cannot restore storage authority.
+    // Root closure releases any unknown kernel lease; its error cannot unpoison the instance.
+    await root?.close().catch(() => undefined)
   }
 
   private async boundRoot(): Promise<FileHandle | null> {
-    if (!this.rootHandle || !this.rootIdentity) return null
+    if (this.closed || this.poisoned || !this.rootHandle || !this.rootIdentity) return null
     try {
       const info = await this.rootHandle.stat({ bigint: true })
       const homeMatches = secureDirectory(info, this.uid) && sameIdentity(info, this.rootIdentity) && await this.rootStillBound()
-      if (!homeMatches || (this.lockHandle && !(await this.lockStillBound()))) return null
-      return this.rootHandle
+      return homeMatches ? this.rootHandle : null
     } catch {
       return null
     }
@@ -289,19 +258,6 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     // A caller receives its failure; the ordering queue must remain available for later recovery.
     this.queue = result.catch(() => undefined)
     return result
-  }
-}
-
-async function serializeMutation<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const previous = mutationQueues.get(key) ?? Promise.resolve()
-  const running = previous.then(operation, operation)
-  // This promise only advances the per-root queue; the caller still receives `running` failures.
-  const settled = running.then(() => undefined, () => undefined)
-  mutationQueues.set(key, settled)
-  try {
-    return await running
-  } finally {
-    if (mutationQueues.get(key) === settled) mutationQueues.delete(key)
   }
 }
 
@@ -329,118 +285,6 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-type LockCreation =
-  | { status: 'created'; handle: FileHandle }
-  | { status: 'exists' }
-  | { status: 'storage-unavailable' }
-
-async function createLock(target: string, uid: number | undefined): Promise<LockCreation> {
-  try {
-    const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, RECORD_MODE)
-    if (secureRecord(await handle.stat(), uid)) return { status: 'created', handle }
-    await handle.close()
-    await unlink(target)
-    return { status: 'storage-unavailable' }
-  } catch (error) {
-    return isCode(error, 'EEXIST') ? { status: 'exists' } : { status: 'storage-unavailable' }
-  }
-}
-
-type LockOwner = { pid: number; identity: string }
-type ProcessIdentity =
-  | { status: 'identified'; value: string }
-  | { status: 'absent' }
-  | { status: 'indeterminate' }
-
-async function readLockOwner(target: string, uid: number | undefined): Promise<LockOwner | null> {
-  try {
-    const handle = await openRecord(target)
-    if (!handle) return null
-    const held = await readSecure(handle, uid, LOCK_BYTES)
-    if (held.status !== 'found') return null
-    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(held.bytes)) as { pid?: unknown; identity?: unknown }
-    if (typeof value.pid !== 'number' || !Number.isSafeInteger(value.pid) || value.pid <= 0) return null
-    if (typeof value.identity !== 'string' || value.identity.length === 0 || value.identity.length > 512 || /[\u0000-\u001f\u007f]/.test(value.identity)) return null
-    return { pid: value.pid, identity: value.identity }
-  } catch {
-    return null
-  }
-}
-
-async function processIdentity(pid: number): Promise<ProcessIdentity> {
-  if (process.platform === 'linux') return await linuxProcessIdentity(pid)
-  if (process.platform === 'darwin') return await darwinProcessIdentity(pid)
-  return processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' }
-}
-
-async function linuxProcessIdentity(pid: number): Promise<ProcessIdentity> {
-  try {
-    const [bootId, stat] = await Promise.all([
-      readFile('/proc/sys/kernel/random/boot_id', 'utf8'),
-      readFile(`/proc/${pid}/stat`, 'utf8'),
-    ])
-    const closingParenthesis = stat.lastIndexOf(')')
-    const fields = closingParenthesis < 0 ? [] : stat.slice(closingParenthesis + 1).trim().split(/\s+/)
-    const startTicks = fields[19]
-    const boot = bootId.trim()
-    if (!/^[0-9a-f-]{36}$/.test(boot) || !startTicks || !/^\d+$/.test(startTicks)) return { status: 'indeterminate' }
-    return { status: 'identified', value: `linux:${boot}:${startTicks}` }
-  } catch {
-    return processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' }
-  }
-}
-
-function darwinProcessIdentity(pid: number): Promise<ProcessIdentity> {
-  return new Promise(resolve => {
-    execFile(
-      '/bin/ps',
-      ['-p', String(pid), '-o', 'pid=', '-o', 'lstart='],
-      { encoding: 'utf8', timeout: 1_000, maxBuffer: 4_096, env: { LC_ALL: 'C', LANG: 'C', PATH: '/usr/bin:/bin' } },
-      (error, stdout) => {
-        if (error) {
-          resolve(processAlive(pid) ? { status: 'indeterminate' } : { status: 'absent' })
-          return
-        }
-        const matched = stdout.match(/^\s*(\d+)\s+(.+?)\s*$/)
-        resolve(matched?.[1] === String(pid) && matched[2]
-          ? { status: 'identified', value: `darwin:${matched[2]}` }
-          : { status: 'indeterminate' })
-      },
-    )
-  })
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return !isCode(error, 'ESRCH')
-  }
-}
-
-async function retireStaleLock(target: string, root: FileHandle): Promise<boolean> {
-  const retired = `${target}.stale-${randomBytes(16).toString('hex')}`
-  try {
-    await rename(target, retired)
-    await unlink(retired)
-    await root.sync()
-    return true
-  } catch (error) {
-    return isCode(error, 'ENOENT')
-  }
-}
-
-async function lockPathMatches(handle: FileHandle, target: string, uid: number | undefined): Promise<boolean> {
-  try {
-    const held = await handle.stat({ bigint: true })
-    const current = await lstat(target, { bigint: true })
-    return secureRecord(held, uid) && secureRecord(current, uid) && sameIdentity(current, identityOf(held))
-  } catch {
-    return false
-  }
-}
-
 async function openSecureRoot(root: string, uid: number | undefined): Promise<FileHandle | null> {
   let handle: FileHandle | undefined
   try {
@@ -463,157 +307,47 @@ function rootEntryPath(root: FileHandle, entry: string): string {
   return path.join(descriptorRootDirectory(), String(root.fd), entry)
 }
 
-async function acquireMutationLock(root: FileHandle, uid: number | undefined): Promise<FileHandle | null> {
-  const target = rootEntryPath(root, MUTATION_LOCK_FILE)
-  for (let attempt = 0; attempt < MUTATION_LOCK_ATTEMPTS; attempt += 1) {
-    let handle: FileHandle | undefined
-    try {
-      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK
-      handle = await open(target, flags, RECORD_MODE)
-      if (!secureRecord(await handle.stat(), uid)) {
-        await rejectMutationLock(handle, target)
-        return null
-      }
-      await writeAll(handle, Buffer.from(`${JSON.stringify({ pid: process.pid })}\n`))
-      await handle.sync()
-      await root.sync()
-      if (!(await ownedEntryMatches(handle, target, uid))) {
-        // Lost publication means this handle owns no lock path; close cannot make it usable.
-        await handle.close().catch(() => undefined)
-        return null
-      }
-      return handle
-    } catch (error) {
-      if (handle) await releaseOwnedEntry(root, handle, MUTATION_LOCK_FILE, uid)
-      if (!isCode(error, 'EEXIST')) return null
-      const retired = await retireStaleMutationLock(root, target, uid)
-      if (retired === 'unavailable') return null
-      if (retired === 'active') await delay(2)
+type InterruptedTemp = { name: string; identity: RootIdentity; size: number }
+
+async function cleanupInterruptedTemps(root: FileHandle, uid: number | undefined): Promise<boolean> {
+  try {
+    const names = await readdir(rootEntryPath(root, '.'))
+    if (names.some(name => LEGACY_COORDINATION_ENTRIES.has(name))) return false
+    const records = Object.entries(RECORD_FILES).filter(([record]) => record !== 'audit')
+    const candidates: InterruptedTemp[] = []
+    let totalBytes = 0
+    for (const name of names) {
+      const matched = records.find(([, file]) => name.startsWith(`${file}.tmp-`))
+      if (!matched) continue
+      const [record, file] = matched
+      if (!new RegExp(`^${escapeRegExp(file)}\\.tmp-[0-9a-f]{32}$`).test(name)) return false
+      const info = await lstat(rootEntryPath(root, name), { bigint: true })
+      if (!secureRecord(info, uid) || Number(info.size) > RECORD_LIMITS[record as RunnerHomeStateRecord]) return false
+      totalBytes += Number(info.size)
+      candidates.push({ name, identity: identityOf(info), size: Number(info.size) })
     }
-  }
-  return null
-}
-
-async function rejectMutationLock(handle: FileHandle, target: string): Promise<void> {
-  // The lock is already rejected; cleanup errors keep acquisition unavailable.
-  await handle.close().catch(() => undefined)
-  // Only the just-created private lock is targeted, and failure leaves the root closed.
-  await unlink(target).catch(() => undefined)
-}
-
-type MutationLockState = 'retired' | 'active' | 'unavailable'
-
-async function retireStaleMutationLock(
-  root: FileHandle,
-  target: string,
-  uid: number | undefined,
-): Promise<MutationLockState> {
-  const reaper = await acquireReaper(root, uid)
-  if (!reaper) return 'active'
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    const held = await handle.stat({ bigint: true })
-    if (!secureRecord(held, uid)) return 'unavailable'
-    const bytes = await readBounded(handle, MUTATION_LOCK_BYTES, Number(held.size))
-    const pid = bytes && mutationLockPid(bytes)
-    if (pid && processIsAlive(pid)) return 'active'
-    if (!pid && Date.now() - Number(held.mtimeMs) <= MUTATION_LOCK_INITIALIZATION_MS) return 'active'
-    const visible = await lstat(target, { bigint: true })
-    if (!secureRecord(visible, uid) || !sameIdentity(visible, identityOf(held))) return 'unavailable'
-    await unlink(target)
-    return 'retired'
-  } catch (error) {
-    return isCode(error, 'ENOENT') ? 'retired' : 'unavailable'
-  } finally {
-    // The reaper serializes stale retirement; target inspection never owns the active lock.
-    await handle?.close().catch(() => undefined)
-    await releaseOwnedEntry(root, reaper, MUTATION_REAPER_FILE, uid)
-  }
-}
-
-async function acquireReaper(root: FileHandle, uid: number | undefined): Promise<FileHandle | null> {
-  const target = rootEntryPath(root, MUTATION_REAPER_FILE)
-  let handle: FileHandle | undefined
-  try {
-    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK
-    handle = await open(target, flags, RECORD_MODE)
-    if (secureRecord(await handle.stat(), uid)) {
-      await writeAll(handle, Buffer.from(`${JSON.stringify({ pid: process.pid })}\n`))
-      await handle.sync()
-      await root.sync()
-      if (!(await ownedEntryMatches(handle, target, uid))) {
-        // A replaced reaper owns no retirement authority; close cannot reclaim that path.
-        await handle.close().catch(() => undefined)
-        return null
+    if (candidates.length > MAX_INTERRUPTED_TEMPS || totalBytes > MAX_INTERRUPTED_TEMP_BYTES) return false
+    for (const candidate of candidates) {
+      const target = rootEntryPath(root, candidate.name)
+      let handle: FileHandle | undefined
+      try {
+        handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+        const [held, visible] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })])
+        if (!secureRecord(held, uid) || !sameIdentity(held, candidate.identity) || !sameIdentity(visible, candidate.identity)) return false
+      } finally {
+        await handle?.close()
       }
-      return handle
+      await unlink(target)
     }
-    await rejectMutationLock(handle, target)
-    return null
-  } catch {
-    if (handle) await releaseOwnedEntry(root, handle, MUTATION_REAPER_FILE, uid)
-    return null
-  }
-}
-
-function mutationLockPid(bytes: Uint8Array): number | null {
-  try {
-    const value = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown
-    if (typeof value !== 'object' || value === null || !('pid' in value)) return null
-    const pid = value.pid
-    return typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 ? pid : null
-  } catch {
-    return null
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
+    if (candidates.length > 0) await root.sync()
     return true
-  } catch (error) {
-    return !isCode(error, 'ESRCH')
-  }
-}
-
-async function releaseMutationLock(root: FileHandle, lock: FileHandle, uid: number | undefined): Promise<boolean> {
-  return await releaseOwnedEntry(root, lock, MUTATION_LOCK_FILE, uid)
-}
-
-async function ownedEntryMatches(handle: FileHandle, target: string, uid: number | undefined): Promise<boolean> {
-  try {
-    const [held, visible] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })])
-    return secureRecord(held, uid) && secureRecord(visible, uid) && sameIdentity(visible, identityOf(held))
   } catch {
     return false
   }
 }
 
-async function releaseOwnedEntry(
-  root: FileHandle,
-  lock: FileHandle,
-  entry: string,
-  uid: number | undefined,
-): Promise<boolean> {
-  const target = rootEntryPath(root, entry)
-  try {
-    if (!(await ownedEntryMatches(lock, target, uid))) {
-      // Identity mismatch is already unavailable; close cannot authorize cleanup.
-      await lock.close().catch(() => undefined)
-      return false
-    }
-    await unlink(target)
-    // The lock is already absent; sync failure cannot undo mutual exclusion just completed.
-    await root.sync().catch(() => undefined)
-    // The unlinked lock no longer coordinates writers, so descriptor close is best-effort.
-    await lock.close().catch(() => undefined)
-    return true
-  } catch {
-    // Failed identity/unlink cleanup remains unavailable; closing only prevents a descriptor leak.
-    await lock.close().catch(() => undefined)
-    return false
-  }
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 async function inspectEntry(root: FileHandle, record: RunnerHomeRecord, uid: number | undefined): Promise<RunnerHomeEntryInspection> {

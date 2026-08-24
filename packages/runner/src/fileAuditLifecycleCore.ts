@@ -36,6 +36,7 @@ import {
 import { decodeAuditRecord, encodeAuditRecord } from './auditRecordCodec.js'
 import { createFileRunnerHomeStorage } from './runnerHomeStorage.js'
 import type { RunnerHomeStorage } from './runnerHome.js'
+import { linuxDescriptorRootPath, withLinuxRootLease } from './linuxRootLease.js'
 
 export const DIRECTORY_MODE = 0o700
 export const FILE_MODE = 0o600
@@ -98,6 +99,7 @@ type RecoveredSealed = {
 }
 
 export type RecoveredLifecycle = {
+  leaseRoot?: FileHandle
   directory: FileHandle
   directoryIdentity: DirectoryIdentity
   directoryPath: string
@@ -110,6 +112,50 @@ export type RecoveredLifecycle = {
 }
 
 export type AuditMigrationHook = (root: string, uid: number | undefined) => Promise<void>
+
+async function recoverWithRootLease(
+  root: string,
+  uid: number | undefined,
+  migrate: AuditMigrationHook,
+): Promise<RecoveredLifecycle | null> {
+  let leaseRoot: FileHandle | undefined
+  let candidate: RecoveredLifecycle | undefined
+  try {
+    leaseRoot = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    if (!secureDirectory(await leaseRoot.stat({ bigint: true }), uid)) {
+      await leaseRoot.close()
+      leaseRoot = undefined
+      return null
+    }
+    const rootHandle = leaseRoot
+    const recovered = await withLinuxRootLease(
+      rootHandle,
+      null,
+      async () => {
+        const boundRoot = linuxDescriptorRootPath(rootHandle)
+        await migrate(boundRoot, uid)
+        const value = await recoverLifecycle(boundRoot, uid, rootHandle)
+        candidate = { ...value, leaseRoot: rootHandle }
+        return candidate
+      },
+      () => false,
+      async () => {
+        // Unlock failure rejects recovery; closing only guarantees the kernel lease is released.
+        await rootHandle.close().catch(() => undefined)
+      },
+    )
+    if (recovered) return recovered
+  } catch {
+    // Cleanup below owns every handle created by a failed open/recovery attempt.
+  }
+  // Recovery is already unavailable; cleanup failures cannot produce a usable lifecycle.
+  await candidate?.current.handle.close().catch(() => undefined)
+  // The audit directory handle has no owner after recovery failure.
+  await candidate?.directory.close().catch(() => undefined)
+  // The root handle must release any lease even though recovery failed.
+  await leaseRoot?.close().catch(() => undefined)
+  return null
+}
 
 export async function openRunnerAuditLifecycleCore(
   options: RunnerAuditLifecycleOptions,
@@ -124,9 +170,10 @@ export async function openRunnerAuditLifecycleCore(
     if (await storage.acquire?.() !== 'acquired') return await unavailable(storage)
     const root = path.resolve(options.runnerHome)
     const uid = options.currentUserId ?? process.getuid?.()
-    await migrate(root, uid)
-    const recovered = await recoverLifecycle(root, uid)
-    return { status: 'ready', audit: new FileRunnerAuditLifecycle(storage, recovered) }
+    const recovered = await recoverWithRootLease(root, uid, migrate)
+    return recovered
+      ? { status: 'ready', audit: new FileRunnerAuditLifecycle(storage, recovered) }
+      : await unavailable(storage)
   } catch {
     return await unavailable(storage)
   }
@@ -139,9 +186,10 @@ export async function openBoundRunnerAuditLifecycleCore(
   try {
     const root = path.resolve(options.runnerHome)
     const uid = options.currentUserId ?? process.getuid?.()
-    await migrate(root, uid)
-    const recovered = await recoverLifecycle(root, uid)
-    return { status: 'ready', audit: new FileRunnerAuditLifecycle(null, recovered) }
+    const recovered = await recoverWithRootLease(root, uid, migrate)
+    return recovered
+      ? { status: 'ready', audit: new FileRunnerAuditLifecycle(null, recovered) }
+      : { status: 'storage-unavailable' }
   } catch {
     return { status: 'storage-unavailable' }
   }
@@ -169,7 +217,7 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
   }
 
   append(record: AuditRecordInputV2): Promise<void> {
-    const operation = this.queue.then(() => this.appendOne(record))
+    const operation = this.queue.then(() => this.appendLeased(record))
     // The caller receives the append failure; the ordering queue remains usable for close/snapshot.
     this.queue = operation.catch(() => undefined)
     return operation
@@ -190,6 +238,26 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     // Close reports its own failure while the internal queue only retains ordering.
     this.queue = operation.catch(() => undefined)
     return operation
+  }
+
+  private async appendLeased(record: AuditRecordInputV2): Promise<void> {
+    const root = this.recovered.leaseRoot
+    if (!root) throw new Error('audit lifecycle has no runner-home lease root')
+    const committed = await withLinuxRootLease(
+      root,
+      false,
+      async () => {
+        await this.appendOne(record)
+        return true
+      },
+      value => value,
+      async () => {
+        this.faulted = true
+        // Closing the lease root releases unknown lock state; close failure cannot restore it.
+        await root.close().catch(() => undefined)
+      },
+    )
+    if (!committed) throw new Error('audit lifecycle lease unavailable')
   }
 
   private async appendOne(record: AuditRecordInputV2): Promise<void> {
@@ -282,24 +350,29 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
   private async closeOwned(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    let failure: unknown
-    try {
-      await this.current.handle.sync()
-      await this.current.handle.close()
-      await this.recovered.directory.close()
-    } catch (error) {
-      failure = error
-    }
-    if (this.storage) {
-      try {
-        await this.storage.release?.()
-        await this.storage.close?.()
-      } catch (error) {
-        failure ??= error
-      }
-    }
+    const operations = [
+      async () => await this.current.handle.sync(),
+      async () => await this.current.handle.close(),
+      async () => await this.recovered.directory.close(),
+      async () => await this.recovered.leaseRoot?.close(),
+      async () => await this.storage?.release?.(),
+      async () => await this.storage?.close?.(),
+    ]
+    const failure = await attemptAll(operations)
     if (failure) throw failure
   }
+}
+
+async function attemptAll(operations: readonly (() => Promise<unknown>)[]): Promise<unknown> {
+  let failure: unknown
+  for (const operation of operations) {
+    try {
+      await operation()
+    } catch (error) {
+      failure ??= error
+    }
+  }
+  return failure
 }
 
 export async function readMigrationMarker(
@@ -325,14 +398,18 @@ export async function readMigrationMarker(
   }
 }
 
-export async function recoverLifecycle(root: string, uid: number | undefined): Promise<RecoveredLifecycle> {
+export async function recoverLifecycle(
+  root: string,
+  uid: number | undefined,
+  rootHandle?: FileHandle,
+): Promise<RecoveredLifecycle> {
   const directoryPath = path.join(root, AUDIT_DIRECTORY)
-  await ensureAuditDirectory(directoryPath, uid)
+  await ensureAuditDirectory(root, directoryPath, uid, rootHandle)
   const directory = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
-  const directoryInfo = await directory.stat({ bigint: true })
-  if (!secureDirectory(directoryInfo, uid)) throw new Error('insecure audit directory')
-  const recovered = { directory, directoryIdentity: identityOf(directoryInfo), directoryPath, uid }
   try {
+    const directoryInfo = await directory.stat({ bigint: true })
+    if (!secureDirectory(directoryInfo, uid)) throw new Error('insecure audit directory')
+    const recovered = { directory, directoryIdentity: identityOf(directoryInfo), directoryPath, uid }
     await removeInterruptedTemps(recovered)
     const entries = await readdir(directoryPath)
     const migration = entries.includes(MIGRATION_MARKER) ? await readMigrationMarker(recovered) : undefined
@@ -378,15 +455,24 @@ export async function recoverLifecycle(root: string, uid: number | undefined): P
   }
 }
 
-async function ensureAuditDirectory(directoryPath: string, uid: number | undefined): Promise<void> {
+async function ensureAuditDirectory(
+  root: string,
+  directoryPath: string,
+  uid: number | undefined,
+  rootHandle?: FileHandle,
+): Promise<void> {
   const held = await lstat(directoryPath).catch(error => missingOnly(error))
   if (held === null) {
     await mkdir(directoryPath, { mode: DIRECTORY_MODE })
-    const parent = await open(path.dirname(directoryPath), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
-    try {
-      await parent.sync()
-    } finally {
-      await parent.close()
+    if (rootHandle) {
+      await rootHandle.sync()
+    } else {
+      const parent = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+      try {
+        await parent.sync()
+      } finally {
+        await parent.close()
+      }
     }
   }
   const info = await lstat(directoryPath)

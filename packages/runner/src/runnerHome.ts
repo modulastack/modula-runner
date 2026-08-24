@@ -143,6 +143,7 @@ export interface RunnerHomeStorage {
   acquire?(): Promise<'acquired' | 'busy' | 'storage-unavailable'>
   release?(): Promise<void>
   close?(): Promise<void>
+  descriptorRoot?(): Promise<string | null>
   read(record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead>
   replace(record: RunnerHomeStateRecord, expectedSha256: string | null, bytes: Uint8Array): Promise<RunnerHomeStorageWrite>
 }

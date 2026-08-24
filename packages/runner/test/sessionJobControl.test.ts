@@ -211,13 +211,24 @@ describe('session job-control dispatch', () => {
     expect(calls).toBe(1)
   })
 
-  it('recovers only after active v2 negotiation and preserves launcher action order', async () => {
-    const subject = createSessionJobControl({ launcher: launcher() })
+  it('recovers only after active v2 negotiation and binds recovery to the authenticated peer', async () => {
+    let recoveredBinding: string | undefined
+    const base = launcher()
+    const subject = createSessionJobControl({
+      launcher: {
+        handle: request => base.handle(request),
+        recover: bindingId => {
+          recoveredBinding = bindingId
+          return base.recover(bindingId)
+        },
+      },
+    })
     await expect(collect(subject.recover(context(1)))).resolves.toEqual([])
     await expect(collect(subject.recover(context()))).resolves.toEqual([{
       kind: 'send',
       channelId: 'job-control-1',
       payload: { codec: 'json', body: { type: 'SESSION_FINISHED', requestId: request.requestId, exitCode: 0, signal: null } },
     }])
+    expect(recoveredBinding).toBe(request.bindingId)
   })
 })

@@ -1,4 +1,4 @@
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -88,28 +88,49 @@ describe('file runner-home storage', () => {
     expect(['one', 'two']).toContain(await readFile(path.join(root, 'projects.json'), 'utf8'))
   })
 
-  it('retires a secure mutation lock owned by an absent process', async () => {
+  it('fails closed on unmerged legacy mutation coordination artifacts', async () => {
+    for (const entry of ['.records.lock', '.records.reap']) {
+      const { root } = await temporaryHome()
+      const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+      await storage.inspect({})
+      await writeFile(path.join(root, entry), 'legacy\n', { mode: 0o600 })
+      await expect(storage.replace('projects', null, Buffer.from('blocked'))).resolves.toEqual({ status: 'storage-unavailable' })
+      await expect(readFile(path.join(root, entry), 'utf8')).resolves.toBe('legacy\n')
+    }
+  })
+
+  it('cleans only exact secure interrupted record temps before mutation', async () => {
     const { root } = await temporaryHome()
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
     await storage.inspect({})
-    await writeFile(path.join(root, '.records.lock'), '{"pid":2147483647}\n', { mode: 0o600 })
-    await expect(storage.replace('projects', null, Buffer.from('recovered'))).resolves.toMatchObject({ status: 'written' })
-    await expect(lstat(path.join(root, '.records.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+    const valid = path.join(root, `receipts.json.tmp-${'a'.repeat(32)}`)
+    await writeFile(valid, 'partial', { mode: 0o600 })
+    await expect(storage.replace('projects', null, Buffer.from('written'))).resolves.toMatchObject({ status: 'written' })
+    await expect(lstat(valid)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const malformed = path.join(root, 'receipts.json.tmp-not-hex')
+    await writeFile(malformed, 'unknown', { mode: 0o600 })
+    await expect(storage.replace('configuration', null, Buffer.from('blocked'))).resolves.toEqual({ status: 'storage-unavailable' })
+    await expect(readFile(malformed, 'utf8')).resolves.toBe('unknown')
   })
 
-  it('serializes concurrent stale-lock reapers before a new owner writes', async () => {
+  it('refuses interrupted-temp cleanup before deleting over-cap or insecure candidates', async () => {
     const { root } = await temporaryHome()
-    const first = createFileRunnerHomeStorage({ defaultRoot: root })
-    const second = createFileRunnerHomeStorage({ defaultRoot: root })
-    await first.inspect({})
-    await second.inspect({})
-    await writeFile(path.join(root, '.records.lock'), '{"pid":2147483647}\n', { mode: 0o600 })
-    const outcomes = await Promise.all([
-      first.replace('projects', null, Buffer.from('one')),
-      second.replace('projects', null, Buffer.from('two')),
-    ])
-    expect(outcomes.map(outcome => outcome.status).sort()).toEqual(['conflict', 'written'])
-    expect(['one', 'two']).toContain(await readFile(path.join(root, 'projects.json'), 'utf8'))
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    await storage.inspect({})
+    const excessive = Array.from({ length: 129 }, (_, index) => path.join(root, `projects.json.tmp-${index.toString(16).padStart(32, '0')}`))
+    await Promise.all(excessive.map(file => writeFile(file, '', { mode: 0o600 })))
+    await expect(storage.replace('projects', null, Buffer.from('blocked'))).resolves.toEqual({ status: 'storage-unavailable' })
+    await expect(lstat(excessive[0]!)).resolves.toMatchObject({ size: 0 })
+    await Promise.all(excessive.map(file => rm(file)))
+
+    const oversized = Array.from({ length: 6 }, (_, index) => path.join(root, `receipts.json.tmp-${index.toString(16).padStart(32, 'a')}`))
+    await Promise.all(oversized.map(async file => {
+      await writeFile(file, '', { mode: 0o600 })
+      await truncate(file, 23 * 1024 * 1024)
+    }))
+    await expect(storage.replace('projects', null, Buffer.from('blocked'))).resolves.toEqual({ status: 'storage-unavailable' })
+    await expect(lstat(oversized[0]!)).resolves.toMatchObject({ size: 23 * 1024 * 1024 })
   })
 
   it('returns bounded reads without retaining the record-limit allocation', async () => {
@@ -197,22 +218,24 @@ describe('file runner-home storage', () => {
     await contender.release!()
   })
 
-  it('reclaims a well-formed lock whose owning process no longer exists', async () => {
+  it('gives legacy PID lock files no ownership authority', async () => {
     const { root } = await temporaryHome()
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
     await storage.inspect({})
-    await writeFile(path.join(root, 'runner.lock'), '{"pid":2147483647,"identity":"linux:stale:1"}\n', { mode: 0o600 })
+    await writeFile(path.join(root, 'runner.lock'), '{"pid":2147483647,"identity":"legacy"}\n', { mode: 0o600 })
     await expect(storage.acquire!()).resolves.toBe('acquired')
     await storage.release!()
-    await expect(lstat(path.join(root, 'runner.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(path.join(root, 'runner.lock'), 'utf8')).resolves.toContain('legacy')
   })
 
-  it('reclaims a live reused PID when its process-start identity differs', async () => {
+  it('keeps close terminal and rejects every later admission', async () => {
     const { root } = await temporaryHome()
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
     await storage.inspect({})
-    await writeFile(path.join(root, 'runner.lock'), `${JSON.stringify({ pid: process.pid, identity: 'stale-process-instance' })}\n`, { mode: 0o600 })
-    await expect(storage.acquire!()).resolves.toBe('acquired')
-    await storage.release!()
+    await storage.close!()
+    await expect(storage.inspect({})).rejects.toThrow('closed')
+    await expect(storage.read('projects')).resolves.toEqual({ status: 'storage-unavailable' })
+    await expect(storage.replace('projects', null, Buffer.from('closed'))).resolves.toEqual({ status: 'storage-unavailable' })
+    await expect(storage.acquire!()).resolves.toBe('storage-unavailable')
   })
 })

@@ -1,10 +1,11 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createAllowlistSigningKeyFile,
   createFileRunnerHome,
+  readAllowlistSigningKeyFile,
   createRunnerApplication,
   type RunnerApplicationOptions,
 } from '../src/index.js'
@@ -101,6 +102,31 @@ describe('allowlist application commands', () => {
     await expect(held.application.execute(call.value)).resolves.toBe(1)
     await expect(lstat(inside)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(call.stderr.join('')).toContain('state-insecure-mode')
+  })
+
+  it('recovers the one provable temporary hard link from interrupted key publication', async () => {
+    const held = await fixture()
+    const keyPath = path.join(held.operatorRoot, 'allowlist.pem')
+    const generated = await createAllowlistSigningKeyFile(keyPath)
+    const temporary = `${keyPath}.tmp-999-${generated.signingKey.keyId.slice(0, 16)}`
+    await link(keyPath, temporary)
+    await expect(readAllowlistSigningKeyFile(keyPath)).resolves.toMatchObject({
+      signingKey: { keyId: generated.signingKey.keyId },
+    })
+    expect((await lstat(keyPath)).nlink).toBe(1)
+    await expect(lstat(temporary)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects an allowlist document writable by group or other users', async () => {
+    const held = await fixture()
+    const keyPath = path.join(held.operatorRoot, 'allowlist.pem')
+    await expect(held.application.execute(invocation(['allowlist', 'init', '--key', keyPath], held.parent).value)).resolves.toBe(0)
+    const documentPath = path.join(held.operatorRoot, 'allowlist.json')
+    await writeFile(documentPath, JSON.stringify({ executables: ['git'], recipes: {} }), { mode: 0o600 })
+    await chmod(documentPath, 0o666)
+    const sign = invocation(['allowlist', 'sign', '--key', keyPath, '--input', documentPath], held.parent)
+    await expect(held.application.execute(sign.value)).resolves.toBe(1)
+    expect(sign.stderr).toEqual(['allowlist was not signed\n'])
   })
 
   it('rejects malformed documents and untrusted signing keys without replacing policy', async () => {

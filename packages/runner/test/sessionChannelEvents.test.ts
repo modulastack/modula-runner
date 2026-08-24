@@ -112,14 +112,27 @@ describe('generation-scoped channel events', () => {
       action: { kind: 'message', message: { type: 'SESSION_FINISHED', exitCode: 0, signal: null } },
     })
     expect(held.current()).toMatchObject({ state: 'finished', channel: { lifecycle: 'closed' } })
-    expect(held.order).toEqual(['replace', 'audit'])
+    expect(held.order).toEqual(['audit', 'replace'])
+  })
+
+  it('accepts only an exact terminal duplicate without rewriting or re-auditing', async () => {
+    const first = subject()
+    await first.coordinator.handle(terminalEvent(0, null))
+    const finished = first.current()
+    const held = subject(finished)
+    await expect(held.coordinator.handle(terminalEvent(0, null))).resolves.toMatchObject({
+      status: 'applied', action: { kind: 'message', message: { exitCode: 0, signal: null } },
+    })
+    await expect(held.coordinator.handle(terminalEvent(null, 15))).resolves.toEqual({ status: 'unknown' })
+    expect(held.current()).toEqual(finished)
+    expect(held.order).toEqual([])
   })
 
   it('returns storage-unavailable instead of an action when terminal audit fails', async () => {
     const held = subject(receipt(), true)
     await expect(held.coordinator.handle(terminalEvent(null, 15)))
       .resolves.toEqual({ status: 'storage-unavailable' })
-    expect(held.current()).toMatchObject({ state: 'finished', result: { signal: 15 } })
-    expect(held.order).toEqual(['replace', 'audit'])
+    expect(held.current()).toMatchObject({ state: 'started', channel: { lifecycle: 'live' } })
+    expect(held.order).toEqual(['audit'])
   })
 })

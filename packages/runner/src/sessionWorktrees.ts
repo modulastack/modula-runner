@@ -109,6 +109,8 @@ async function register(
         return failed('worktree-conflict')
       }
       if (!(await exactBranch(options, checkout.repoPath, snapshot.branch, snapshot.headCommit))) return failed('worktree-conflict')
+      const grantedRoot = await options.grants.resolveGrantedCwd(project.worktreesRoot)
+      if (!grantedRoot || !samePath(grantedRoot, project.worktreesRoot)) return failed('path-not-granted')
       const worktreePath = deterministicWorktreePath(project.worktreesRoot, target.worktreeName)
       let listed = await listedWorktrees(options, checkout.repoPath, signal)
       const existing = listed.find(worktree => samePath(worktree.path, worktreePath))
@@ -127,15 +129,20 @@ async function register(
       } catch {
         // Interrupted add has no documented rollback point; only the post-signal Git listing is authoritative.
       }
-      listed = await listedWorktrees(options, checkout.repoPath)
-      const committed = listed.filter(worktree => samePath(worktree.path, worktreePath) && worktree.branch === snapshot.branch)
-      if (committed.length !== 1 || committed[0]!.prunable || committed[0]!.locked) return failed('provision-failed')
-      const registered = await registeredSnapshot(options, snapshot, worktreePath, 'created')
-      if (!signal.aborted) return { status: 'ready' as const, snapshot: registered }
-      if (!(await cleanupAbortedRegistration(options, checkout.repoPath, worktreePath, snapshot.branch))) {
-        throw new WorktreeError('provision-failed')
+      try {
+        listed = await listedWorktrees(options, checkout.repoPath)
+        const committed = listed.filter(worktree => samePath(worktree.path, worktreePath) && worktree.branch === snapshot.branch)
+        if (committed.length !== 1 || committed[0]!.prunable || committed[0]!.locked) throw new Error('registration not exact')
+        const registered = await registeredSnapshot(options, snapshot, worktreePath, 'created')
+        if (!signal.aborted) return { status: 'ready' as const, snapshot: registered }
+        if (!(await cleanupAbortedRegistration(options, checkout.repoPath, worktreePath, snapshot.branch))) {
+          return failed('recovery-uncertain')
+        }
+        return failed('provision-failed')
+      } catch {
+        const cleaned = await cleanupAbortedRegistration(options, checkout.repoPath, worktreePath, snapshot.branch)
+        return failed(cleaned ? 'provision-failed' : 'recovery-uncertain')
       }
-      return failed('provision-failed')
     })
   } catch (error) {
     return failed(reasonOf(error))
@@ -190,7 +197,7 @@ async function inspect(options: SessionWorktreePortOptions, snapshot: SessionWor
     if (!(await sameIdentity(snapshot.resolvedCwdPath, snapshot.resolvedCwdIdentity))) return 'mismatch'
     return contained(snapshot.worktreePath, await realpath(snapshot.resolvedCwdPath)) ? 'exact' : 'mismatch'
   } catch {
-    return 'missing'
+    return 'mismatch'
   }
 }
 
@@ -230,7 +237,9 @@ async function mainCheckout(options: SessionWorktreePortOptions, project: Sessio
   if (!samePath(root, repoPath)) throw new WorktreeError('worktree-invalid')
   const gitDir = path.resolve(repoPath, await git(options, repoPath, ['rev-parse', '--absolute-git-dir'], signal))
   const commonDir = path.resolve(await git(options, repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'], signal))
-  if (!samePath(gitDir, commonDir)) throw new WorktreeError('worktree-invalid')
+  if (!samePath(gitDir, commonDir) || !samePath(commonDir, path.join(repoPath, '.git'))) {
+    throw new WorktreeError('worktree-invalid')
+  }
   return { repoPath, commonDir }
 }
 
@@ -327,12 +336,26 @@ async function cleanupAbortedRegistration(
 }
 
 async function refExists(options: SessionWorktreePortOptions, repoPath: string, ref: string, signal?: AbortSignal) {
-  try {
-    await git(options, repoPath, ['show-ref', '--verify', '--quiet', ref], signal)
-    return true
-  } catch {
-    return false
-  }
+  if (signal?.aborted) throw new WorktreeError('provision-failed')
+  const result = await options.seam.run(
+    { kind: 'git', executable: 'git', args: ['show-ref', '--verify', '--quiet', ref], cwd: repoPath, grantScoped: false },
+    async vetted => {
+      try {
+        await run(vetted.command, [...vetted.args], { cwd: repoPath, encoding: 'utf8', timeout: LOCAL_TIMEOUT_MS, signal })
+        return { outcome: { exitCode: 0 as const, signal: null }, value: true }
+      } catch (error) {
+        if (processExitCode(error) === 1) return { outcome: { exitCode: 0 as const, signal: null }, value: false }
+        throw error
+      }
+    },
+  )
+  if (result.status === 'refused') throw new WorktreeError('provision-failed')
+  return result.value
+}
+
+function processExitCode(error: unknown): number | null {
+  if (!error || typeof error !== 'object' || !('code' in error)) return null
+  return typeof error.code === 'number' ? error.code : null
 }
 
 async function ensureClean(options: SessionWorktreePortOptions, worktreePath: string, signal?: AbortSignal) {
@@ -423,7 +446,7 @@ function samePath(left: string, right: string): boolean {
   return path.resolve(left) === path.resolve(right)
 }
 
-function failed(reason: 'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed') {
+function failed(reason: 'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed' | 'recovery-uncertain') {
   return { status: 'failed' as const, reason }
 }
 

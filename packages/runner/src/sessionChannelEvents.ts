@@ -32,11 +32,19 @@ async function handleChannelEvent(
   if (current.sessionId !== event.sessionId || !current.channel) return { status: 'unknown' }
   if (event.generation < current.channel.generation) return { status: 'retired' }
   if (event.generation !== current.channel.generation || event.channelId !== current.channel.channelId) return { status: 'unknown' }
+  const duplicate = terminalDuplicate(current, event)
+  if (duplicate) return duplicate
+  if (current.result) return { status: 'unknown' }
   const next = channelEventReceipt(current, event, options.clock.now())
   if (!next) return { status: 'unknown' }
+  if (event.kind === 'terminal' && !(await auditChannelEvent(options, next))) {
+    return { status: 'storage-unavailable' }
+  }
   const replaced = await replaceReceipt(options, current.revision, next)
   if (replaced.status !== 'updated') return replacementFailure(replaced, event.generation)
-  if (!(await auditChannelEvent(options, replaced.receipt))) return { status: 'storage-unavailable' }
+  if (event.kind !== 'terminal' && !(await auditChannelEvent(options, replaced.receipt))) {
+    return { status: 'storage-unavailable' }
+  }
   return { status: 'applied', receipt: replaced.receipt, action: channelEventAction(replaced.receipt) }
 }
 
@@ -92,6 +100,17 @@ function channelEventReceipt(
     },
     phaseTimestamps: { ...receipt.phaseTimestamps, finished: new Date(now).toISOString() },
   }
+}
+
+function terminalDuplicate(
+  receipt: SessionReceipt,
+  event: SessionChannelEvent,
+): SessionChannelEventResult | null {
+  if (event.kind !== 'terminal' || receipt.state !== 'finished' || !receipt.result) return null
+  const result = terminalEventResult(receipt.key.requestId, event)
+  if (!result || JSON.stringify(result) !== JSON.stringify(receipt.result)) return null
+  if (receipt.channel?.lifecycle !== 'closed') return null
+  return { status: 'applied', receipt, action: channelEventAction(receipt) }
 }
 
 function terminalEventResult(

@@ -93,8 +93,10 @@ describe('production runner home', () => {
     await expect(competing.open({})).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
 
     await storage.release!()
-    await expect(competing.open({})).resolves.toMatchObject({ status: 'ready' })
-    await competingStorage.release!()
+    const nextStorage = createFileRunnerHomeStorage({ defaultRoot: root })
+    const next = createRunnerHome({ storage: nextStorage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
+    await expect(next.open({})).resolves.toMatchObject({ status: 'ready' })
+    await nextStorage.release!()
   })
 
   it('composes encrypted pairing/key custody behind one file-home factory and releases on close', async () => {

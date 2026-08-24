@@ -1,6 +1,6 @@
 import { createPrivateKey, createPublicKey } from 'node:crypto'
-import { constants } from 'node:fs'
-import { link, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
+import { constants, type BigIntStats, type Stats } from 'node:fs'
+import { link, lstat, open, readdir, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import {
   MAX_ALLOWLIST_BYTES,
@@ -49,7 +49,8 @@ export async function readAllowlistSigningKeyFile(target: string): Promise<Gener
   let handle: FileHandle | undefined
   try {
     handle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    const info = await handle.stat()
+    let info = await handle.stat()
+    if (info.nlink === 2) info = await recoverInterruptedKeyPublication(keyPath, handle, info)
     if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_KEY_MODE || info.nlink !== 1) {
       throw new Error('allowlist signing key custody is invalid')
     }
@@ -72,10 +73,15 @@ export async function readAllowlistDocumentFile(target: string): Promise<string>
   let handle: FileHandle | undefined
   try {
     handle = await open(path.resolve(target), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    const info = await handle.stat()
-    if (!info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1) throw new Error('allowlist document custody is invalid')
-    if (info.size > MAX_ALLOWLIST_BYTES) throw new Error('allowlist document is too large')
-    return (await readBounded(handle, MAX_ALLOWLIST_BYTES, 'allowlist document')).toString('utf8')
+    const before = await handle.stat({ bigint: true })
+    if (!secureAllowlistDocument(before)) throw new Error('allowlist document custody is invalid')
+    if (before.size > BigInt(MAX_ALLOWLIST_BYTES)) throw new Error('allowlist document is too large')
+    const document = await readBounded(handle, MAX_ALLOWLIST_BYTES, 'allowlist document')
+    const after = await handle.stat({ bigint: true })
+    if (!sameDocument(before, after) || !secureAllowlistDocument(after)) {
+      throw new Error('allowlist document custody changed while reading')
+    }
+    return document.toString('utf8')
   } finally {
     await handle?.close()
   }
@@ -86,6 +92,27 @@ export function signingKeyOutsideHome(target: string, homeRoot: string): boolean
   const root = path.resolve(homeRoot)
   const relative = path.relative(root, keyPath)
   return relative !== '' && (relative.startsWith('..') || path.isAbsolute(relative))
+}
+
+async function recoverInterruptedKeyPublication(
+  keyPath: string,
+  handle: FileHandle,
+  targetInfo: Stats,
+) {
+  const directory = path.dirname(keyPath)
+  const basename = path.basename(keyPath)
+  const candidates = (await readdir(directory)).filter(entry => (
+    entry.startsWith(`${basename}.tmp-`) && /\.tmp-\d+-[0-9a-f]{16}$/.test(entry)
+  ))
+  const matching = []
+  for (const entry of candidates) {
+    const info = await lstat(path.join(directory, entry))
+    if (info.isFile() && info.dev === targetInfo.dev && info.ino === targetInfo.ino) matching.push(entry)
+  }
+  if (matching.length !== 1) return targetInfo
+  await unlink(path.join(directory, matching[0]!))
+  await syncDirectory(directory)
+  return await handle.stat()
 }
 
 async function validatedKeyPath(target: string): Promise<string> {
@@ -129,6 +156,24 @@ async function syncDirectory(directory: string): Promise<void> {
   } finally {
     await handle.close()
   }
+}
+
+function secureAllowlistDocument(info: BigIntStats): boolean {
+  return info.isFile()
+    && info.uid === BigInt(process.getuid?.() ?? -1)
+    && (info.mode & 0o022n) === 0n
+    && info.nlink === 1n
+}
+
+function sameDocument(
+  before: BigIntStats,
+  after: BigIntStats,
+): boolean {
+  return before.dev === after.dev
+    && before.ino === after.ino
+    && before.size === after.size
+    && before.mtimeNs === after.mtimeNs
+    && before.ctimeNs === after.ctimeNs
 }
 
 function isCode(error: unknown, code: string): boolean {

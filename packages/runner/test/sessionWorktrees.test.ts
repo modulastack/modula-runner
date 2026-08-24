@@ -107,6 +107,76 @@ describe('production session worktree port', () => {
     expect(existsSync(registered.snapshot.worktreePath)).toBe(true)
   })
 
+  it('rechecks the worktrees-root grant before recovered registration mutates disk', async () => {
+    const repos = repositories()
+    const grants = createGrants({ store: createMemoryGrantStore([repos.project.worktreesRoot]) })
+    const worktrees = createSessionWorktreePort({ seam: permissiveSpawnSeam(), grants })
+    const prepared = await worktrees.prepare(repos.project, repos.target, signal())
+    if (prepared.status !== 'ready' || prepared.snapshot.phase !== 'branch-created') throw new Error('branch phase missing')
+    await grants.revoke(repos.project.worktreesRoot)
+    await expect(worktrees.register(prepared.snapshot, repos.project, repos.target, signal()))
+      .resolves.toEqual({ status: 'failed', reason: 'path-not-granted' })
+    expect(existsSync(path.join(repos.project.worktreesRoot, repos.target.worktreeName))).toBe(false)
+  })
+
+  it('removes an exact worktree when post-add registration inspection fails', async () => {
+    const repos = repositories()
+    const base = permissiveSpawnSeam()
+    let added = false
+    let failedPostAddList = false
+    const seam: SpawnSeam = {
+      check: (executable, recipeId) => base.check(executable, recipeId),
+      recordRefusal: (request, reason) => base.recordRefusal(request, reason),
+      authorize: request => base.authorize(request),
+      run: async (request, runner) => {
+        if (added && !failedPostAddList && request.kind === 'git' && request.args?.[0] === 'worktree' && request.args[1] === 'list') {
+          failedPostAddList = true
+          throw new Error('post-add inspection failed')
+        }
+        const result = await base.run(request, runner)
+        if (request.kind === 'git' && request.args?.[0] === 'worktree' && request.args[1] === 'add') added = true
+        return result
+      },
+    }
+    const worktrees = port(repos, true, seam)
+    const prepared = await worktrees.prepare(repos.project, repos.target, signal())
+    if (prepared.status !== 'ready' || prepared.snapshot.phase !== 'branch-created') throw new Error('branch phase missing')
+    await expect(worktrees.register(prepared.snapshot, repos.project, repos.target, signal()))
+      .resolves.toEqual({ status: 'failed', reason: 'provision-failed' })
+    expect(failedPostAddList).toBe(true)
+    expect(existsSync(path.join(repos.project.worktreesRoot, repos.target.worktreeName))).toBe(false)
+  })
+
+  it('rejects repositories whose Git directory is separated from the main checkout', async () => {
+    const repos = repositories()
+    const origin = path.join(repos.root, 'origin.git')
+    const separate = path.join(repos.root, 'separate.git')
+    rmSync(repos.project.repoPath, { recursive: true, force: true })
+    execFileSync('git', ['clone', '--separate-git-dir', separate, origin, repos.project.repoPath], { stdio: 'ignore' })
+    await expect(port(repos).prepare(repos.project, repos.target, signal()))
+      .resolves.toEqual({ status: 'failed', reason: 'worktree-invalid' })
+  })
+
+  it('treats unexpected ref inspection failures as uncertain, not missing', async () => {
+    const repos = repositories()
+    const first = port(repos)
+    const prepared = await first.prepare(repos.project, repos.target, signal())
+    if (prepared.status !== 'ready' || prepared.snapshot.phase !== 'branch-created') throw new Error('branch phase missing')
+    const base = permissiveSpawnSeam()
+    const failing: SpawnSeam = {
+      check: (executable, recipeId) => base.check(executable, recipeId),
+      recordRefusal: (request, reason) => base.recordRefusal(request, reason),
+      authorize: request => base.authorize(request),
+      run: async (request, runner) => {
+        if (request.kind === 'git' && request.args?.[0] === 'show-ref') throw new Error('git unavailable')
+        return await base.run(request, runner)
+      },
+    }
+    const restarted = port(repos, true, failing)
+    await expect(restarted.inspect(prepared.snapshot)).resolves.toBe('mismatch')
+    await expect(restarted.rollback(prepared.snapshot)).resolves.toBe('uncertain')
+  })
+
   it('rejects dirty, ungranted, and pre-aborted provisioning without destructive guesses', async () => {
     const repos = repositories()
     const worktrees = port(repos)

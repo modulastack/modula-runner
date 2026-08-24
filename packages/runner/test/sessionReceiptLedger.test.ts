@@ -520,6 +520,26 @@ describe('production session receipt ledger', () => {
     await expect(ledger.replace(1, rewritten)).resolves.toMatchObject({ status: 'conflict' })
   })
 
+  it('terminalizes a failed replacement while preserving its intent evidence', async () => {
+    const initial = emptyImage()
+    const started = receipt(1, 'started', '2026-08-21T00:05:00Z')
+    const replacement: SessionReceipt = {
+      ...started,
+      channel: { generation: started.channel!.generation + 1, lifecycle: 'replacement-intent', channelId: null },
+    }
+    initial.receipts = [replacement]
+    const ledger = createSessionReceiptLedger({ storage: memoryStorage(initial).storage, clock })
+    const failed: SessionReceipt = {
+      ...replacement,
+      state: 'uncertain',
+      phaseTimestamps: { ...replacement.phaseTimestamps, uncertain: '2026-08-21T00:06:00Z' },
+      result: { type: 'SESSION_FAILED', requestId: replacement.key.requestId, reason: 'recovery-uncertain' },
+    }
+    await expect(ledger.replace(1, failed)).resolves.toMatchObject({
+      status: 'updated', receipt: { state: 'uncertain', channel: { lifecycle: 'replacement-intent' } },
+    })
+  })
+
   it('keeps assigned session and channel identities immutable outside generation replacement', async () => {
     const initial = emptyImage()
     initial.receipts = [receipt(1, 'started', '2026-08-21T00:05:00Z')]

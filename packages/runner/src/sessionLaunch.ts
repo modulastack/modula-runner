@@ -227,7 +227,7 @@ export class SessionReceiptStorageUnavailableError extends Error {
 
 export type SessionWorktreeFailure = Extract<
   SessionFailureReason,
-  'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed'
+  'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed' | 'recovery-uncertain'
 >
 
 export type SessionWorktreeStep<T> =
@@ -360,7 +360,7 @@ export interface SessionLauncher {
   // Each stream is ordered and emits a message only after its receipt/audit state is
   // durable. It may remain open until an indefinitely running session finishes.
   handle(request: SessionStartMessage): AsyncIterable<SessionLaunchAction>
-  recover(): AsyncIterable<SessionLaunchAction>
+  recover(authenticatedBindingId?: string): AsyncIterable<SessionLaunchAction>
 }
 
 export class SessionLaunchNotImplementedError extends Error {

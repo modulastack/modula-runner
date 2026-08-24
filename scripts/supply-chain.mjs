@@ -12,6 +12,7 @@ const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const defaultOutput = join(repositoryRoot, 'dist', 'release')
 const defaultWaivers = join(repositoryRoot, 'security', 'vulnerability-waivers.json')
 const defaultAliases = join(repositoryRoot, 'security', 'advisory-aliases.json')
+const workspaces = ['packages/linux-file-lock', 'packages/protocol', 'packages/runner']
 
 function run(command, args, cwd) {
   return runProcess(command, args, {
@@ -55,7 +56,7 @@ function validateIntegrity(path, integrity) {
 function validateLockEntry(path, entry, packages) {
   if (entry.link === true) {
     const target = assertString(entry.resolved, `${path} link has no target`)
-    if (!['packages/protocol', 'packages/runner'].includes(target) || !packages[target]) {
+    if (!workspaces.includes(target) || !packages[target]) {
       throw new Error(`${path} links to unknown workspace ${target}`)
     }
     return
@@ -82,7 +83,7 @@ async function validateLock(projectRoot) {
   if (lock.lockfileVersion !== 3 || typeof lock.packages !== 'object' || !lock.packages) {
     throw new Error('package-lock.json must be lockfileVersion 3 with a packages map')
   }
-  for (const path of ['', 'packages/protocol', 'packages/runner']) {
+  for (const path of ['', ...workspaces]) {
     if (!lock.packages[path]) throw new Error(`package-lock.json is missing ${path || 'root'}`)
     await validateWorkspaceEntry(projectRoot, path, lock.packages[path])
   }
@@ -99,7 +100,7 @@ function packagePath(component) {
 
 async function canonicalizeSbom(sbom, projectRoot) {
   const names = new Map()
-  for (const path of ['', 'packages/protocol', 'packages/runner']) {
+  for (const path of ['', ...workspaces]) {
     const manifest = await readJson(join(projectRoot, path || '.', 'package.json'))
     names.set(path, manifest.name)
   }
@@ -117,7 +118,7 @@ async function canonicalizeSbom(sbom, projectRoot) {
 function expectedComponentPaths(lock) {
   return Object.entries(lock.packages)
     .filter(([path, entry]) => {
-      if (path === 'packages/protocol' || path === 'packages/runner') return true
+      if (workspaces.includes(path)) return true
       return isInstalledPackagePath(path) && entry.link !== true && entry.dev !== true
     })
     .map(([path]) => path)
@@ -392,10 +393,12 @@ async function runGate(projectRoot, output, waiverPath, aliasPath = defaultAlias
 }
 
 async function copySeedProject(target) {
+  await mkdir(join(target, 'packages', 'linux-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'protocol'), { recursive: true })
   await mkdir(join(target, 'packages', 'runner'), { recursive: true })
   await cp(join(repositoryRoot, 'package.json'), join(target, 'package.json'))
   await cp(join(repositoryRoot, 'package-lock.json'), join(target, 'package-lock.json'))
+  await cp(join(repositoryRoot, 'packages', 'linux-file-lock', 'package.json'), join(target, 'packages', 'linux-file-lock', 'package.json'))
   await cp(join(repositoryRoot, 'packages', 'protocol', 'package.json'), join(target, 'packages', 'protocol', 'package.json'))
   await cp(join(repositoryRoot, 'packages', 'runner', 'package.json'), join(target, 'packages', 'runner', 'package.json'))
 }
