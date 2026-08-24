@@ -36,9 +36,9 @@ export async function observeJobControlScenario(scenario: RuntimeScenario): Prom
   const subject = createSessionJobControl({ launcher })
   const input = jobControlInput(scenario)
   try {
-    const first = await collect(subject.dispatch(input))
+    const first = await collectJobControlEffects(subject.dispatch(input))
     const batches = scenario.fixture === 'v2-frame-replay'
-      ? [first, await collect(subject.dispatch(input))]
+      ? [first, await collectJobControlEffects(subject.dispatch(input))]
       : [first]
     for (const effects of batches) for (const effect of effects) recordEffect(recorder.record, effect)
     if (launcherCalls === 1) recorder.record('launcher.handle:once')
@@ -128,11 +128,15 @@ function recordEffect(record: (event: string) => void, effect: SessionJobControl
   if (body.requestId) record(`effect.requestId:${body.requestId}`)
 }
 
-async function collect(values: AsyncIterable<SessionJobControlEffect>): Promise<SessionJobControlEffect[]> {
+export async function collectJobControlEffects(
+  values: AsyncIterable<SessionJobControlEffect>,
+): Promise<SessionJobControlEffect[]> {
   const effects: SessionJobControlEffect[] = []
   for await (const effect of values) {
+    if (effects.length === 8) {
+      throw new Error(`session job-control emitted ${effects.length + 1} effects; maximum is 8`)
+    }
     effects.push(effect)
-    if (effects.length >= 8) break
   }
   return effects
 }

@@ -44,15 +44,15 @@ export async function collectLaunchStimuli(
   expireTombstone?: () => boolean | Promise<boolean>,
 ): Promise<LaunchStimulusResult> {
   if (!needsSecondStimulus(scenario.fixture)) {
-    const first = await collect(handle(request), record)
+    const first = await collect(handle(request), request.requestId, record)
     return { actions: first, batches: [first], firstReceiptStable: true }
   }
   if (scenario.fixture === 'tombstone-retention-retry') {
-    const first = await collect(handle(request), record)
+    const first = await collect(handle(request), request.requestId, record)
     const key = `${request.bindingId}:${request.requestId}`
     const replayedBeforeExpiry = isTombstone(stored.get(key)) && hasFinishedReplay(first, request.requestId)
     const deletedAfterRetention = expireTombstone ? await expireTombstone() : false
-    const second = await collect(handle(request), record)
+    const second = await collect(handle(request), request.requestId, record)
     return {
       actions: [...first, ...second],
       batches: [first, second],
@@ -66,14 +66,17 @@ export async function collectLaunchStimuli(
   }
   const secondRequest = secondRequestFor(scenario, request)
   if (scenario.fixture.startsWith('concurrent-')) {
-    const [first, second] = await Promise.all([collect(handle(request), record), collect(handle(secondRequest), record)])
+    const [first, second] = await Promise.all([
+      collect(handle(request), request.requestId, record),
+      collect(handle(secondRequest), secondRequest.requestId, record),
+    ])
     return { actions: [...first, ...second], batches: [first, second], firstReceiptStable: true }
   }
-  const first = await collect(handle(request), record)
+  const first = await collect(handle(request), request.requestId, record)
   const key = `${request.bindingId}:${request.requestId}`
   const firstReceiptPresent = stored.has(key)
   const before = JSON.stringify(stored.get(key))
-  const second = await collect(handle(secondRequest), record)
+  const second = await collect(handle(secondRequest), secondRequest.requestId, record)
   return {
     actions: [...first, ...second],
     batches: [first, second],
@@ -83,9 +86,10 @@ export async function collectLaunchStimuli(
 
 export async function collectRecoveryStimulus(
   values: AsyncIterable<SessionLaunchAction>,
+  expectedRequestId: string,
   record: (event: string) => void,
 ): Promise<LaunchStimulusResult> {
-  const actions = await collect(values, record)
+  const actions = await collect(values, expectedRequestId, record)
   return { actions, batches: [actions], firstReceiptStable: true }
 }
 
@@ -108,7 +112,7 @@ export function recordLaunchScenarioEvidence(
     if (sessionStartFingerprint(request) === sessionStartFingerprint(second)) record('stimulus.fingerprint:same')
   }
   if (scenario.fixture.includes('duplicate') || scenario.fixture === 'canonical-body-reordered') {
-    if (sameTerminalOutcome(observed.batches[0] ?? [], observed.batches[1] ?? [])) record('action.replay:same-outcome')
+    if (sameTerminalOutcome(observed.batches[0] ?? [], observed.batches[1] ?? [], request.requestId)) record('action.replay:same-outcome')
   }
   if (scenario.fixture === 'duplicate-different-body' && observed.firstReceiptStable) record('receipt.first:immutable')
   if (scenario.fixture === 'tombstone-retention-retry') {
@@ -116,14 +120,15 @@ export function recordLaunchScenarioEvidence(
     if (observed.retention?.deletedAfterRetention) record('receipt.tombstone:deleted-after-retention')
     if (observed.retention?.refusedAfterRetention) record('receipt.tombstone:request-expired')
   }
-  if (hasStartedCorrelation(observed.actions, evidence, true)) record('action.started:request+channel+session')
-  if (scenario.fixture.includes('known-terminal') && terminalReplayMatchesStored(observed.actions, evidence.stored, request)) {
+  if (hasStartedCorrelation(observed.actions, evidence, true, request.requestId)) record('action.started:request+channel+session')
+  if (scenario.fixture.includes('known-terminal') && observed.batches.length > 0
+    && observed.batches.every(batch => terminalReplayMatchesStored(batch, evidence.stored, request))) {
     record('action.replay:terminal')
   }
-  if (scenario.fixture.includes('known-started') && hasStartedCorrelation(observed.actions, evidence, false)) {
+  if (scenario.fixture.includes('known-started') && hasStartedCorrelation(observed.actions, evidence, false, request.requestId)) {
     record('action.started:stable-correlation')
   }
-  if (scenario.fixture === 'recover-exact-session' && hasNewChannelStableSession(observed.actions, evidence)) {
+  if (scenario.fixture === 'recover-exact-session' && hasNewChannelStableSession(observed.actions, evidence, request.requestId)) {
     record('action.started:new-channel+stable-session')
   }
   if (scenario.fixture === 'refusal-vocabulary' && hasOnlyClosedReasons(observed.actions)) record('action.refusal-vocabulary:closed')
@@ -159,7 +164,11 @@ function secondRequestFor(scenario: RuntimeScenario, request: SessionStartMessag
   return request
 }
 
-function recordAction(record: (event: string) => void, action: SessionLaunchAction) {
+function recordAction(
+  record: (event: string) => void,
+  action: SessionLaunchAction,
+  expectedRequestId: string,
+) {
   if (action.kind === 'close-job-control') {
     record(`action.close:${action.error}`)
     return
@@ -171,8 +180,10 @@ function recordAction(record: (event: string) => void, action: SessionLaunchActi
   if (message.type === 'SESSION_REFUSED') record(`action.refused:${message.reason}`)
   if (message.type === 'SESSION_FAILED') record(`action.failed:${message.reason}`)
   if (message.type === 'SESSION_FINISHED') record('action.finished')
-  record(`action.requestId:${message.requestId}`)
-  record(`input.request:${message.requestId}`)
+  if (message.requestId === expectedRequestId) {
+    record(`action.requestId:${expectedRequestId}`)
+    record(`input.request:${expectedRequestId}`)
+  }
 }
 
 const forbiddenActionFields = new Set([
@@ -200,15 +211,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function sameTerminalOutcome(first: readonly SessionLaunchAction[], second: readonly SessionLaunchAction[]): boolean {
+function sameTerminalOutcome(
+  first: readonly SessionLaunchAction[],
+  second: readonly SessionLaunchAction[],
+  expectedRequestId: string,
+): boolean {
   const firstResult = terminalMessage(first)
   const secondResult = terminalMessage(second)
-  return firstResult !== null && secondResult !== null && sameTerminalMessage(firstResult, secondResult)
+  return firstResult !== null && secondResult !== null
+    && firstResult.requestId === expectedRequestId
+    && secondResult.requestId === expectedRequestId
+    && sameTerminalMessage(firstResult, secondResult)
 }
 
 function terminalMessage(actions: readonly SessionLaunchAction[]) {
   const terminals = terminalMessages(actions)
-  return terminals.length === 0 ? null : terminals[terminals.length - 1]!
+  return terminals.length === 1 ? terminals[0]! : null
 }
 
 function terminalMessages(actions: readonly SessionLaunchAction[]) {
@@ -225,7 +243,11 @@ export function terminalReplayMatchesStored(
   const storedValue = stored.get(`${request.bindingId}:${request.requestId}`)
   const expected = storedValue?.result
   const terminals = terminalMessages(actions)
-  return expected !== undefined && terminals.length === 1 && sameTerminalMessage(terminals[0]!, expected)
+  return expected !== undefined
+    && expected.requestId === request.requestId
+    && terminals.length === 1
+    && terminals[0]?.requestId === request.requestId
+    && sameTerminalMessage(terminals[0]!, expected)
 }
 
 function sameTerminalMessage(
@@ -239,8 +261,8 @@ function sameTerminalMessage(
 }
 
 function hasFinishedReplay(actions: readonly SessionLaunchAction[], requestId: string): boolean {
-  return actions.some(action => action.kind === 'message' && action.message.type === 'SESSION_FINISHED'
-    && action.message.requestId === requestId)
+  const terminal = terminalMessage(actions)
+  return terminal?.type === 'SESSION_FINISHED' && terminal.requestId === requestId
 }
 
 function hasRefusal(
@@ -248,8 +270,8 @@ function hasRefusal(
   requestId: string,
   reason: 'request-expired',
 ): boolean {
-  return actions.some(action => action.kind === 'message' && action.message.type === 'SESSION_REFUSED'
-    && action.message.requestId === requestId && action.message.reason === reason)
+  const terminal = terminalMessage(actions)
+  return terminal?.type === 'SESSION_REFUSED' && terminal.requestId === requestId && terminal.reason === reason
 }
 
 function isTombstone(value: SessionReceipt | SessionReceiptTombstone | undefined): value is SessionReceiptTombstone {
@@ -260,20 +282,26 @@ function hasStartedCorrelation(
   actions: readonly SessionLaunchAction[],
   evidence: LaunchEvidence,
   requireOpenChannel: boolean,
+  expectedRequestId: string,
 ): boolean {
   return actions.some(action => {
     if (action.kind !== 'message' || action.message.type !== 'SESSION_STARTED') return false
     const message = action.message
-    const matches = (candidate: StartedSessionEvidence) => candidate.requestId === message.requestId
+    const matches = (candidate: StartedSessionEvidence) => candidate.requestId === expectedRequestId
+      && message.requestId === expectedRequestId
       && candidate.channelId === message.channelId && candidate.sessionId === message.sessionId
     return evidence.durableStarts.some(matches) && (!requireOpenChannel || evidence.openedChannels.some(matches))
   })
 }
 
-function hasNewChannelStableSession(actions: readonly SessionLaunchAction[], evidence: LaunchEvidence): boolean {
+function hasNewChannelStableSession(
+  actions: readonly SessionLaunchAction[],
+  evidence: LaunchEvidence,
+  expectedRequestId: string,
+): boolean {
   return actions.some(action => action.kind === 'message' && action.message.type === 'SESSION_STARTED'
     && action.message.sessionId === 'session-stable' && action.message.channelId !== 'channel-old'
-    && hasStartedCorrelation([action], evidence, true))
+    && hasStartedCorrelation([action], evidence, true, expectedRequestId))
 }
 
 function hasOnlyClosedReasons(actions: readonly SessionLaunchAction[]): boolean {
@@ -290,14 +318,18 @@ function nextRequestId(requestId: string): string {
 
 const MAX_LAUNCH_ACTIONS = 8
 
-async function collect(values: AsyncIterable<SessionLaunchAction>, record: (event: string) => void): Promise<SessionLaunchAction[]> {
+async function collect(
+  values: AsyncIterable<SessionLaunchAction>,
+  expectedRequestId: string,
+  record: (event: string) => void,
+): Promise<SessionLaunchAction[]> {
   const actions: SessionLaunchAction[] = []
   for await (const action of values) {
     if (actions.length === MAX_LAUNCH_ACTIONS) {
       throw new Error(`session launch emitted ${actions.length + 1} actions; maximum is ${MAX_LAUNCH_ACTIONS}`)
     }
     actions.push(action)
-    recordAction(record, action)
+    recordAction(record, action, expectedRequestId)
   }
   return actions
 }

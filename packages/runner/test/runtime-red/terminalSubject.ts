@@ -99,18 +99,41 @@ async function observeExit(
   return observed('terminal:finished', recorder)
 }
 
-async function observeResume(host: TerminalHost, stub: StubControlPlane, cwd: string, socket: string, recorder: ReturnType<typeof createRecorder>, client: RunnerClient): Promise<RuntimeObservation> {
+async function observeResume(
+  host: TerminalHost,
+  stub: StubControlPlane,
+  cwd: string,
+  socket: string,
+  recorder: ReturnType<typeof createRecorder>,
+  client: RunnerClient,
+): Promise<RuntimeObservation> {
   const info = await host.launch({ command: '/bin/cat', cwd, socket })
   await until(() => stub.channels.has(info.channelId))
+  stub.sendTerminal(info.channelId, { type: 'INIT', cols: 80, rows: 24 })
+  await until(() => stub.terminalMessages(info.channelId).some(message => message.type === 'READY'))
+  const preDisconnectFrames = terminalFrames(stub, info.channelId)
+  const highestBeforeDisconnect = highestTerminalSequence(stub, info.channelId)
+  if (highestBeforeDisconnect < 1) throw new Error('terminal resume fixture observed no pre-disconnect frames')
+  recorder.record(`terminal.sequence:pre-disconnect-high-water:[${highestBeforeDisconnect}]`)
   const token = stub.channels.get(info.channelId)?.attachToken
   stub.dropConnections()
   await until(() => stub.connectionCount >= 2, 10_000)
   await until(() => stub.channels.has(info.channelId), 10_000)
-  if (stub.channels.get(info.channelId)?.attachToken === token && client.channelIds().includes(info.channelId)) {
-    recorder.record('terminal.resume:same-channel+token+sequence')
-  } else {
-    recorder.record('terminal.replacement')
+  stub.sendTerminal(info.channelId, { type: 'INPUT', data: 'resume-proof\n' })
+  await until(() => terminalFrames(stub, info.channelId).length > preDisconnectFrames.length, 10_000)
+  const postReconnectFrames = terminalFrames(stub, info.channelId).slice(preDisconnectFrames.length)
+  const resetSequences = stub.resets.filter(reset => reset.channel === info.channelId).map(reset => reset.seq)
+  if (!terminalResumeAdvances(highestBeforeDisconnect, postReconnectFrames.map(frame => frame.seq), resetSequences)) {
+    throw new Error('terminal resume did not advance contiguously after reconnect')
   }
+  const firstPostReconnect = postReconnectFrames[0]
+  if (!firstPostReconnect) throw new Error('terminal resume observed no post-reconnect frame')
+  recorder.record(`terminal.sequence:post-reconnect:[${firstPostReconnect.seq}]`)
+  if (stub.channels.get(info.channelId)?.attachToken !== token || !client.channelIds().includes(info.channelId)) {
+    recorder.record('terminal.replacement')
+    return observed('terminal:resumed', recorder)
+  }
+  recorder.record('terminal.resume:same-channel+token+sequence')
   return observed('terminal:resumed', recorder)
 }
 
@@ -228,6 +251,18 @@ function terminalExit(stub: StubControlPlane, channelId: string): SequencedTermi
 
 function highestTerminalSequence(stub: StubControlPlane, channelId: string): number {
   return terminalFrames(stub, channelId).reduce((highest, frame) => Math.max(highest, frame.seq), 0)
+}
+
+export function terminalResumeAdvances(
+  highestBeforeDisconnect: number,
+  postReconnectSequences: readonly number[],
+  resetSequences: readonly number[],
+): boolean {
+  return Number.isSafeInteger(highestBeforeDisconnect) && highestBeforeDisconnect >= 1
+    && resetSequences.length === 0
+    && postReconnectSequences.length > 0
+    && postReconnectSequences.every((sequence, index) => Number.isSafeInteger(sequence)
+      && sequence === highestBeforeDisconnect + index + 1)
 }
 
 function hasContiguousPostReplayFrame(stub: StubControlPlane, channelId: string, replayedSequence: number): boolean {
