@@ -72,8 +72,24 @@ async function fileHome() {
   const root = path.join(parent, 'home')
   const storage = createFileRunnerHomeStorage({ defaultRoot: root })
   await storage.inspect({})
-  await storage.replace('policy', null, Buffer.from(JSON.stringify(policy())))
+  const snapshot = policy()
+  await storage.replace('trust', null, Buffer.from(`${canonicalJson({
+    schemaVersion: 1,
+    revision: snapshot.revision,
+    anchors: snapshot.trustAnchors,
+    allowlist: snapshot.allowlist,
+  })}\n`))
   return { root, storage }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+    )).join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 describe('production runner home', () => {

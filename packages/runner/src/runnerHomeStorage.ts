@@ -33,6 +33,7 @@ const RECORD_LIMITS: Readonly<Record<RunnerHomeStateRecord, number>> = {
   grants: DEFAULT_RECORD_LIMIT,
   configuration: DEFAULT_RECORD_LIMIT,
   policy: DEFAULT_RECORD_LIMIT,
+  trust: 256 * 1024,
   projects: DEFAULT_RECORD_LIMIT,
   receipts: 25 * 1024 * 1024,
 }
@@ -42,6 +43,7 @@ const RECORD_FILES: Readonly<Record<RunnerHomeRecord, string>> = {
   grants: 'grants.json',
   configuration: 'configuration.json',
   policy: 'policy.json',
+  trust: 'policy.trust.json',
   projects: 'projects.json',
   receipts: 'receipts.json',
   audit: 'audit.jsonl',

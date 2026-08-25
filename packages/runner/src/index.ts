@@ -350,6 +350,8 @@ export {
   type RunnerPolicyReplace,
   type RunnerPolicySnapshot,
   type RunnerPolicyStore,
+  type RunnerTrustAuthorization,
+  type RunnerTrustReplace,
 } from './runnerHome.js'
 export {
   createFileRunnerHome,
@@ -359,6 +361,14 @@ export {
   createFileRunnerHomeStorage,
   type FileRunnerHomeStorageOptions,
 } from './runnerHomeStorage.js'
+export {
+  createRunnerTrustStore,
+  createTrustRotationAuthorization,
+  decodeTrustAnchors,
+  initializeRunnerTrust,
+  openRunnerTrust,
+  RunnerTrustError,
+} from './runnerTrustStore.js'
 export {
   openRunnerHomeRecords,
   type RunnerHomeRecordComponents,
