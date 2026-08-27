@@ -13,6 +13,7 @@ import {
 } from './allowlist.js'
 import { createGrants, type GrantRecord, type GrantStore } from './consent.js'
 import { DEFAULT_LOCAL_ENDPOINTS, LocalEndpointRegistry, type LocalEndpointConfig } from './localEndpoints.js'
+import { decodeGrantImage, decodeGrantRecords, grantIdentity } from './runnerGrantRecords.js'
 import type { PairingContractStore } from './pairingContract.js'
 import type {
   RunnerConfigurationStore,
@@ -152,26 +153,70 @@ async function readConfiguration(
 }
 
 function validateConfiguration(value: unknown, keys: ApiKeyStore): RunnerLocalConfiguration {
-  if (!isRecord(value) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1) invalidConfiguration()
-  if (!Array.isArray(value.profiles) || !Array.isArray(value.endpoints)) invalidConfiguration()
-  if (!value.profiles.every(isRecord) || !value.endpoints.every(isRecord)) invalidConfiguration()
-  const profiles = value.profiles as LocalModelProfile[]
-  const endpoints = value.endpoints as LocalEndpointConfig[]
-  const profileIds = profiles.map(profile => profile.modelProfileId)
-  const endpointIds = endpoints.map(endpoint => endpoint.endpointId)
-  if (!profileIds.every(id => typeof id === 'string') || !endpointIds.every(id => typeof id === 'string')) invalidConfiguration()
-  if (!profiles.every(isCompleteLocalModelProfile)) invalidConfiguration()
-  if (duplicated(profileIds) || duplicated(endpointIds)) {
+  if (!exactRecord(value, ['endpoints', 'profiles', 'revision'])) invalidConfiguration()
+  if (!Number.isSafeInteger(value.revision) || (value.revision as number) < 1) invalidConfiguration()
+  const rawProfiles = value.profiles
+  const rawEndpoints = value.endpoints
+  if (!Array.isArray(rawProfiles) || !Array.isArray(rawEndpoints)) invalidConfiguration()
+  const profileCount = rawProfiles.length
+  const endpointCount = rawEndpoints.length
+  if (!Number.isSafeInteger(profileCount) || profileCount < 0 || profileCount > 256
+    || !Number.isSafeInteger(endpointCount) || endpointCount < 0 || endpointCount > 256) invalidConfiguration()
+  const profiles: LocalModelProfile[] = []
+  for (let index = 0; index < profileCount; index += 1) profiles.push(decodeProfile(rawProfiles[index]))
+  const endpoints: LocalEndpointConfig[] = []
+  for (let index = 0; index < endpointCount; index += 1) endpoints.push(decodeEndpoint(rawEndpoints[index]))
+  if (duplicated(profiles.map(profile => profile.modelProfileId)) || duplicated(endpoints.map(endpoint => endpoint.endpointId))) {
     throw new HomeRecordError('config-duplicate')
   }
-  if (!profiles.every(isCompleteLocalModelProfile)) invalidConfiguration()
   try {
     const registry = new LocalEndpointRegistry(endpoints)
     new AccessResolver({ profiles, runtimes: [], keys, endpoints: registry, capabilities: () => null })
-    return { revision: value.revision as number, profiles: structuredClone(profiles), endpoints: structuredClone(endpoints) }
+    return { revision: value.revision as number, profiles, endpoints }
   } catch {
     invalidConfiguration()
   }
+}
+
+function decodeProfile(value: unknown): LocalModelProfile {
+  if (!exactRecord(value, ['access', 'modelProfileId', 'runtime'], ['endpointId', 'keyLabel', 'model', 'provider'])) invalidConfiguration()
+  const canonical = {
+    access: value.access,
+    modelProfileId: value.modelProfileId,
+    runtime: value.runtime,
+    endpointId: value.endpointId,
+    keyLabel: value.keyLabel,
+    model: value.model,
+    provider: value.provider,
+  }
+  if (typeof canonical.modelProfileId !== 'string' || !isSafeIdentifier(canonical.modelProfileId)) invalidConfiguration()
+  if (typeof canonical.runtime !== 'string' || !isSafeIdentifier(canonical.runtime)) invalidConfiguration()
+  if (canonical.access !== 'subscription' && canonical.access !== 'api-key' && canonical.access !== 'local') invalidConfiguration()
+  for (const field of ['endpointId', 'keyLabel', 'provider'] as const) {
+    if (canonical[field] !== undefined && (typeof canonical[field] !== 'string' || !isSafeIdentifier(canonical[field]))) invalidConfiguration()
+  }
+  if (canonical.model !== undefined && !boundedText(canonical.model, 128)) invalidConfiguration()
+  const profile: LocalModelProfile = {
+    modelProfileId: canonical.modelProfileId,
+    runtime: canonical.runtime,
+    access: canonical.access,
+    ...(typeof canonical.provider === 'string' ? { provider: canonical.provider } : {}),
+    ...(typeof canonical.model === 'string' ? { model: canonical.model } : {}),
+    ...(typeof canonical.keyLabel === 'string' ? { keyLabel: canonical.keyLabel } : {}),
+    ...(typeof canonical.endpointId === 'string' ? { endpointId: canonical.endpointId } : {}),
+  }
+  if (!isCompleteLocalModelProfile(profile)) invalidConfiguration()
+  return profile
+}
+
+function decodeEndpoint(value: unknown): LocalEndpointConfig {
+  if (!exactRecord(value, ['baseUrl', 'endpointId', 'kind'])) invalidConfiguration()
+  const canonical = { endpointId: value.endpointId, kind: value.kind, baseUrl: value.baseUrl }
+  const { endpointId, kind, baseUrl } = canonical
+  if (typeof endpointId !== 'string' || !isSafeIdentifier(endpointId)
+    || typeof baseUrl !== 'string' || !boundedText(baseUrl, 2_048)) invalidConfiguration()
+  if (kind !== 'ollama' && kind !== 'openai-compatible') invalidConfiguration()
+  return { endpointId, kind, baseUrl }
 }
 
 function invalidConfiguration(): never {
@@ -234,12 +279,12 @@ const MAX_PROJECT_CAS_ATTEMPTS = 8
 type ProjectImage = { revision: number; projects: LocalProjectRecord[] }
 
 async function createProject(storage: RunnerHomeStorage, project: NewLocalProject): Promise<LocalProjectRecord> {
-  validateNewProject(project)
+  const canonical = canonicalProject(project)
   for (let attempt = 0; attempt < MAX_PROJECT_CAS_ATTEMPTS; attempt += 1) {
     const held = await readProjects(storage)
-    if (held.value.projects.some(candidate => candidate.projectId === project.projectId)) throw new Error('project id already exists')
+    if (held.value.projects.some(candidate => candidate.projectId === canonical.projectId)) throw new Error('project id already exists')
     const revision = held.value.revision + 1
-    const created = { ...project, revision }
+    const created = { ...canonical, revision }
     const status = await writeProjectImage(storage, held, { revision, projects: [...held.value.projects, created] })
     if (status === 'written') return created
   }
@@ -265,21 +310,32 @@ async function removeProject(storage: RunnerHomeStorage, projectId: string, expe
 async function readProjects(storage: RunnerHomeStorage): Promise<{ value: ProjectImage; sha256: string | null }> {
   const held = await readJson(storage, 'projects')
   if (held.status === 'missing') return { value: { revision: 0, projects: [] }, sha256: null }
-  if (!isRecord(held.value) || !Number.isSafeInteger(held.value.revision) || (held.value.revision as number) < 0 || !Array.isArray(held.value.projects)) stateFailure()
+  if (!exactRecord(held.value, ['projects', 'revision'])) stateFailure()
+  if (!Number.isSafeInteger(held.value.revision) || (held.value.revision as number) < 0 || !Array.isArray(held.value.projects)) stateFailure()
   const projects = held.value.projects.map(decodeProject)
   if (duplicated(projects.map(project => project.projectId))) stateFailure()
   return { value: { revision: held.value.revision as number, projects }, sha256: held.sha256 }
 }
 
 function decodeProject(value: unknown): LocalProjectRecord {
-  if (!isRecord(value) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1) stateFailure()
-  const project = value as LocalProjectRecord
-  validateNewProject(project)
-  return { projectId: project.projectId, repoPath: project.repoPath, worktreesRoot: project.worktreesRoot, revision: project.revision }
+  if (!exactRecord(value, ['projectId', 'repoPath', 'revision', 'worktreesRoot'])) stateFailure()
+  if (!Number.isSafeInteger(value.revision) || (value.revision as number) < 1) stateFailure()
+  if (typeof value.projectId !== 'string' || typeof value.repoPath !== 'string' || typeof value.worktreesRoot !== 'string') stateFailure()
+  const project: LocalProjectRecord = {
+    projectId: value.projectId,
+    repoPath: value.repoPath,
+    worktreesRoot: value.worktreesRoot,
+    revision: value.revision as number,
+  }
+  if (!isSafeIdentifier(project.projectId) || !localPath(project.repoPath) || !localPath(project.worktreesRoot)) stateFailure()
+  return project
 }
 
-function validateNewProject(project: NewLocalProject): void {
-  if (!isSafeIdentifier(project.projectId) || !localPath(project.repoPath) || !localPath(project.worktreesRoot)) stateFailure()
+function canonicalProject(project: NewLocalProject): NewLocalProject {
+  if (!exactRecord(project, ['projectId', 'repoPath', 'worktreesRoot'])) stateFailure()
+  const canonical = { projectId: project.projectId, repoPath: project.repoPath, worktreesRoot: project.worktreesRoot }
+  if (!isSafeIdentifier(canonical.projectId) || !localPath(canonical.repoPath) || !localPath(canonical.worktreesRoot)) stateFailure()
+  return canonical
 }
 
 async function writeProjectImage(
@@ -292,9 +348,14 @@ async function writeProjectImage(
   return result.status
 }
 
+type HeldGrantImage = { value: { revision: number; records: GrantRecord[] }; sha256: string | null }
+type GrantMutation = { additions: GrantRecord[]; revocations: { identity: string; revokedAt: string }[] }
+
+const MAX_GRANT_CAS_ATTEMPTS = 8
+
 function grantStore(storage: RunnerHomeStorage): GrantStore {
   let queue: Promise<unknown> = Promise.resolve()
-  let base: { revision: number; sha256: string | null } | null = null
+  let base: HeldGrantImage | null = null
   return {
     serialize: operation => {
       const result = queue.then(operation, operation)
@@ -303,42 +364,71 @@ function grantStore(storage: RunnerHomeStorage): GrantStore {
       return result
     },
     read: async () => {
-      const held = await readGrantImage(storage)
-      base = { revision: held.value.revision, sha256: held.sha256 }
-      return held.value.records
+      base = await readGrantImage(storage)
+      return base.value.records.map(record => ({ ...record }))
     },
     write: async records => {
       if (!base) stateFailure()
-      const validated = validateGrantRecords(records)
-      const result = await storage.replace('grants', base.sha256, encodeJson({ revision: base.revision + 1, records: validated }))
-      if (result.status !== 'written') stateFailure()
-      base = { revision: base.revision + 1, sha256: result.sha256 }
+      const mutation = grantMutation(base.value.records, requireGrantRecords(records))
+      for (let attempt = 0; attempt < MAX_GRANT_CAS_ATTEMPTS; attempt += 1) {
+        const held = attempt === 0 ? base : await readGrantImage(storage)
+        const nextRecords = applyGrantMutation(held.value.records, mutation)
+        const result = await storage.replace('grants', held.sha256, encodeJson({ revision: held.value.revision + 1, records: nextRecords }))
+        if (result.status === 'written') {
+          base = { value: { revision: held.value.revision + 1, records: nextRecords }, sha256: result.sha256 }
+          return
+        }
+        if (result.status === 'storage-unavailable') stateFailure()
+      }
+      stateFailure()
     },
   }
 }
 
-async function readGrantImage(storage: RunnerHomeStorage): Promise<{ value: { revision: number; records: GrantRecord[] }; sha256: string | null }> {
+async function readGrantImage(storage: RunnerHomeStorage): Promise<HeldGrantImage> {
   const held = await readJson(storage, 'grants')
   if (held.status === 'missing') return { value: { revision: 0, records: [] }, sha256: null }
-  if (!isRecord(held.value) || !Number.isSafeInteger(held.value.revision) || (held.value.revision as number) < 0 || !Array.isArray(held.value.records)) stateFailure()
-  const records = validateGrantRecords(held.value.records)
-  return { value: { revision: held.value.revision as number, records }, sha256: held.sha256 }
+  const value = decodeGrantImage(held.value)
+  if (!value) stateFailure()
+  return { value, sha256: held.sha256 }
 }
 
-function validateGrantRecords(values: readonly unknown[]): GrantRecord[] {
-  const records = values.map(decodeGrant)
-  const live = records.filter(record => record.revokedAt === undefined)
-  const liveAliases = live.flatMap(record => record.alias === undefined ? [] : [record.alias])
-  if (duplicated(live.map(record => record.path)) || duplicated(liveAliases)) stateFailure()
-  if (duplicated(records.map(record => `${record.path}\u0000${record.grantedAt}`))) stateFailure()
+function grantMutation(base: readonly GrantRecord[], candidate: readonly GrantRecord[]): GrantMutation {
+  const baseByIdentity = new Map(base.map(record => [grantIdentity(record), record]))
+  const candidateByIdentity = new Map(candidate.map(record => [grantIdentity(record), record]))
+  const additions = candidate.filter(record => !baseByIdentity.has(grantIdentity(record)))
+  if (additions.some(record => record.revokedAt !== undefined)) stateFailure()
+  const revocations: GrantMutation['revocations'] = []
+  for (const held of base) {
+    const next = candidateByIdentity.get(grantIdentity(held))
+    if (!next || next.alias !== held.alias) stateFailure()
+    if (held.revokedAt !== undefined && next.revokedAt !== held.revokedAt) stateFailure()
+    if (held.revokedAt === undefined && next.revokedAt !== undefined) {
+      revocations.push({ identity: grantIdentity(held), revokedAt: next.revokedAt })
+    }
+  }
+  return { additions, revocations }
+}
+
+function applyGrantMutation(current: readonly GrantRecord[], mutation: GrantMutation): GrantRecord[] {
+  const revoked = new Map(mutation.revocations.map(change => [change.identity, change.revokedAt]))
+  const merged = current.map(record => {
+    const revokedAt = record.revokedAt === undefined ? revoked.get(grantIdentity(record)) : undefined
+    return revokedAt === undefined ? record : { ...record, revokedAt }
+  })
+  for (const added of mutation.additions) {
+    const held = merged.find(record => grantIdentity(record) === grantIdentity(added))
+    const live = merged.find(record => record.revokedAt === undefined && record.path === added.path)
+    if ((held && (held.revokedAt !== undefined || held.alias !== added.alias)) || (live && live.alias !== added.alias)) stateFailure()
+    if (!held && !live) merged.push(added)
+  }
+  return requireGrantRecords(merged)
+}
+
+function requireGrantRecords(values: readonly unknown[]): GrantRecord[] {
+  const records = decodeGrantRecords(values)
+  if (!records) stateFailure()
   return records
-}
-
-function decodeGrant(value: unknown): GrantRecord {
-  if (!isRecord(value) || !localPath(value.path) || !timestamp(value.grantedAt)) stateFailure()
-  if (value.alias !== undefined && !localPath(value.alias)) stateFailure()
-  if (value.revokedAt !== undefined && (!timestamp(value.revokedAt) || Date.parse(value.revokedAt) < Date.parse(value.grantedAt))) stateFailure()
-  return value as GrantRecord
 }
 
 function receiptStorage(storage: RunnerHomeStorage): SessionReceiptStorage {
@@ -407,8 +497,8 @@ function stateFailure(): never {
   throw new HomeRecordError('state-io-failed')
 }
 
-function timestamp(value: unknown): value is string {
-  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+function boundedText(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maximum && !hasControlCharacter(value)
 }
 
 function localPath(value: unknown): value is string {
@@ -417,6 +507,17 @@ function localPath(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function exactRecord(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): value is Record<string, unknown> {
+  if (!isRecord(value)) return false
+  const allowed = new Set([...required, ...optional])
+  return required.every(key => Object.prototype.hasOwnProperty.call(value, key))
+    && Object.keys(value).every(key => allowed.has(key))
 }
 
 function duplicated(values: readonly string[]): boolean {
