@@ -213,7 +213,9 @@ and evidence format so a manual result cannot be mistaken for an automated one.
 
 ### A1 — Pairing and identity
 
-- **A1.1:** clean installed `status` is unpaired and creates no credential-bearing output.
+- **A1.1:** after trusted policy initialization, an otherwise clean installed `status` is unpaired
+  and creates no credential-bearing output. Before policy initialization, `status` fails closed with
+  `policy-missing`; `status --json` returns the same code under `error.code`.
 - **A1.2:** prompted pairing sends the code only to the exact configured origin, survives no
   redirect, stores pending state before confirmation, sends a token proof rather than the token,
   then reports paired.

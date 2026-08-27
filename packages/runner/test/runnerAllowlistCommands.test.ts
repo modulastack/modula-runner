@@ -35,6 +35,7 @@ async function fixture() {
       pairing: () => { throw new Error('pairing not used') },
       sessions: () => { throw new Error('sessions not used') },
       jobControl: () => { throw new Error('job control not used') },
+      containmentStatus: () => ({ disposition: 'detect-and-stop', prevention: false, detail: 'test containment' }),
       runtime: { start: async () => { throw new Error('runtime not used') } },
     },
   }

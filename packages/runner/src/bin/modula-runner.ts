@@ -44,9 +44,9 @@ try {
 
 async function readHidden(prompt: string): Promise<string> {
   if (!process.stdin.isTTY) throw new Error('hidden input requires a TTY')
-  process.stderr.write(prompt)
   const muted = new Writable({ write(_chunk, _encoding, done) { done() } })
   const input = createInterface({ input: process.stdin, output: muted, terminal: true })
+  process.stderr.write(prompt)
   try {
     return await input.question('')
   } finally {

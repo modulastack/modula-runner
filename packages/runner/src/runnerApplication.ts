@@ -29,6 +29,7 @@ import type { RunnerClock } from './runtimeClock.js'
 import type { RunnerHome, RunnerHomeFailure, RunnerHomeSelection, RunnerHomeState } from './runnerHome.js'
 import type { SessionJobControl } from './sessionJobControl.js'
 import type { SessionLauncher } from './sessionLaunch.js'
+import type { ContainmentStatus } from './previewContainment.js'
 
 export const RUNNER_TOP_LEVEL_COMMANDS = [
   'help',
@@ -112,10 +113,13 @@ export function createRunnerRuntime(_options: RunnerRuntimeOptions): RunnerRunti
   }
 }
 
+export type RunnerContainmentStatus = Pick<ContainmentStatus, 'disposition' | 'prevention' | 'detail'>
+
 export type RunnerComposition = {
   pairing(home: RunnerHomeState): PairingContractService
   sessions(home: RunnerHomeState): SessionLauncher
   jobControl(sessions: SessionLauncher): SessionJobControl
+  containmentStatus(): RunnerContainmentStatus
   runtime: RunnerRuntimePort
 }
 
@@ -219,7 +223,13 @@ async function runOpened(
   args: readonly string[],
 ): Promise<CommandOutcome> {
   if (command === 'pair') return await pairCommand(options, home, invocation, args[1]!)
-  if (command === 'status') return await statusCommand(options.composition.pairing(home), args[0] === '--json')
+  if (command === 'status') {
+    return await statusCommand(
+      options.composition.pairing(home),
+      options.composition.containmentStatus(),
+      args[0] === '--json',
+    )
+  }
   if (command === 'run') return await runCommand(options.composition, home, invocation.signals)
   if (command === 'project') return await projectCommand(home, invocation.cwd, args)
   if (command === 'key') return await keyCommand(home, invocation, args)
@@ -351,7 +361,11 @@ function waitForRuntime(handle: RunnerRuntimeHandle, signals: RunnerCliSignals |
   })
 }
 
-async function statusCommand(pairing: PairingContractService, json: boolean): Promise<CommandOutcome> {
+async function statusCommand(
+  pairing: PairingContractService,
+  containment: RunnerContainmentStatus,
+  json: boolean,
+): Promise<CommandOutcome> {
   let snapshot = await pairing.snapshot()
   let pairingError: string | null = null
   if (snapshot.state === 'pending') {
@@ -363,30 +377,39 @@ async function statusCommand(pairing: PairingContractService, json: boolean): Pr
       snapshot = await pairing.snapshot()
     }
   }
-  const value = statusValue(snapshot, pairingError)
+  const value = statusValue(snapshot, pairingError, containment)
   return {
     exitCode: pairingError ? 1 : 0,
     stdout: json ? JSON.stringify(value) : statusText(value),
   }
 }
 
-function statusValue(snapshot: Awaited<ReturnType<PairingContractService['snapshot']>>, error: string | null) {
+function statusValue(
+  snapshot: Awaited<ReturnType<PairingContractService['snapshot']>>,
+  error: string | null,
+  containment: RunnerContainmentStatus,
+) {
   const record = snapshot.state === 'pending' || snapshot.state === 'paired' || snapshot.state === 'revoked'
     ? snapshot.record
     : null
   return {
     state: snapshot.state,
     ...(record ? { runnerId: record.runnerId, controlPlaneOrigin: record.controlPlaneOrigin } : {}),
+    containment: containment.disposition,
+    prevention: containment.prevention,
+    containmentDetail: containment.detail,
     ...(error ? { error: { code: error } } : {}),
   }
 }
 
 function statusText(value: ReturnType<typeof statusValue>): string {
-  if (value.state === 'unpaired') return 'unpaired — run modula-runner pair to connect'
-  if (value.state === 'reserved') return 'pairing-in-progress'
-  if (value.state === 'revoked') return 'revoked — pair again to reconnect'
-  if (value.state === 'pending') return `pending as runner ${value.runnerId}${value.error ? ` — ${value.error.code}` : ''}`
-  return `paired as runner ${value.runnerId} to ${value.controlPlaneOrigin}`
+  let pairing: string
+  if (value.state === 'unpaired') pairing = 'unpaired — run modula-runner pair to connect'
+  else if (value.state === 'reserved') pairing = 'pairing-in-progress'
+  else if (value.state === 'revoked') pairing = 'revoked — pair again to reconnect'
+  else if (value.state === 'pending') pairing = `pending as runner ${value.runnerId}${value.error ? ` — ${value.error.code}` : ''}`
+  else pairing = `paired as runner ${value.runnerId} to ${value.controlPlaneOrigin}`
+  return `${pairing}\ncontainment: ${value.containment}; prevention: ${value.prevention}; ${value.containmentDetail}`
 }
 
 function keySyntax(args: readonly string[], invocation: RunnerCliInvocation): CommandOutcome | null {

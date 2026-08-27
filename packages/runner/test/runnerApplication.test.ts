@@ -89,6 +89,7 @@ function application(
       pairing: () => pairingService,
       sessions: () => ({ async *handle() {}, async *recover() {} }),
       jobControl: () => ({ async *dispatch() {}, async *recover() {} }),
+      containmentStatus: () => ({ disposition: 'detect-and-stop', prevention: false, detail: 'test containment' }),
       runtime,
     },
     ...applicationOverrides,
@@ -238,7 +239,14 @@ describe('core runner application commands', () => {
     const call = invocation(['status', '--json'])
     await expect(app.value.execute(call.value)).resolves.toBe(0)
     const status = JSON.parse(call.stdout.join('')) as Record<string, unknown>
-    expect(status).toEqual({ state: 'paired', runnerId: 'runner-01', controlPlaneOrigin: 'https://example.test' })
+    expect(status).toEqual({
+      state: 'paired',
+      runnerId: 'runner-01',
+      controlPlaneOrigin: 'https://example.test',
+      containment: 'detect-and-stop',
+      prevention: false,
+      containmentDetail: 'test containment',
+    })
     expect(call.stdout.join('')).not.toContain(token)
   })
 

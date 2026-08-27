@@ -48,6 +48,10 @@ export async function observeApplicationScenario(scenario: RuntimeScenario): Pro
         recorder.record('composition.jobControl')
         return { async *dispatch() {}, async *recover() {} }
       },
+      containmentStatus() {
+        recorder.record('composition.containmentStatus')
+        return { disposition: 'detect-and-stop', prevention: false, detail: 'runtime-red containment' }
+      },
       runtime: {
         async start() {
           recorder.record('runtime.start')

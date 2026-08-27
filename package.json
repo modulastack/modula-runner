@@ -32,6 +32,8 @@
     "typecheck": "npm run build && npm run typecheck -w packages/runner",
     "test": "npm run build && vitest run",
     "gate": "npm run typecheck && vitest run",
+    "blackbox": "vitest run -c packages/runner/test/blackbox/vitest.config.ts",
+    "blackbox:manual": "node scripts/blackbox-manual.mjs",
     "release:build": "node scripts/release.mjs build",
     "release:reproducible": "node scripts/release.mjs reproducible",
     "supply-chain:audit": "node scripts/supply-chain.mjs live-audit",

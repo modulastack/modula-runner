@@ -159,6 +159,7 @@ describe('G2 runner CLI composition interface', () => {
         pairing: () => pairing,
         sessions: () => sessions,
         jobControl: launcher => createSessionJobControl({ launcher }),
+        containmentStatus: () => ({ disposition: 'detect-and-stop', prevention: false, detail: 'test containment' }),
         runtime: createRunnerRuntime({ clock }),
       },
     } satisfies RunnerApplicationOptions
