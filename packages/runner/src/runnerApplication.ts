@@ -171,10 +171,11 @@ async function execute(options: RunnerApplicationOptions, invocation: RunnerCliI
       return emit(invocation.io, commandFailure(command, args, 'state-io-failed', 'allowlist initialization failed'))
     }
   }
-  if (command === 'allowlist' && args[0] === 'sign') {
+  const allowlistKeyArgument = args[0] === 'sign' ? args[2] : args[0] === 'trust' ? args[3] : undefined
+  if (command === 'allowlist' && allowlistKeyArgument) {
     if (!options.home.validateSigningKeyPath) return emit(invocation.io, homeFailure('state-io-failed'))
     try {
-      const failure = await options.home.validateSigningKeyPath(homeSelection(invocation), path.resolve(invocation.cwd, args[2]!))
+      const failure = await options.home.validateSigningKeyPath(homeSelection(invocation), path.resolve(invocation.cwd, allowlistKeyArgument))
       if (failure) return emit(invocation.io, homeFailure(failure))
     } catch {
       return emit(invocation.io, commandFailure(command, args, 'state-io-failed', 'signing key path validation failed'))

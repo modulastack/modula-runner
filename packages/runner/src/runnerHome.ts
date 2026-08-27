@@ -15,6 +15,8 @@ export const RUNNER_HOME_FAILURES = [
   'policy-malformed',
   'policy-unknown-key',
   'policy-bad-signature',
+  'policy-trust-migration-required',
+  'policy-trust-unauthorized',
   'state-wrong-owner',
   'state-insecure-mode',
   'state-not-regular',
@@ -53,9 +55,18 @@ export type RunnerPolicyReplace =
   | { status: 'conflict'; current: RunnerPolicySnapshot }
   | { status: 'storage-unavailable' }
 
+export type RunnerTrustAuthorization = { keyId: string; signature: string }
+
+export type RunnerTrustReplace = RunnerPolicyReplace | { status: 'unauthorized' }
+
 export interface RunnerPolicyStore {
   snapshot(): Promise<RunnerPolicySnapshot>
   replace(expectedRevision: number, policy: Omit<RunnerPolicySnapshot, 'revision'>): Promise<RunnerPolicyReplace>
+  rotateTrust?(
+    expectedRevision: number,
+    anchors: readonly TrustAnchor[],
+    authorization: RunnerTrustAuthorization,
+  ): Promise<RunnerTrustReplace>
 }
 
 export type RunnerHomeState = {
@@ -100,6 +111,7 @@ export const RUNNER_HOME_STATE_RECORDS = [
   'grants',
   'configuration',
   'policy',
+  'trust',
   'projects',
   'receipts',
 ] as const

@@ -77,7 +77,8 @@ export function createHomeFixtureStorage(fixture: string, record: (event: string
         record('storage.read:configuration:storage-unavailable')
         return { status: 'storage-unavailable' }
       }
-      if (fixture === 'home-replace-unavailable' && name === 'policy') return encodedPolicy()
+      if (fixture === 'home-replace-unavailable' && name === 'trust') return encodedTrustPolicy()
+      if (fixture === 'home-replace-unavailable' && name === 'policy') return encodedPolicyTombstone()
       if (name !== 'configuration') return { status: 'missing' }
       return encodedConfiguration(fixture)
     },
@@ -143,13 +144,29 @@ function profile(modelProfileId: string) {
   return { modelProfileId, access: 'subscription', runtime: 'claude' }
 }
 
-function encodedPolicy() {
+function encodedTrustPolicy() {
   const { signingKey, trustAnchor } = generateAllowlistSigningKey()
   const policy = {
-    revision: 1,
     allowlist: signAllowlist({ executables: ['git'], recipes: {} }, signingKey),
-    trustAnchors: [trustAnchor],
+    anchors: [trustAnchor],
+    revision: 1,
+    schemaVersion: 1,
   }
-  const bytes = Buffer.from(JSON.stringify(policy))
+  const bytes = Buffer.from(`${canonicalJson(policy)}\n`)
   return { status: 'found' as const, bytes, sha256: 'b'.repeat(64) }
+}
+
+function encodedPolicyTombstone() {
+  const bytes = Buffer.from(`${canonicalJson({ schemaVersion: 2, migratedTo: 'policy.trust.json' })}\n`)
+  return { status: 'found' as const, bytes, sha256: 'c'.repeat(64) }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+    )).join(',')}}`
+  }
+  return JSON.stringify(value)
 }

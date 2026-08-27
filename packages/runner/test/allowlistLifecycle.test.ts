@@ -96,7 +96,7 @@ describe('allowlist signing-key custody and policy bootstrap', () => {
     }
     const home = createFileRunnerHome({ defaultRoot: homeRoot, clock })
     await expect(home.initializePolicy?.({}, keyPath, policy)).resolves.toMatchObject({ status: 'initialized' })
-    await expect(home.initializePolicy?.({}, keyPath, policy)).resolves.toEqual({ status: 'exists' })
+    await expect(home.initializePolicy?.({}, keyPath, policy)).resolves.toEqual({ status: 'initialized', policy })
     await expect(home.open({})).resolves.toMatchObject({ status: 'ready', home: { policy: { keyId: generated.signingKey.keyId } } })
     await home.close?.()
     expect(signingKeyOutsideHome(keyPath, homeRoot)).toBe(true)

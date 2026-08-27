@@ -22,9 +22,14 @@ import type {
   RunnerHomeStorage,
   RunnerLocalConfiguration,
   RunnerPolicySnapshot,
-  RunnerPolicyStore,
 } from './runnerHome.js'
 import type { RunnerClock } from './runtimeClock.js'
+import {
+  createRunnerTrustStore,
+  initializeRunnerTrust,
+  openRunnerTrust,
+  RunnerTrustError,
+} from './runnerTrustStore.js'
 import {
   createSessionReceiptLedger,
   decodeSessionReceiptLedgerImage,
@@ -64,14 +69,11 @@ export async function initializeRunnerPolicyRecord(
     return { status: 'failed', code: error instanceof HomeRecordError ? error.failure : 'policy-malformed' }
   }
   try {
-    const held = await storage.read('policy')
-    if (held.status === 'found') return { status: 'exists' }
-    if (held.status === 'storage-unavailable') return { status: 'failed', code: 'state-io-failed' }
-    const stored = await storage.replace('policy', null, encodeJson(policy))
-    if (stored.status === 'written') return { status: 'initialized', policy }
-    return stored.status === 'conflict' ? { status: 'exists' } : { status: 'failed', code: 'state-io-failed' }
-  } catch {
-    return { status: 'failed', code: 'state-io-failed' }
+    const result = await initializeRunnerTrust(storage, policy)
+    if (result === 'conflict') return { status: 'exists' }
+    return { status: 'initialized', policy: await createRunnerTrustStore(storage).snapshot() }
+  } catch (error) {
+    return { status: 'failed', code: trustFailure(error) }
   }
 }
 
@@ -87,7 +89,7 @@ export async function openRunnerHomeRecords(options: RunnerHomeRecordsOptions): 
     await options.keys.list()
     const configuration = configurationStore(options.storage, options.keys)
     await configuration.snapshot()
-    const policyStore = runnerPolicyStore(options.storage)
+    const policyStore = await openRunnerTrust(options.storage)
     const policySnapshot = await policyStore.snapshot()
     const policy = trustedPolicy(policySnapshot)
     const projects = projectRegistry(options.storage)
@@ -111,7 +113,7 @@ export async function openRunnerHomeRecords(options: RunnerHomeRecordsOptions): 
       },
     }
   } catch (error) {
-    return { status: 'failed', code: error instanceof HomeRecordError ? error.failure : 'state-io-failed' }
+    return { status: 'failed', code: trustFailure(error) }
   }
 }
 
@@ -176,26 +178,9 @@ function invalidConfiguration(): never {
   throw new HomeRecordError('config-invalid')
 }
 
-function runnerPolicyStore(storage: RunnerHomeStorage): RunnerPolicyStore {
-  return {
-    snapshot: async () => (await readPolicy(storage)).value,
-    replace: async (expectedRevision, candidate) => {
-      const current = await readPolicy(storage)
-      if (current.value.revision !== expectedRevision) return { status: 'conflict', current: current.value }
-      const next = decodePolicy({ ...candidate, revision: expectedRevision + 1 })
-      trustedPolicy(next)
-      const stored = await storage.replace('policy', current.sha256, encodeJson(next))
-      if (stored.status === 'written') return { status: 'updated', policy: next }
-      if (stored.status === 'storage-unavailable') return { status: 'storage-unavailable' }
-      return { status: 'conflict', current: (await readPolicy(storage)).value }
-    },
-  }
-}
-
-async function readPolicy(storage: RunnerHomeStorage): Promise<{ value: RunnerPolicySnapshot; sha256: string }> {
-  const held = await readJsonWithFailure(storage, 'policy', 'policy-malformed')
-  if (held.status === 'missing') throw new HomeRecordError('policy-missing')
-  return { value: decodePolicy(held.value), sha256: held.sha256 }
+function trustFailure(error: unknown): RunnerHomeFailure {
+  if (error instanceof HomeRecordError || error instanceof RunnerTrustError) return error.failure
+  return 'state-io-failed'
 }
 
 function decodePolicy(value: unknown): RunnerPolicySnapshot {

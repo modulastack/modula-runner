@@ -36,7 +36,10 @@ function memoryStorage(initial: Partial<Record<RunnerHomeStateRecord, unknown>> 
   const records = new Map<RunnerHomeStateRecord, Uint8Array>()
   const audit: AuditRecordInputV2[] = []
   let auditUnavailable = false
-  for (const [record, value] of Object.entries(initial)) records.set(record as RunnerHomeStateRecord, Buffer.from(JSON.stringify(value)))
+  for (const [record, value] of Object.entries(initial)) {
+    const serialized = record === 'trust' ? `${canonicalJson(value)}\n` : JSON.stringify(value)
+    records.set(record as RunnerHomeStateRecord, Buffer.from(serialized))
+  }
   const storage: RunnerHomeStorage = {
     inspect: async () => ({ rootKind: 'directory', rootOwner: 'current-user', rootMode: 0o700, entries: [] }),
     read: async record => {
@@ -86,9 +89,13 @@ function signedPolicy(): { revision: number; allowlist: SignedAllowlist; trustAn
   }
 }
 
+function storedTrust(policy = signedPolicy()): unknown {
+  return { schemaVersion: 1, revision: policy.revision, anchors: policy.trustAnchors, allowlist: policy.allowlist }
+}
+
 describe('runner-home logical records', () => {
   it('opens trusted state and exposes durable configuration, project, receipt, and audit adapters', async () => {
-    const held = memoryStorage({ policy: signedPolicy() })
+    const held = memoryStorage({ trust: storedTrust() })
     const opened = await openRecords(held)
     expect(opened.status).toBe('ready')
     if (opened.status !== 'ready') throw new Error(opened.code)
@@ -119,7 +126,7 @@ describe('runner-home logical records', () => {
   })
 
   it('retries unrelated project compare-and-set conflicts across registry instances', async () => {
-    const held = memoryStorage({ policy: signedPolicy() })
+    const held = memoryStorage({ trust: storedTrust() })
     const [first, second] = await Promise.all([openRecords(held), openRecords(held)])
     if (first.status !== 'ready' || second.status !== 'ready') throw new Error('homes did not open')
     const created = await Promise.all([
@@ -133,7 +140,7 @@ describe('runner-home logical records', () => {
   it('rejects duplicate local configuration before returning a usable home', async () => {
     const profile = { modelProfileId: 'daily', access: 'subscription', runtime: 'claude' }
     const held = memoryStorage({
-      policy: signedPolicy(),
+      trust: storedTrust(),
       configuration: { revision: 1, profiles: [profile, profile], endpoints: [] },
     })
     await expect(openRecords(held)).resolves.toEqual({ status: 'failed', code: 'config-duplicate' })
@@ -144,7 +151,7 @@ describe('runner-home logical records', () => {
       { revision: 1, profiles: [], endpoints: [{ endpointId: 'lab', kind: 'openai-compatible', baseUrl: 'https://user:secret@example.test' }] },
     ]
     for (const configuration of invalidConfigurations) {
-      const incomplete = memoryStorage({ policy: signedPolicy(), configuration })
+      const incomplete = memoryStorage({ trust: storedTrust(), configuration })
       await expect(openRecords(incomplete)).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
     }
   })
@@ -155,7 +162,7 @@ describe('runner-home logical records', () => {
       { modelProfileId: 'local', access: 'local', runtime: 'claude' },
     ]
     for (const profile of profiles) {
-      const held = memoryStorage({ policy: signedPolicy(), configuration: { revision: 1, profiles: [profile], endpoints: [] } })
+      const held = memoryStorage({ trust: storedTrust(), configuration: { revision: 1, profiles: [profile], endpoints: [] } })
       await expect(openRecords(held)).resolves.toEqual({ status: 'failed', code: 'config-invalid' })
     }
   })
@@ -169,7 +176,7 @@ describe('runner-home logical records', () => {
       await Promise.all([mkdir(first), mkdir(second)])
       await symlink(first, alias)
       const held = memoryStorage({
-        policy: signedPolicy(),
+        trust: storedTrust(),
         grants: {
           revision: 1,
           records: [{ path: await realpath(first), alias: path.resolve(alias), grantedAt: '2026-08-22T00:00:00Z' }],
@@ -186,7 +193,7 @@ describe('runner-home logical records', () => {
   })
 
   it('returns the winning receipt image after an underlying storage conflict', async () => {
-    const held = memoryStorage({ policy: signedPolicy() })
+    const held = memoryStorage({ trust: storedTrust() })
     const replace = held.storage.replace
     let injectConflict = true
     held.storage.replace = async (record, expectedSha256, bytes) => {
@@ -217,9 +224,9 @@ describe('runner-home logical records', () => {
     const trusted = signedPolicy()
     const cases: Array<readonly [string, Partial<Record<RunnerHomeStateRecord, unknown>>, string]> = [
       ['missing', {}, 'policy-missing'],
-      ['foreign', { policy: { ...trusted, allowlist: { ...trusted.allowlist, keyId: 'foreign' } } }, 'policy-unknown-key'],
-      ['tampered', { policy: { ...trusted, allowlist: { ...trusted.allowlist, signature: 'AAAA' } } }, 'policy-bad-signature'],
-      ['malformed', { policy: { revision: 1, allowlist: null, trustAnchors: [] } }, 'policy-malformed'],
+      ['foreign', { trust: storedTrust({ ...trusted, allowlist: { ...trusted.allowlist, keyId: 'foreign' } }) }, 'policy-unknown-key'],
+      ['tampered', { trust: storedTrust({ ...trusted, allowlist: { ...trusted.allowlist, signature: 'AAAA' } }) }, 'policy-malformed'],
+      ['malformed', { trust: { schemaVersion: 1, revision: 1, allowlist: null, anchors: [] } }, 'policy-malformed'],
     ]
     for (const [name, initial, code] of cases) {
       const held = memoryStorage(initial)
@@ -227,15 +234,15 @@ describe('runner-home logical records', () => {
     }
     const invalidJson = memoryStorage()
     invalidJson.records.set('policy', Buffer.from('{'))
-    await expect(openRecords(invalidJson)).resolves.toEqual({ status: 'failed', code: 'policy-malformed' })
+    await expect(openRecords(invalidJson)).resolves.toEqual({ status: 'failed', code: 'policy-trust-migration-required' })
   })
 
   it('fails closed when a state record is malformed or its audit append is unavailable', async () => {
     const invalidStates = [
-      memoryStorage({ policy: signedPolicy(), projects: { revision: 1, projects: [null] } }),
-      memoryStorage({ policy: signedPolicy(), grants: { revision: 1, records: [{ path: null, grantedAt: '2026-08-22T00:00:00Z' }] } }),
+      memoryStorage({ trust: storedTrust(), projects: { revision: 1, projects: [null] } }),
+      memoryStorage({ trust: storedTrust(), grants: { revision: 1, records: [{ path: null, grantedAt: '2026-08-22T00:00:00Z' }] } }),
       memoryStorage({
-        policy: signedPolicy(),
+        trust: storedTrust(),
         grants: {
           revision: 1,
           records: [
@@ -249,13 +256,23 @@ describe('runner-home logical records', () => {
       await expect(openRecords(invalid)).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
     }
 
-    const held = memoryStorage({ policy: signedPolicy() })
+    const held = memoryStorage({ trust: storedTrust() })
     const opened = await openRecords(held)
     if (opened.status !== 'ready') throw new Error(opened.code)
     held.failAudit()
     await expect(opened.home.audit.append({ kind: 'kill', confirmed: false, details: 'uncertain', at: '2026-08-22T00:00:00Z' })).rejects.toThrow('audit unavailable')
   })
 })
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`
+    )).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
 
 function digest(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
