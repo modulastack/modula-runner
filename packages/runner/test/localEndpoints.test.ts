@@ -152,6 +152,12 @@ describe('the local endpoint registry', () => {
   it('refuses a configuration the wire could not carry', () => {
     expect(() => new LocalEndpointRegistry([{ endpointId: 'has spaces', kind: 'ollama', baseUrl: 'http://127.0.0.1:11434' }])).toThrow(/safe identifier/)
     expect(() => new LocalEndpointRegistry([{ endpointId: 'a', kind: 'ollama', baseUrl: 'file:///etc/passwd' }])).toThrow(/base URL/)
+    expect(() => new LocalEndpointRegistry([{ endpointId: 'a', kind: 'ollama', baseUrl: 'https://user:secret@example.test' }])).toThrow(/base URL/)
+    expect(() => new LocalEndpointRegistry([{ endpointId: 'a', kind: 'ollama', baseUrl: 'https://example.test?token=secret' }])).toThrow(/base URL/)
+    expect(() => new LocalEndpointRegistry([{ endpointId: 'a', kind: 'ollama', baseUrl: 'https://example.test#secret' }])).toThrow(/base URL/)
+    for (const baseUrl of ['https://example.test?', 'https://example.test#', 'https://example.test/path?#']) {
+      expect(() => new LocalEndpointRegistry([{ endpointId: 'a', kind: 'ollama', baseUrl }])).toThrow(/base URL/)
+    }
     expect(() => new LocalEndpointRegistry([
       { endpointId: 'twice', kind: 'ollama', baseUrl: 'http://127.0.0.1:11434' },
       { endpointId: 'twice', kind: 'ollama', baseUrl: 'http://127.0.0.1:11435' },

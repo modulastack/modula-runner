@@ -11,6 +11,7 @@ const releaseWorkflow = readFileSync(join(root, '.github', 'workflows', 'release
 const releaseRunbook = readFileSync(join(root, 'docs', 'release-verification.md'), 'utf8')
 const reproducibleBuilds = readFileSync(join(root, 'docs', 'reproducible-builds.md'), 'utf8')
 const readme = readFileSync(join(root, 'README.md'), 'utf8')
+const pinnedNode = readFileSync(join(root, '.nvmrc'), 'utf8').trim()
 const packageVersion = JSON.parse(
   readFileSync(join(root, 'packages', 'runner', 'package.json'), 'utf8'),
 ).version as string
@@ -32,6 +33,10 @@ function artifactPath(output: string) {
 
 const isolatedReleaseFixturePaths = [
   '.nvmrc', 'package.json', 'package-lock.json', 'README.md', 'LICENSE',
+  'packages/linux-file-lock/package.json', 'packages/linux-file-lock/index.js', 'packages/linux-file-lock/index.d.ts',
+  'packages/linux-file-lock/UPSTREAM-LICENSE.txt', 'packages/linux-file-lock/VENDORING.md',
+  'packages/linux-file-lock/binaries/fs-ext-linux-arm64-node-22.0.0.node',
+  'packages/linux-file-lock/binaries/fs-ext-linux-x64-node-22.0.0.node',
   'packages/protocol/package.json', 'packages/protocol/README.md', 'packages/protocol/SCHEMA.md',
   'packages/runner/package.json', 'scripts/cli-process.mjs', 'scripts/release.mjs',
 ]
@@ -530,11 +535,12 @@ exit 64
     await Promise.all([
       mkdir(bin, { recursive: true }),
       mkdir(fixtureScripts, { recursive: true }),
+      mkdir(join(fixture, 'packages', 'linux-file-lock'), { recursive: true }),
       mkdir(join(fixture, 'packages', 'protocol'), { recursive: true }),
       mkdir(join(fixture, 'packages', 'runner'), { recursive: true }),
     ])
     for (const path of [
-      '.nvmrc', 'package.json', 'packages/protocol/package.json', 'packages/runner/package.json',
+      '.nvmrc', 'package.json', 'packages/linux-file-lock/package.json', 'packages/protocol/package.json', 'packages/runner/package.json',
       'scripts/cli-process.mjs', 'scripts/release.mjs',
     ]) {
       await copyFile(join(root, path), join(fixture, path))
@@ -572,6 +578,9 @@ exit 33
     expect(listing.status).toBe(0)
     expect(contents.status).toBe(0)
     expect(listing.stdout).toContain('package/npm-shrinkwrap.json')
+    expect(listing.stdout).toContain('package/packages/linux-file-lock/index.js')
+    expect(listing.stdout).toContain('package/packages/linux-file-lock/VENDORING.md')
+    expect(listing.stdout).toContain('package/packages/linux-file-lock/binaries/fs-ext-linux-x64-node-22.0.0.node')
     expect(listing.stdout).toContain('package/packages/protocol/dist/index.js')
     expect(listing.stdout).toContain('package/packages/runner/dist/index.js')
     expect(listing.stdout).toContain('package/packages/runner/dist/bin/modula-runner.js')
@@ -581,6 +590,7 @@ exit 33
     expect(contents.stdout.includes(Buffer.from(root))).toBe(false)
     for (const path of [
       'package/package.json',
+      'package/packages/linux-file-lock/package.json',
       'package/packages/protocol/package.json',
       'package/packages/runner/package.json',
     ]) {
@@ -589,6 +599,9 @@ exit 33
       expect(manifest.devDependencies).toBeUndefined()
     }
     const installManifest = archivedJson(firstArtifact, 'package/package.json')
+    expect(installManifest.engines).toEqual({ node: pinnedNode })
+    expect(installManifest.os).toEqual(['linux'])
+    expect(installManifest.cpu).toEqual(['x64', 'arm64'])
     expect(installManifest.name).toBe('modula-runner')
     expect(installManifest.private).toBeUndefined()
     expect(installManifest.bin).toEqual({ 'modula-runner': 'packages/runner/dist/bin/modula-runner.js' })

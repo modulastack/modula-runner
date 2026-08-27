@@ -66,6 +66,26 @@ export async function observeCapacityDurabilityScenario(
   }
 }
 
+export async function rejectWrongCapacityAuditResultId(scenario: RuntimeScenario): Promise<void> {
+  await observeCapacityDurabilityScenario(scenario, options => ({
+    async *handle(request) {
+      const claim = await options.receipts.claim(request, sessionStartFingerprint(request), now)
+      if (claim.status !== 'at-capacity') {
+        yield { kind: 'close-job-control', error: 'storage-unavailable' }
+        return
+      }
+      await options.audit.append({
+        kind: 'session-launch',
+        key: { bindingId: request.bindingId, requestId: request.requestId },
+        state: 'refused',
+        at: now,
+        result: { type: 'SESSION_REFUSED', requestId: alternateRequestId(request.requestId), reason: 'at-capacity' },
+      })
+    },
+    async *recover() {},
+  }))
+}
+
 async function runCapacityCase(
   mode: CapacityCaseMode,
   scenario: RuntimeScenario,
@@ -228,6 +248,11 @@ function capacityRequest(scenario: RuntimeScenario): SessionStartMessage {
       relativeCwd: '.',
     },
   }
+}
+
+function alternateRequestId(requestId: string): string {
+  const final = requestId.slice(-1)
+  return `${requestId.slice(0, -1)}${final === 'f' ? 'e' : 'f'}`
 }
 
 function capacityOccupant(request: SessionStartMessage, index: number): SessionStartMessage {

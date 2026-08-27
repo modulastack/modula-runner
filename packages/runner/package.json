@@ -17,13 +17,21 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20"
+    "node": "22.22.3"
   },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@modulastack/linux-file-lock": "0.1.0",
     "@modulastack/runner-protocol": "0.1.0",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"

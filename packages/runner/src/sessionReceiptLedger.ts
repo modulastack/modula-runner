@@ -19,6 +19,7 @@ import {
   MAX_SESSION_RECEIPT_RECORD_BYTES,
   MAX_SESSION_TOMBSTONE_BYTES,
   MAX_SESSION_TOMBSTONES,
+  SESSION_CHANNEL_LIFECYCLES,
   SESSION_RECEIPT_RETENTION_MS,
   SESSION_RECEIPT_SCHEMA_VERSION,
   SESSION_TOMBSTONE_RETENTION_MS,
@@ -57,6 +58,10 @@ export function createSessionReceiptLedger(options: SessionReceiptLedgerOptions)
   return new DurableSessionReceiptLedger(options)
 }
 
+export function decodeSessionReceiptLedgerImage(value: unknown): SessionReceiptLedgerImage | null {
+  return isValidImage(value) ? jsonClone(value) : null
+}
+
 class DurableSessionReceiptLedger implements SessionReceiptLedger {
   private queue: Promise<unknown> = Promise.resolve()
   private pendingOperations = 0
@@ -86,7 +91,18 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
         const receipt = initialReceipt(request, fingerprint, currentTime)
         if (!isValidReceipt(receipt)) return { status: 'storage-unavailable' }
         if (isActiveBlock(image.capacityBlockedUntil, currentTime) || !hasReceiptCapacity(image, receipt)) {
-          return await this.blockAdmission(image, request.expiresAt)
+          const blockedUntil = laterTimestamp(image.capacityBlockedUntil, request.expiresAt)
+          if (blockedUntil === image.capacityBlockedUntil) return { status: 'at-capacity', blockedUntil }
+          const blocked = nextImage(image, { capacityBlockedUntil: blockedUntil })
+          if (!blocked) return { status: 'storage-unavailable' }
+          const stored = await this.options.storage.replace(image.revision, blocked)
+          if (stored.status === 'storage-unavailable') return { status: 'storage-unavailable' }
+          if (stored.status === 'conflict') {
+            if (!isValidImage(stored.current)) return { status: 'storage-unavailable' }
+            image = stored.current
+            continue
+          }
+          return { status: 'at-capacity', blockedUntil }
         }
         const next = nextImage(image, { capacityBlockedUntil: null, receipts: [...image.receipts, receipt] })
         if (!next) return { status: 'storage-unavailable' }
@@ -120,7 +136,8 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
       if (current && isTerminal(current)) return { status: 'conflict', current }
       if (current && (!sameImmutableReceiptIdentity(current, receipt)
         || !validStateTransition(current.state, receipt.state)
-        || !validPhaseTransition(current, receipt))) {
+        || !validPhaseTransition(current, receipt)
+        || !validChannelTransition(current, receipt))) {
         return { status: 'conflict', current }
       }
       const persisted = jsonClone({ ...receipt, revision: expectedRevision + 1 })
@@ -155,23 +172,6 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
       const stored = await this.options.storage.replace(image.revision, compacted)
       if (stored.status !== 'updated') throw new SessionReceiptStorageUnavailableError()
     })
-  }
-
-  private async blockAdmission(image: SessionReceiptLedgerImage, expiresAt: string): Promise<SessionReceiptClaim> {
-    let current = image
-    for (let attempt = 0; attempt < MAX_CLAIM_CAS_ATTEMPTS; attempt += 1) {
-      const blockedUntil = laterTimestamp(current.capacityBlockedUntil, expiresAt)
-      if (blockedUntil === current.capacityBlockedUntil) return { status: 'at-capacity', blockedUntil }
-      const next = nextImage(current, { capacityBlockedUntil: blockedUntil })
-      if (!next) return { status: 'storage-unavailable' }
-      const stored = await this.options.storage.replace(current.revision, next)
-      if (stored.status === 'updated') return { status: 'at-capacity', blockedUntil }
-      if (stored.status === 'storage-unavailable' || !isValidImage(stored.current)) {
-        return { status: 'storage-unavailable' }
-      }
-      current = stored.current
-    }
-    return { status: 'storage-unavailable' }
   }
 
   private currentTime(candidate: string): string {
@@ -319,7 +319,6 @@ function sameImmutableReceiptIdentity(left: SessionReceipt, right: SessionReceip
     && left.fingerprint === right.fingerprint
     && canonicalSessionStart(left.request) === canonicalSessionStart(right.request)
     && (left.sessionId === undefined || left.sessionId === right.sessionId)
-    && (left.channelId === undefined || left.channelId === right.channelId)
     && (left.project === undefined || canonicalJson(left.project) === canonicalJson(right.project))
     && worktreeEvidencePreserved(left.worktree, right.worktree)
 }
@@ -333,6 +332,39 @@ function worktreeEvidencePreserved(left: SessionWorktreeSnapshot, right: Session
   delete leftEvidence.phase
   delete rightEvidence.phase
   return Object.entries(leftEvidence).every(([key, value]) => canonicalJson(rightEvidence[key]) === canonicalJson(value))
+}
+
+function validChannelTransition(left: SessionReceipt, right: SessionReceipt): boolean {
+  if (!left.channel) {
+    if (!right.channel) return left.channelId === undefined || left.channelId === right.channelId
+    if (right.channel.generation !== 1) return false
+    return left.channelId === undefined
+      || (right.channel.channelId === left.channelId && right.channelId === left.channelId)
+  }
+  if (!right.channel) return false
+  if (right.channel.generation === left.channel.generation + 1) {
+    return right.channel.lifecycle === 'replacement-intent'
+      && right.channel.channelId === null
+      && right.channelId === left.channelId
+  }
+  if (right.channel.generation !== left.channel.generation) return false
+  if (left.channel.lifecycle === 'replacement-intent') {
+    if (right.channel.lifecycle === 'replacement-intent') {
+      return right.channel.channelId === null
+        && right.channelId === left.channelId
+        && right.result !== undefined
+    }
+    return right.channel.lifecycle === 'live'
+      && right.channel.channelId !== null
+      && right.channelId === right.channel.channelId
+  }
+  const lifecycleAllowed = left.channel.lifecycle === 'live'
+    ? right.channel.lifecycle === 'live' || right.channel.lifecycle === 'closed' || right.channel.lifecycle === 'lost'
+    : right.channel.lifecycle === left.channel.lifecycle
+  return lifecycleAllowed
+    && right.channel.channelId === left.channel.channelId
+    && right.channelId === left.channelId
+    && right.channel.connectionEpoch === left.channel.connectionEpoch
 }
 
 function terminalReceiptEqual(left: SessionReceipt, right: SessionReceipt): boolean {
@@ -414,7 +446,7 @@ function isValidReceipt(value: unknown): value is SessionReceipt {
   if (!validWorktree(receipt.worktree)) return false
   if (receipt.sessionId !== undefined && !isSafeIdentifier(receipt.sessionId)) return false
   if (receipt.channelId !== undefined && !isSafeIdentifier(receipt.channelId)) return false
-  if (!validStateEvidence(receipt) || !validReceiptResult(receipt)) return false
+  if (!validChannel(receipt) || !validStateEvidence(receipt) || !validReceiptResult(receipt)) return false
   return jsonBytes(receipt) <= MAX_SESSION_RECEIPT_RECORD_BYTES
 }
 
@@ -433,6 +465,17 @@ function validRequest(value: unknown): value is SessionReceipt['request'] {
   if (!jsonValueWithin(value, MAX_SESSION_RECEIPT_JSON_NODES)) return false
   const parsed = parseSessionLaunchClientMessage(value, SESSION_LAUNCH_PROTOCOL_VERSION)
   return parsed !== null && canonicalSessionStart(parsed) === canonicalSessionStart(value as SessionReceipt['request'])
+}
+
+function validChannel(receipt: SessionReceipt): boolean {
+  const channel = receipt.channel
+  if (!channel) return true
+  if (!Number.isSafeInteger(channel.generation) || channel.generation < 1) return false
+  if (!(SESSION_CHANNEL_LIFECYCLES as readonly unknown[]).includes(channel.lifecycle)) return false
+  if (channel.connectionEpoch !== undefined && !isSafeIdentifier(channel.connectionEpoch)) return false
+  if (channel.lifecycle === 'replacement-intent') return channel.channelId === null
+  if (!isSafeIdentifier(channel.channelId)) return false
+  return receipt.channelId === undefined || receipt.channelId === channel.channelId
 }
 
 function validStateEvidence(receipt: SessionReceipt): boolean {

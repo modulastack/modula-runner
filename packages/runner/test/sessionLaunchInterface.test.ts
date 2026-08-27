@@ -18,11 +18,11 @@ import {
   SessionLaunchNotImplementedError,
   createUnimplementedPairingContractService,
   createUnimplementedSessionLauncher,
-  openAuditLog,
   type SessionLaunchAction,
   type SessionReceipt,
   type SessionWorktreeSnapshot,
 } from '../src/index.js'
+import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
 
 const roots: string[] = []
 const request: SessionStartMessage = {
@@ -125,7 +125,7 @@ describe('session-launch interface checkpoint', () => {
     const root = await mkdtemp(path.join(tmpdir(), 'runner-launch-interface-'))
     roots.push(root)
     const auditPath = path.join(root, 'audit.jsonl')
-    const audit = openAuditLog({ path: auditPath })
+    const audit = openAuditLogFixture({ path: auditPath })
     await audit.append({
       kind: 'session-launch',
       key: { bindingId: request.bindingId, requestId: request.requestId },

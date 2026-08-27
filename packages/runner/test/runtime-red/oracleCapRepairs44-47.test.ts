@@ -1,5 +1,6 @@
 import type { SessionStartMessage } from '@modulastack/runner-protocol'
 import { describe, expect, it } from 'vitest'
+import { SessionLaunchNotImplementedError } from '../../src/index.js'
 import type {
   AuditRecord,
   SessionJobControlEffect,
@@ -20,7 +21,7 @@ import {
 import { collectJobControlEffects } from './jobControlSubject.js'
 import { RUNTIME_RED_OBLIGATIONS } from './obligationMatrix.js'
 import { scenarioFor } from './runtimeScenarios.js'
-import type { RuntimeObservation, RuntimeScenario } from './scenarioTypes.js'
+import { observationMatches, type RuntimeObservation, type RuntimeScenario } from './scenarioTypes.js'
 import { observeTerminalScenario, terminalResumeAdvances } from './terminalSubject.js'
 
 const request: SessionStartMessage = {
@@ -61,9 +62,14 @@ describe('fresh verifier oracle cap repairs #44-#47', () => {
       result: { type: 'SESSION_FAILED', requestId: request.requestId, reason: 'spawn-failed' },
     }, request)).toBe(false)
 
-    const sentinel = await observeCapacityDurabilityScenario(runtimeScenario('G1-R21'))
+    const scenario = runtimeScenario('G1-R21')
+    const capacity = await observeCapacityDurabilityScenario(scenario)
+    expect(capacity.status).toBe('observed')
+    expect(observationMatches(capacity, scenario.oracle)).toBe(true)
+
+    const sentinel = await observeCapacityDurabilityScenario(scenario, sentinelLauncher)
     expect(sentinel).toEqual({ status: 'missing-production-runtime', subject: 'launcher', error: 'SessionLaunchNotImplementedError' })
-    await expect(observeCapacityDurabilityScenario(runtimeScenario('G1-R21'), nonSentinelLauncher)).rejects.toThrow('capacity non-sentinel')
+    await expect(observeCapacityDurabilityScenario(scenario, nonSentinelLauncher)).rejects.toThrow('capacity non-sentinel')
   })
 
   it('#45 correlates only exact stimulus responses and rejects ambiguous terminal batches', async () => {
@@ -208,6 +214,15 @@ function capacityAuditRecord(expected: SessionStartMessage, resultRequestId: str
     state: 'refused',
     at: '2026-08-21T00:00:00Z',
     result: { type: 'SESSION_REFUSED', requestId: resultRequestId, reason: 'at-capacity' },
+  }
+}
+
+function sentinelLauncher(): SessionLauncher {
+  return {
+    async *handle() {
+      throw new SessionLaunchNotImplementedError()
+    },
+    async *recover() {},
   }
 }
 

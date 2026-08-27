@@ -53,7 +53,7 @@ export function worktreeSocket(worktree: string) {
 }
 
 export function tmuxSessionName(worktree: string, sessionId: string) {
-  return ['mr', shortHash(worktree), sessionId.slice(0, 8)].join('-')
+  return ['mr', shortHash(worktree), sessionId].join('-')
 }
 
 // Server options ride a config file read at server start: an option set after

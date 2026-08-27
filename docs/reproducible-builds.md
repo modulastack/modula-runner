@@ -64,10 +64,18 @@ npm run release:reproducible  # performs two isolated npm ci/build/pack passes
 (cd dist/release && sha256sum --check SHA256SUMS)
 ```
 
-`release:build` compiles both workspaces and creates
-`dist/release/modula-runner-<version>.tgz`. The package contains compiled runner and protocol
-workspaces, the lockfile as `npm-shrinkwrap.json`, license, README, and deterministic build metadata.
-It contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
+`release:build` compiles the runner and protocol workspaces and creates
+`dist/release/modula-runner-<version>.tgz`. The package also embeds the private Linux file-lock
+workspace, its vendoring record and license, and reviewed Node 22 native members for Linux x64 and
+arm64. The current artifact requires Node `22.22.3` and Linux; Darwin remains unsupported until
+Forge issue #53 supplies its native descriptor-relative backend and evidence.
+
+The package contains a production-only `npm-shrinkwrap.json`, license, README, and deterministic
+build metadata. Staging internalizes runner imports of the bundled workspaces and promotes the
+runner's external runtime dependencies to the installable root manifest; otherwise an installed
+archive would contain sibling workspace bytes but still ask Node to resolve an unpublished package.
+Build metadata binds both the staged shrinkwrap and the original source lockfile. The package
+contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
 source before either comparison begins, performs exactly two independently isolated
 install/build/staging/packing passes, fails unless their package bytes match, and preserves the first
 compared package plus its checksum as the canonical release output. Untracked files, an existing

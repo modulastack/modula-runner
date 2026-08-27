@@ -1,5 +1,6 @@
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
+import { hasControlCharacter } from '@modulastack/runner-protocol'
 import type { ConsentPolicy } from './spawnSeam.js'
 
 // Per-directory consent: the runner operates only inside directories the operator granted, and
@@ -153,5 +154,10 @@ export function createMemoryGrantStore(initial: readonly string[] = []): GrantSt
 export async function resolveRealPath(cwd: string): Promise<string | null> {
   // Unresolvable means ungranted: a path that does not exist, or that permissions hide, resolves
   // to null and flows to a refusal, never to permission by default.
-  return realpath(path.resolve(cwd)).catch(() => null)
+  try {
+    const resolved = await realpath(path.resolve(cwd))
+    return hasControlCharacter(resolved) ? null : resolved
+  } catch {
+    return null
+  }
 }

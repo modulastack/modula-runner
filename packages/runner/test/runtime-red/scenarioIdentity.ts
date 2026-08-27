@@ -14,3 +14,7 @@ export function pairingCodeFor(obligationId: string): string {
 export function connectionIdFor(obligationId: string): string {
   return `connection-${obligationId.toLowerCase()}`
 }
+
+export function auditScenarioIdFor(obligationId: string): string {
+  return `audit-${createHash('sha256').update(`audit-runtime-red:${obligationId}`).digest('base64url').slice(0, 20)}`
+}

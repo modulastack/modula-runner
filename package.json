@@ -8,12 +8,20 @@
     "modula-runner": "packages/runner/dist/bin/modula-runner.js"
   },
   "workspaces": [
+    "packages/linux-file-lock",
     "packages/protocol",
     "packages/runner"
   ],
   "engines": {
-    "node": ">=20"
+    "node": "22.22.3"
   },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "packageManager": "npm@10.9.8",
   "volta": {
     "node": "22.22.3",

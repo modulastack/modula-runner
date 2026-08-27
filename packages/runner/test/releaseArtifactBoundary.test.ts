@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -49,6 +49,42 @@ afterAll(async () => {
 })
 
 describe('privileged release artifact boundary', () => {
+  it('runs from an installed package layout with internal protocol imports and declared runtime dependencies', async () => {
+    const install = join(workspace, 'installed-layout')
+    const nodeModules = join(install, 'node_modules')
+    const packageRoot = join(nodeModules, 'modula-runner')
+    await mkdir(packageRoot, { recursive: true })
+    const extracted = spawnSync('tar', ['-xzf', releaseArtifact, '-C', packageRoot, '--strip-components=1'], { encoding: 'utf8' })
+    expect(extracted.status).toBe(0)
+    await Promise.all([
+      symlink(join(root, 'node_modules', 'node-pty'), join(nodeModules, 'node-pty'), 'dir'),
+      symlink(join(root, 'node_modules', 'ws'), join(nodeModules, 'ws'), 'dir'),
+    ])
+    const manifest = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8')) as Record<string, unknown>
+    expect(manifest).toMatchObject({
+      name: 'modula-runner',
+      version: packageVersion,
+      dependencies: { 'node-pty': '^1.0.0', ws: '^8.18.0' },
+      main: './packages/runner/dist/index.js',
+    })
+    expect(manifest).not.toHaveProperty('workspaces')
+    const client = await readFile(join(packageRoot, 'packages', 'runner', 'dist', 'client.js'), 'utf8')
+    expect(client).not.toContain('@modulastack/runner-protocol')
+    expect(client).toContain('../../protocol/dist/index.js')
+
+    const bin = join(packageRoot, 'packages', 'runner', 'dist', 'bin', 'modula-runner.js')
+    const version = spawnSync(process.execPath, [bin, '--version'], { encoding: 'utf8' })
+    expect(version).toMatchObject({ status: 0, stdout: `${packageVersion}\n`, stderr: '' })
+    const help = spawnSync(process.execPath, [bin, '--help'], { encoding: 'utf8' })
+    expect(help.status).toBe(0)
+    expect(help.stdout).toContain('local pairing, state, and foreground runner commands')
+    const status = spawnSync(process.execPath, [bin, 'status', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, MODULA_RUNNER_HOME: join(install, 'home') },
+    })
+    expect(status).toMatchObject({ status: 1, stdout: '{"error":{"code":"policy-missing"}}\n', stderr: '' })
+  })
+
   it('rejects malformed raw build artifacts before signing', async () => {
     const fixture = join(workspace, 'raw-build-artifact')
     const baseEvidence = join(fixture, 'evidence')
@@ -307,7 +343,7 @@ if mutation == 'encrypted':
     }
 
     const valid = await runCase()
-    expect(valid.result.status).toBe(0)
+    expect(valid.result.status, valid.result.stderr).toBe(0)
     expect(await readFile(valid.output, 'utf8')).toContain(`package_digest=${packageDigest}`)
 
     const invalidCases: Array<[string, CaseOptions]> = [

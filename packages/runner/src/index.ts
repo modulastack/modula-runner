@@ -1,7 +1,7 @@
 export { RunnerClient, type ChannelHandle, type RunnerClientOptions } from './client.js'
 export { ChannelStore, type ChannelState, type NextOutbound, type ReceiveResult } from './channels.js'
 export { backoffDelay, type BackoffOptions } from './backoff.js'
-export { TerminalHost, type TerminalBindingInfo, type TerminalHostOptions } from './terminalHost.js'
+export { TerminalHost, type TerminalBindingInfo, type TerminalExitInfo, type TerminalHostOptions } from './terminalHost.js'
 export {
   DEFAULT_FLOW,
   DEFAULT_REPLAY_LINES,
@@ -12,6 +12,8 @@ export {
 } from './terminalSession.js'
 export { hasTmuxSession, killTmuxSession, tmuxSessionName, worktreeSocket, type TmuxRef } from './tmux.js'
 export { provisionWorktree, type WorktreeProvisionRequest, type WorktreeProvisionResult } from './worktrees.js'
+export { createSessionWorktreePort, type SessionWorktreePortOptions } from './sessionWorktrees.js'
+export { createSessionTerminalPorts, type SessionTerminalPorts, type SessionTerminalPortsOptions } from './sessionTerminals.js'
 export {
   PAIRING_FAILURES,
   PairingError,
@@ -25,6 +27,7 @@ export {
   type RunnerBinding,
 } from './pairing.js'
 export { createEncryptedPairingStore, createMemoryPairingStore, type EncryptedStoreOptions } from './identityStore.js'
+export { createPairingHttpTransport } from './pairingHttpTransport.js'
 export {
   PAIRING_CONTRACT_FAILURES,
   PairingContractError,
@@ -46,6 +49,7 @@ export {
   type PairingResponseMediaType,
   type PairingReservation,
 } from './pairingContract.js'
+export { createEncryptedPairingContractStore, pairingContractStore } from './pairingContractStore.js'
 export { createPairedClient, type PairedClientOptions } from './pairedClient.js'
 export { PresenceTracker, type PresenceSnapshot, type PresenceState, type PresenceTrackerOptions } from './presence.js'
 export {
@@ -60,22 +64,66 @@ export {
 } from './preview.js'
 export {
   DEFAULT_ALLOWLIST_EXECUTABLES,
+  MAX_ALLOWLIST_BYTES,
+  allowlistKeyId,
   canonicalAllowlistBytes,
+  decodeAllowlistDocument,
   decodeSignedAllowlist,
+  generateAllowlistSigningKey,
   loadTrustedAllowlist,
   signAllowlist,
   verifyAllowlistSignature,
+  trustSignedAllowlist,
   type Allowlist,
   type AllowlistLoad,
   type AllowlistRejection,
   type AllowlistSigningKey,
   type CommandPolicy,
+  type GeneratedAllowlistSigningKey,
   type LoadAllowlistOptions,
   type PreviewRecipe,
   type SignedAllowlist,
   type TrustAnchor,
 } from './allowlist.js'
-export { openAuditLog, type AuditLog, type AuditLogOptions, type AuditRecord, type SpawnOutcome } from './auditLog.js'
+export {
+  createAllowlistSigningKeyFile,
+  readAllowlistDocumentFile,
+  readAllowlistSigningKeyFile,
+  signingKeyOutsideHome,
+} from './allowlistKeyFile.js'
+export { type AuditLog, type AuditRecord, type SpawnOutcome } from './auditLog.js'
+export {
+  AUDIT_ARCHIVE_SCHEMA_VERSION,
+  AUDIT_RECORD_SCHEMA_VERSION,
+  AUDIT_SEGMENT_SCHEMA_VERSION,
+  AUDIT_SEGMENT_STATES,
+  MAX_AUDIT_METADATA_BYTES,
+  MAX_AUDIT_RECORD_BYTES,
+  MAX_AUDIT_SEGMENT_BYTES,
+  MAX_AUDIT_SEGMENT_RECORDS,
+  MAX_CAPABILITY_REFRESH_INTENTIONS,
+  MAX_CAPABILITY_REFRESH_RUNTIMES,
+  MAX_RESIDENT_AUDIT_SEGMENTS,
+  type AuditArchiveAcknowledgement,
+  type AuditLifecycleSnapshot,
+  type AuditRecordBaseV2,
+  type AuditRecordInputV2,
+  type AuditRecordV2,
+  type AuditReclamationTombstone,
+  type AuditSegmentManifest,
+  type AuditSegmentState,
+  type AuditSequence,
+  type AuditSpawnKind,
+  type AuditSpawnSubject,
+  type CapabilityEndpointOutcomeCounts,
+  type CapabilityRuntimeOutcomeCounts,
+  type RunnerAuditArchiveOptions,
+  type RunnerAuditArchiveResult,
+  type RunnerAuditLifecycle,
+  type RunnerAuditLifecycleOpen,
+  type RunnerAuditLifecycleOptions,
+} from './auditLifecycle.js'
+export { archiveRunnerAudit, openRunnerAuditLifecycle } from './fileAuditLifecycle.js'
 export {
   activateKillSwitch,
   type KillOutcome,
@@ -106,6 +154,17 @@ export {
   type SpawnSeamOptions,
   type VettedSpawn,
 } from './spawnSeam.js'
+export {
+  createCapabilityProbeBatchSeam,
+  type CapabilityProbeBatchOptions,
+  type CapabilityProbeBatchSeam,
+  type CapabilityProbeCheck,
+  type CapabilityProbeDecision,
+  type CapabilityProbeIntent,
+  type CapabilityRefreshBatch,
+  type CapabilityRefreshBatchResult,
+  type CapabilityRefreshOutcome,
+} from './capabilityProbeBatch.js'
 export {
   runGrantAddCommand,
   runGrantListCommand,
@@ -162,6 +221,7 @@ export {
   AccessResolver,
   accessRefusalGuidance,
   isAccessRefusal,
+  isCompleteLocalModelProfile,
   type AccessRefusal,
   type AccessResolution,
   type AccessResolverOptions,
@@ -179,6 +239,7 @@ export {
   MAX_SESSION_RECEIPT_RECORD_BYTES,
   MAX_SESSION_TOMBSTONE_BYTES,
   MAX_SESSION_TOMBSTONES,
+  SESSION_CHANNEL_LIFECYCLES,
   SESSION_LAUNCH_STORAGE_UNAVAILABLE,
   SESSION_RECEIPT_RETENTION_MS,
   SESSION_RECEIPT_SCHEMA_VERSION,
@@ -188,7 +249,6 @@ export {
   SessionLaunchNotImplementedError,
   SessionReceiptLedgerNotImplementedError,
   SessionReceiptStorageUnavailableError,
-  createSessionLauncher,
   createUnimplementedSessionLauncher,
   type LocalFileIdentity,
   type LocalProjectRecord,
@@ -197,8 +257,16 @@ export {
   type SessionAccessPort,
   type SessionBranchCreatedSnapshot,
   type SessionBranchEvidence,
+  type SessionChannelCloseResult,
+  type SessionChannelEvent,
+  type SessionChannelEventCoordinator,
+  type SessionChannelEventCoordinatorOptions,
+  type SessionChannelEventResult,
+  type SessionChannelLifecycle,
   type SessionChannelOpen,
   type SessionChannelPort,
+  type SessionChannelSnapshot,
+  type SessionChannelStatus,
   type SessionIdentifierPort,
   type SessionLaunchAction,
   type SessionLaunchAuditRecord,
@@ -206,6 +274,7 @@ export {
   type SessionLauncherOptions,
   type SessionNoWorktreeSnapshot,
   type SessionProjectSnapshot,
+  type SessionRecoveryChannelPort,
   type SessionRegistrationEvidence,
   type SessionReceipt,
   type SessionReceiptClaim,
@@ -221,6 +290,7 @@ export {
   type SessionReceiptStorageReplace,
   type SessionReceiptTombstone,
   type SessionProcessHandle,
+  type SessionProcessIdentity,
   type SessionProcessPort,
   type SessionProcessRequest,
   type SessionProcessStart,
@@ -235,11 +305,15 @@ export {
   type SessionWorktreeVerifiedSnapshot,
   type WorktreeOwnershipPhase,
 } from './sessionLaunch.js'
+export { createSessionChannelEventCoordinator } from './sessionChannelEvents.js'
+export { createSessionLauncher } from './sessionLauncher.js'
 export { MAX_PENDING_SESSION_LEDGER_OPERATIONS, createSessionReceiptLedger } from './sessionReceiptLedger.js'
 export {
   SESSION_JOB_CONTROL_ERRORS,
   SessionJobControlNotImplementedError,
   createSessionJobControl,
+  type SessionConnectionAuditReason,
+  type SessionConnectionAuditRecord,
   type SessionJobControl,
   type SessionJobControlContext,
   type SessionJobControlEffect,
@@ -258,6 +332,7 @@ export {
   type RunnerConfigurationReplace,
   type RunnerConfigurationStore,
   type RunnerHome,
+  type RunnerHomeCustodyInspection,
   type RunnerHomeEntryInspection,
   type RunnerHomeFailure,
   type RunnerHomeInspection,
@@ -271,10 +346,25 @@ export {
   type RunnerHomeStorageRead,
   type RunnerHomeStorageWrite,
   type RunnerLocalConfiguration,
+  type RunnerPolicyInitialization,
   type RunnerPolicyReplace,
   type RunnerPolicySnapshot,
   type RunnerPolicyStore,
 } from './runnerHome.js'
+export {
+  createFileRunnerHome,
+  type FileRunnerHomeOptions,
+} from './fileRunnerHome.js'
+export {
+  createFileRunnerHomeStorage,
+  type FileRunnerHomeStorageOptions,
+} from './runnerHomeStorage.js'
+export {
+  openRunnerHomeRecords,
+  type RunnerHomeRecordComponents,
+  type RunnerHomeRecordsOptions,
+} from './runnerHomeRecords.js'
+export { createInstalledRunnerApplication, type InstalledRunnerOptions } from './installedRunner.js'
 export {
   RUNNER_PROJECT_COMMANDS,
   RUNNER_TOP_LEVEL_COMMANDS,
@@ -285,9 +375,11 @@ export {
   createUnimplementedRunnerApplication,
   type RunnerApplication,
   type RunnerApplicationOptions,
+  type RunnerAuditArchivePort,
   type RunnerCliEnvironment,
   type RunnerCliInvocation,
   type RunnerCliIo,
+  type RunnerCliSignals,
   type RunnerComposition,
   type RunnerExitCode,
   type RunnerRuntimeHandle,

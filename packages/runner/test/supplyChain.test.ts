@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -101,10 +102,12 @@ async function expectInvalidPeerSemanticsRejected(
 async function temporaryWorkspace() {
   const target = await mkdtemp(join(tmpdir(), 'modula-runner-supply-test-'))
   workspaces.push(target)
+  await mkdir(join(target, 'packages', 'linux-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'protocol'), { recursive: true })
   await mkdir(join(target, 'packages', 'runner'), { recursive: true })
   await cp(join(root, 'package.json'), join(target, 'package.json'))
   await cp(join(root, 'package-lock.json'), join(target, 'package-lock.json'))
+  await cp(join(root, 'packages', 'linux-file-lock', 'package.json'), join(target, 'packages', 'linux-file-lock', 'package.json'))
   await cp(join(root, 'packages', 'protocol', 'package.json'), join(target, 'packages', 'protocol', 'package.json'))
   await cp(join(root, 'packages', 'runner', 'package.json'), join(target, 'packages', 'runner', 'package.json'))
   return target
@@ -254,7 +257,7 @@ describe('release supply-chain gate', () => {
     expect(sbom.specVersion).toBe('1.5')
     expect(sbom.metadata.component.name).toBe('modula-runner-workspace')
     expect(sbom.components.map((component: { name: string }) => component.name)).toEqual([
-      'node-addon-api', 'node-pty', 'ws', '@modulastack/runner-protocol', 'modula-runner',
+      'node-addon-api', 'node-pty', 'ws', '@modulastack/linux-file-lock', '@modulastack/runner-protocol', 'modula-runner',
     ])
     expect(JSON.stringify(sbom)).not.toContain('cdx:npm:package:development')
     const subject = sbom.dependencies.find(
@@ -607,7 +610,7 @@ esac
       FAKE_AUDIT_REPORT: JSON.stringify(auditReport(vulnerabilities)),
     })
 
-    expect(result.status).toBe(0)
+    expect(result.status, result.stderr).toBe(0)
     expect(result.stderr).toBe('')
     expect(result.stdout.trim()).toBe(
       'seeded vulnerability proof passed: GHSA-35jh-r3h4-6jhm, GHSA-r5fr-rjxr-66jc',
@@ -630,6 +633,21 @@ esac
     expect(result.status).toBe(1)
     expect(result.stderr).not.toContain(canary)
     expect(result.stderr).toContain('npm failed with exit')
+  })
+
+  it('binds vendored native provenance to the reviewed members', async () => {
+    const provenance = await readFile(join(root, 'packages/linux-file-lock/VENDORING.md'), 'utf8')
+    expect(provenance).toContain('fs-ext-extra-prebuilt@2.2.13')
+    expect(provenance).toContain('792ba4cf6f887011afd03757716ca099824a23d0')
+    expect(provenance).toContain('sha512-mVSm+UDKvftEMHljOThNW3NtI8/gX7f1z9U1WGRbBf6JXQTFbS8Wv+qPVpZhYH6zCj1rXV/XnhQMek3tEn41Pg==')
+    for (const [member, digest] of [
+      ['fs-ext-linux-x64-node-22.0.0.node', 'a58e01d64248b487d9c7dafba751d69b7924d16f0e31cedcce9d3226fdfdb514'],
+      ['fs-ext-linux-arm64-node-22.0.0.node', '80c10393d3698397e35d30f0edca8d05f938c9f5f8be1a747d0bd56cedce6d06'],
+    ] as const) {
+      const bytes = await readFile(join(root, 'packages/linux-file-lock/binaries', member))
+      expect(createHash('sha256').update(bytes).digest('hex')).toBe(digest)
+      expect(provenance).toContain(digest)
+    }
   })
 
   it('reports a development-only High advisory without blocking', async () => {

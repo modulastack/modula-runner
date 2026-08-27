@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
-import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,9 +36,10 @@ async function releaseVersion(projectRoot = root) {
   const workspace = await readJson('package.json', projectRoot)
   const runner = await readJson('packages/runner/package.json', projectRoot)
   const protocol = await readJson('packages/protocol/package.json', projectRoot)
-  const versions = [workspace.version, runner.version, protocol.version]
+  const fileLock = await readJson('packages/linux-file-lock/package.json', projectRoot)
+  const versions = [workspace.version, runner.version, protocol.version, fileLock.version]
   if (new Set(versions).size !== 1) {
-    throw new Error(`workspace versions differ: root ${workspace.version}, runner ${runner.version}, protocol ${protocol.version}`)
+    throw new Error(`workspace versions differ: root ${workspace.version}, runner ${runner.version}, protocol ${protocol.version}, file lock ${fileLock.version}`)
   }
   return runner.version
 }
@@ -56,6 +57,16 @@ async function validateToolchain(projectRoot = root, environment = process.env) 
   return { node: expectedNode, npm: expectedNpm }
 }
 
+async function validateReleaseRuntime(projectRoot, expectedNode) {
+  const paths = ['package.json', 'packages/runner/package.json', 'packages/linux-file-lock/package.json']
+  for (const path of paths) {
+    const manifest = await readJson(path, projectRoot)
+    if (manifest.engines?.node !== expectedNode) throw new Error(`${path} must require Node ${expectedNode}`)
+    if (JSON.stringify(manifest.os) !== '["linux"]') throw new Error(`${path} must support Linux only`)
+    if (JSON.stringify(manifest.cpu) !== '["x64","arm64"]') throw new Error(`${path} must support x64 and arm64 only`)
+  }
+}
+
 function validateReleaseRef(version, environment = process.env) {
   const ref = environment.GITHUB_REF_NAME
   if (ref && ref !== `v${version}`) throw new Error(`tag ${ref} does not match package version v${version}`)
@@ -63,6 +74,7 @@ function validateReleaseRef(version, environment = process.env) {
 
 async function releasePreflight(projectRoot = root, environment = process.env) {
   const toolchain = await validateToolchain(projectRoot, environment)
+  await validateReleaseRuntime(projectRoot, toolchain.node)
   const version = await releaseVersion(projectRoot)
   validateReleaseRef(version, environment)
   return { toolchain, version }
@@ -75,6 +87,16 @@ async function copyPackage(packageName, staging, projectRoot) {
   delete manifest.private
   await mkdir(target, { recursive: true })
   await writeFile(join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  if (packageName === 'linux-file-lock') {
+    await Promise.all([
+      copyFile(join(source, 'index.js'), join(target, 'index.js')),
+      copyFile(join(source, 'index.d.ts'), join(target, 'index.d.ts')),
+      copyFile(join(source, 'UPSTREAM-LICENSE.txt'), join(target, 'UPSTREAM-LICENSE.txt')),
+      copyFile(join(source, 'VENDORING.md'), join(target, 'VENDORING.md')),
+      cp(join(source, 'binaries'), join(target, 'binaries'), { recursive: true }),
+    ])
+    return
+  }
   await cp(join(source, 'dist'), join(target, 'dist'), { recursive: true })
   if (packageName === 'protocol') {
     await copyFile(join(source, 'README.md'), join(target, 'README.md'))
@@ -82,23 +104,97 @@ async function copyPackage(packageName, staging, projectRoot) {
   }
 }
 
+function releaseShrinkwrap(shrinkwrap, manifest) {
+  shrinkwrap.name = manifest.name
+  shrinkwrap.version = manifest.version
+  const root = {
+    name: manifest.name,
+    version: manifest.version,
+    license: manifest.license,
+    bin: manifest.bin,
+    dependencies: manifest.dependencies,
+    engines: manifest.engines,
+  }
+  shrinkwrap.packages[''] = root
+  delete shrinkwrap.packages['packages/linux-file-lock']
+  delete shrinkwrap.packages['packages/protocol']
+  delete shrinkwrap.packages['packages/runner']
+  delete shrinkwrap.packages['node_modules/@modulastack/linux-file-lock']
+  delete shrinkwrap.packages['node_modules/@modulastack/runner-protocol']
+  delete shrinkwrap.packages['node_modules/modula-runner']
+  for (const name of Object.keys(manifest.dependencies)) {
+    if (!shrinkwrap.packages[`node_modules/${name}`]) throw new Error(`release dependency missing from lockfile: ${name}`)
+  }
+  return shrinkwrap
+}
+
+async function rewriteWorkspaceImports(staging) {
+  const runnerDist = join(staging, 'packages', 'runner', 'dist')
+  const targets = {
+    '@modulastack/linux-file-lock': join(staging, 'packages', 'linux-file-lock', 'index.js'),
+    '@modulastack/runner-protocol': join(staging, 'packages', 'protocol', 'dist', 'index.js'),
+  }
+  const files = await filesUnder(runnerDist)
+  for (const file of files) {
+    if (!file.endsWith('.js') && !file.endsWith('.d.ts')) continue
+    let source = await readFile(file, 'utf8')
+    for (const [workspace, target] of Object.entries(targets)) {
+      const relativeImport = relative(dirname(file), target).split(sep).join('/')
+      const specifier = relativeImport.startsWith('.') ? relativeImport : `./${relativeImport}`
+      source = source.replace(new RegExp(`(['"])${workspace.replace('/', '\\/')}\\1`, 'g'), (_match, quote) => `${quote}${specifier}${quote}`)
+      if (source.includes(workspace)) throw new Error(`unrewritten workspace import in release file: ${relative(staging, file)}`)
+    }
+    await writeFile(file, source)
+  }
+}
+
+async function filesUnder(directory) {
+  const files = []
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const target = join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await filesUnder(target))
+    else if (entry.isFile()) files.push(target)
+  }
+  return files
+}
+
 async function stageRelease(staging, version, toolchain, projectRoot) {
+  const workspace = stripBuildFields(await readJson('package.json', projectRoot))
+  const runner = stripBuildFields(await readJson('packages/runner/package.json', projectRoot))
+  const dependencies = Object.fromEntries(
+    Object.entries(runner.dependencies ?? {}).filter(([name]) => !name.startsWith('@modulastack/')),
+  )
   const rootPackage = {
-    ...stripBuildFields(await readJson('package.json', projectRoot)),
+    ...workspace,
     name: 'modula-runner',
     version,
+    description: runner.description,
+    main: './packages/runner/dist/index.js',
+    types: './packages/runner/dist/index.d.ts',
+    exports: {
+      '.': {
+        types: './packages/runner/dist/index.d.ts',
+        default: './packages/runner/dist/index.js',
+      },
+    },
+    dependencies,
   }
   delete rootPackage.private
+  delete rootPackage.workspaces
+  const shrinkwrap = releaseShrinkwrap(await readJson('package-lock.json', projectRoot), rootPackage)
   await mkdir(staging, { recursive: true })
   await writeFile(join(staging, 'package.json'), `${JSON.stringify(rootPackage, null, 2)}\n`)
-  await copyFile(join(projectRoot, 'package-lock.json'), join(staging, 'npm-shrinkwrap.json'))
+  await writeFile(join(staging, 'npm-shrinkwrap.json'), `${JSON.stringify(shrinkwrap, null, 2)}\n`)
   await copyFile(join(projectRoot, 'README.md'), join(staging, 'README.md'))
   await copyFile(join(projectRoot, 'LICENSE'), join(staging, 'LICENSE'))
+  await copyPackage('linux-file-lock', staging, projectRoot)
   await copyPackage('protocol', staging, projectRoot)
   await copyPackage('runner', staging, projectRoot)
+  await rewriteWorkspaceImports(staging)
   await chmod(join(staging, 'packages', 'runner', 'dist', 'bin', 'modula-runner.js'), 0o755)
-  const lockfileSha256 = await sha256(join(projectRoot, 'package-lock.json'))
-  const metadata = { artifact: 'modula-runner', version, expectedTag: `v${version}`, toolchain, lockfileSha256 }
+  const lockfileSha256 = await sha256(join(staging, 'npm-shrinkwrap.json'))
+  const sourceLockfileSha256 = await sha256(join(projectRoot, 'package-lock.json'))
+  const metadata = { artifact: 'modula-runner', version, expectedTag: `v${version}`, toolchain, lockfileSha256, sourceLockfileSha256 }
   await writeFile(join(staging, 'BUILD-METADATA.json'), `${JSON.stringify(metadata, null, 2)}\n`)
 }
 

@@ -3,7 +3,7 @@ import { constants as osConstants, tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import * as pty from 'node-pty'
-import { isTerminalProfile, type TerminalClientMessage, type TerminalServerMessage } from '@modulastack/runner-protocol'
+import { isSafeIdentifier, isTerminalProfile, type TerminalClientMessage, type TerminalServerMessage } from '@modulastack/runner-protocol'
 import {
   captureTmuxScrollback,
   exitTmuxCopyMode,
@@ -59,6 +59,7 @@ const SECRET_PRELUDE = `. "$${SECRET_FILE_ENV}"; sourced=$?; rm -f "$${SECRET_FI
 
 export type TerminalLaunchSpec = {
   command: string
+  sessionId?: string
   args?: string[]
   cwd: string
   profile?: string
@@ -72,6 +73,7 @@ export type TerminalLaunchSpec = {
 }
 
 export type TerminalAdoptSpec = {
+  sessionId?: string
   cwd: string
   command: string
   profile?: string
@@ -268,6 +270,8 @@ export class TerminalSession {
     // not leave the command's side effects behind on its way to being refused.
     const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
     assertSessionMetadata(normalized)
+    const id = spec.sessionId ?? randomUUID()
+    if (!isSafeIdentifier(id)) throw new Error('sessionId must be a safe identifier')
     // Checked here as well as where the file is written, so a refused launch leaves no temp
     // directory and spawns no tmux call on its way out.
     if (spec.secrets) assertInjectableNames(spec.secrets)
@@ -283,7 +287,6 @@ export class TerminalSession {
     // allowlisted command outside the grant.
     const vettedCwd = authorized.authorization.vetted.cwd
     const exitDir = mkdtempSync(path.join(tmpdir(), 'modula-runner-'))
-    const id = randomUUID()
     const ref = { socket: spec.socket ?? worktreeSocket(spec.cwd), sessionName: tmuxSessionName(spec.cwd, id) }
     // A half-launched session is torn down whole: a failed attach must not
     // leave a command running unobserved or a temp directory behind.
@@ -407,10 +410,19 @@ export class TerminalSession {
   static async adopt(ref: TmuxRef, spec: TerminalAdoptSpec, policy: SessionPolicy, events: TerminalSessionEvents, seam: SpawnSeam) {
     const normalized = { command: spec.command, cwd: spec.cwd, profile: spec.profile ?? 'shell' }
     assertSessionMetadata(normalized)
+    if (spec.sessionId !== undefined && !isSafeIdentifier(spec.sessionId)) throw new Error('sessionId must be a safe identifier')
     if (!(await hasTmuxSession(ref, seam))) throw new Error(`no tmux session to adopt: ${ref.sessionName}`)
     // A reattach spawns no command — the pane's command ran under the original launch that
     // gated it — so there is no fresh admission to answer here.
-    const session = new TerminalSession({ spec: normalized, ref, policy, events, seam, paneComplete: async () => undefined })
+    const session = new TerminalSession({
+      ...(spec.sessionId ? { id: spec.sessionId } : {}),
+      spec: normalized,
+      ref,
+      policy,
+      events,
+      seam,
+      paneComplete: async () => undefined,
+    })
     session.attach()
     return session
   }

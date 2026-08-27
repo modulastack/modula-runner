@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { chmod, link, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { chmod, link, mkdir, open, rename, stat, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
@@ -28,6 +28,7 @@ const NONCE_BYTES = 12
 const TAG_BYTES = 16
 const FILE_MODE = 0o600
 const RECORD_VERSION = 1
+const MAX_SEALED_RECORD_BYTES = 8 * 1024 * 1024
 const KEY_FILE = 'key file'
 
 export type EncryptedStoreOptions = {
@@ -412,13 +413,34 @@ async function syncDirectory(directory: string) {
 }
 
 async function readIfPresent(target: string) {
+  let handle: FileHandle | undefined
   try {
-    await stat(target)
-    return await readFile(target)
+    handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const info = await handle.stat()
+    if (!info.isFile()) throw new Error(`sealed record is not a regular file: ${target}`)
+    if (info.uid !== process.getuid?.()) throw new Error(`sealed record is not owned by this user: ${target}`)
+    if ((info.mode & 0o777) !== FILE_MODE) throw new Error(`sealed record mode must be 600: ${target}`)
+    if (info.nlink !== 1) throw new Error(`sealed record must have one link: ${target}`)
+    if (info.size > MAX_SEALED_RECORD_BYTES) throw new Error(`sealed record is too large: ${target}`)
+    return await readBoundedRecord(handle)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
+  } finally {
+    await handle?.close()
   }
+}
+
+async function readBoundedRecord(handle: FileHandle): Promise<Buffer> {
+  const bytes = Buffer.alloc(MAX_SEALED_RECORD_BYTES + 1)
+  let offset = 0
+  while (offset < bytes.length) {
+    const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset)
+    if (bytesRead === 0) break
+    offset += bytesRead
+  }
+  if (offset > MAX_SEALED_RECORD_BYTES) throw new Error('sealed record grew past its size limit')
+  return bytes.subarray(0, offset)
 }
 
 function isBase64(value: unknown, bytes: number): value is string {

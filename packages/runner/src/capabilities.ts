@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import {
@@ -9,9 +10,16 @@ import {
   isSafeIdentifier,
   type AccessMode,
   type CliAuthState,
+  type LocalEndpointCapability,
   type RunnerCapabilities,
   type RuntimeCapability,
 } from '@modulastack/runner-protocol'
+import type {
+  CapabilityProbeBatchSeam,
+  CapabilityProbeDecision,
+  CapabilityProbeIntent,
+  CapabilityRefreshOutcome,
+} from './capabilityProbeBatch.js'
 import type { LocalEndpointRegistry } from './localEndpoints.js'
 import type { SpawnOutcome } from './auditLog.js'
 import type { SpawnSeam } from './spawnSeam.js'
@@ -118,6 +126,9 @@ export type CapabilityMonitorOptions = {
   // Probing spawns third-party CLIs, so it passes the same allowlist gate every runner-owned
   // spawn does: a runtime whose command is not allowlisted is not probed and not advertised.
   seam: SpawnSeam
+  // Production cadence composition supplies the aggregate seam. Omission retains the individual
+  // probe path for explicit one-shot callers and legacy fixtures; it is not an activation bypass.
+  batchSeam?: CapabilityProbeBatchSeam
   runtimes?: readonly RuntimeSpec[]
   endpoints?: LocalEndpointRegistry
   probeTimeoutMs?: number
@@ -133,6 +144,7 @@ export declare interface CapabilityMonitor {
 
 export class CapabilityMonitor extends EventEmitter {
   private readonly seam: SpawnSeam
+  private readonly batchSeam: CapabilityProbeBatchSeam | undefined
   private readonly runtimes: readonly RuntimeSpec[]
   private readonly endpoints: LocalEndpointRegistry | undefined
   private readonly probeTimeoutMs: number
@@ -154,6 +166,7 @@ export class CapabilityMonitor extends EventEmitter {
   constructor(options: CapabilityMonitorOptions) {
     super()
     this.seam = options.seam
+    this.batchSeam = options.batchSeam
     const runtimes = options.runtimes ?? []
     // Bounded where it is produced, not only at the validator: a catalog longer than the
     // wire carries would build a snapshot the peer drops whole, and a configuration that
@@ -230,26 +243,44 @@ export class CapabilityMonitor extends EventEmitter {
   }
 
   private async probeAll(): Promise<RunnerCapabilities> {
+    const snapshot = this.batchSeam
+      ? await this.probeAllAsBatch(this.batchSeam)
+      : await this.probeAllIndividually()
+    // What the machine can do, and what a peer has been told, are two facts. A failed audit batch
+    // never reaches this assignment, so an undurable refresh cannot become the current snapshot.
+    this.latest = snapshot
+    if (JSON.stringify(snapshot) === JSON.stringify(this.announced)) return snapshot
+    if (this.announce(snapshot)) this.announced = snapshot
+    return snapshot
+  }
+
+  private async probeAllIndividually(): Promise<RunnerCapabilities> {
     const [runtimes, endpoints] = await Promise.all([
       probeCatalog(this.seam, this.runtimes, this.probeTimeoutMs),
       this.endpoints ? this.endpoints.probeAll({ timeoutMs: this.probeTimeoutMs }) : Promise.resolve([]),
     ])
-    const snapshot: RunnerCapabilities = { runtimes, endpoints }
-    // What the machine can do, and what a peer has been told, are two facts and they get two
-    // variables. Sharing one is what turned a throwing subscriber into a runner that refuses
-    // every installed runtime: `snapshot()` answers from here, the resolver reads it, and
-    // gating it on delivery meant a bad listener could report the machine as having nothing.
-    this.latest = snapshot
-    // Announced on change only. The snapshot is whole every time, so re-sending an
-    // identical one tells a peer nothing it does not already hold, and a channel carrying a
-    // frame every two seconds forever is noise somebody has to filter.
-    //
-    // Compared against what actually got through, not against what was probed: a delivery
-    // that failed is offered again by the next pass, which is the whole point of tracking it
-    // separately, and a whole snapshot makes the repeat harmless.
-    if (JSON.stringify(snapshot) === JSON.stringify(this.announced)) return snapshot
-    if (this.announce(snapshot)) this.announced = snapshot
-    return snapshot
+    return { runtimes, endpoints }
+  }
+
+  private async probeAllAsBatch(batchSeam: CapabilityProbeBatchSeam): Promise<RunnerCapabilities> {
+    const batch = {
+      refreshId: randomUUID(),
+      probes: capabilityIntentions(this.runtimes),
+      endpointIntentions: this.endpoints?.list().length ?? 0,
+    }
+    const result = await batchSeam.run(batch, async decisions => {
+      const [runtimeResult, endpoints] = await Promise.all([
+        probeCatalogBatch(this.runtimes, decisions, this.probeTimeoutMs),
+        this.endpoints ? this.endpoints.probeAll({ timeoutMs: this.probeTimeoutMs }) : Promise.resolve([]),
+      ])
+      const snapshot: RunnerCapabilities = { runtimes: runtimeResult.capabilities, endpoints }
+      return {
+        outcome: aggregateOutcome(runtimeResult.outcomes, endpoints, batch.endpointIntentions, snapshot, this.announced),
+        value: snapshot,
+      }
+    })
+    if (result.status === 'storage-unavailable') throw new Error('capability refresh audit unavailable')
+    return result.value
   }
 
   private announce(snapshot: RunnerCapabilities) {
@@ -300,6 +331,106 @@ async function probeCatalog(seam: SpawnSeam, specs: readonly RuntimeSpec[], time
   // Written by index so the order is the catalog's; the holes an absent runtime leaves are
   // closed here rather than advertised as gaps.
   return detected.filter(entry => entry !== undefined)
+}
+
+type BatchProbeOutcome = ProbeOutcome | { status: 'refused' }
+type BatchCatalogResult = { capabilities: RuntimeCapability[]; outcomes: BatchProbeOutcome[] }
+
+function capabilityIntentions(specs: readonly RuntimeSpec[]): CapabilityProbeIntent[] {
+  return specs.flatMap(spec => {
+    const intent = (check: 'version' | 'auth', args: readonly string[]): CapabilityProbeIntent => ({
+      probeId: randomUUID(),
+      runtimeId: spec.runtime,
+      check,
+      request: { kind: 'probe', executable: spec.command, args, cwd: tmpdir(), grantScoped: false },
+    })
+    return spec.authArgs === null
+      ? [intent('version', spec.versionArgs)]
+      : [intent('version', spec.versionArgs), intent('auth', spec.authArgs)]
+  })
+}
+
+async function probeCatalogBatch(
+  specs: readonly RuntimeSpec[],
+  decisions: readonly CapabilityProbeDecision[],
+  timeoutMs: number,
+): Promise<BatchCatalogResult> {
+  const results = new Array<{ capability: RuntimeCapability | null; outcomes: BatchProbeOutcome[] }>(specs.length)
+  let next = 0
+  const worker = async () => {
+    for (;;) {
+      const index = next++
+      const spec = specs[index]
+      if (!spec) return
+      results[index] = await probeRuntimeBatch(spec, decisions, timeoutMs)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_PROBES, specs.length) }, worker))
+  return {
+    capabilities: results.flatMap(result => result.capability ? [result.capability] : []),
+    outcomes: results.flatMap(result => result.outcomes),
+  }
+}
+
+async function probeRuntimeBatch(
+  spec: RuntimeSpec,
+  decisions: readonly CapabilityProbeDecision[],
+  timeoutMs: number,
+): Promise<{ capability: RuntimeCapability | null; outcomes: BatchProbeOutcome[] }> {
+  const version = await executeBatchDecision(decisionFor(decisions, spec.runtime, 'version'), timeoutMs)
+  const auth = spec.authArgs === null
+    ? null
+    : version.status === 'missing'
+      ? { status: 'missing' as const }
+      : await executeBatchDecision(decisionFor(decisions, spec.runtime, 'auth'), timeoutMs)
+  const outcomes = auth ? [version, auth] : [version]
+  if (version.status === 'missing' || version.status === 'refused') return { capability: null, outcomes }
+  return {
+    capability: {
+      runtime: spec.runtime,
+      version: version.status === 'answered' ? reportedVersion(version.stdout) : null,
+      auth: auth?.status === 'answered' ? (auth.exitCode === 0 ? 'authenticated' : 'unauthenticated') : 'unknown',
+      access: [...spec.access],
+    },
+    outcomes,
+  }
+}
+
+function decisionFor(
+  decisions: readonly CapabilityProbeDecision[],
+  runtimeId: string,
+  check: 'version' | 'auth',
+): CapabilityProbeDecision {
+  const decision = decisions.find(candidate => candidate.runtimeId === runtimeId && candidate.check === check)
+  if (!decision) throw new Error('capability batch omitted a probe decision')
+  return decision
+}
+
+function executeBatchDecision(decision: CapabilityProbeDecision, timeoutMs: number): Promise<BatchProbeOutcome> {
+  return decision.status === 'refused'
+    ? Promise.resolve({ status: 'refused' })
+    : runProbeProcess(decision.vetted.command, decision.vetted.args, timeoutMs)
+}
+
+function aggregateOutcome(
+  runtimeOutcomes: readonly BatchProbeOutcome[],
+  endpoints: readonly LocalEndpointCapability[],
+  endpointIntentions: number,
+  snapshot: RunnerCapabilities,
+  announced: RunnerCapabilities | null,
+): CapabilityRefreshOutcome {
+  const count = (status: BatchProbeOutcome['status']) => runtimeOutcomes.filter(outcome => outcome.status === status).length
+  const available = endpoints.filter(endpoint => endpoint.reachable).length
+  return {
+    runtimeOutcomes: {
+      answered: count('answered'),
+      missing: count('missing'),
+      unanswered: count('unanswered'),
+      refused: count('refused'),
+    },
+    endpointOutcomes: { available, unavailable: endpointIntentions - available, refused: 0 },
+    snapshotChanged: JSON.stringify(snapshot) !== JSON.stringify(announced),
+  }
 }
 
 // The CLI is asked about itself and only its exit status is read. Its output can carry an

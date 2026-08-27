@@ -11,9 +11,9 @@ import {
   DEFAULT_FLOW,
   DEFAULT_REPLAY_LINES,
   TerminalSession,
+  allowlistKeyId,
   createSpawnSeam,
   loadTrustedAllowlist,
-  openAuditLog,
   signAllowlist,
   type Allowlist,
   type AllowlistRejection,
@@ -25,6 +25,7 @@ import {
   type TrustAnchor,
   type VettedSpawn,
 } from '../src/index.js'
+import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
 import { permissiveConsent } from './spawnSeamSupport.js'
 
 const execFileAsync = promisify(execFile)
@@ -40,11 +41,12 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
 })
 
-function signingIdentity(keyId: string): { anchor: TrustAnchor; key: AllowlistSigningKey } {
+function signingIdentity(_label: string): { anchor: TrustAnchor; key: AllowlistSigningKey } {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519', {
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   })
+  const keyId = allowlistKeyId(publicKey)
   return {
     anchor: { keyId, publicKey },
     key: { keyId, privateKey },
@@ -207,7 +209,7 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
     const identity = signingIdentity('local-only')
     await writeEnvelope(path, signAllowlist(allowlist(), identity.key))
     const policy = await loadPolicy(path, [identity.anchor])
-    const seam = createSpawnSeam({ policy, audit: openAuditLog({ path: auditPath }) })
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }) })
     const requests = [
       { kind: 'preview' as const, recipeId: 'remote-recipe', cwd: directory, grantScoped: true, requestId: 'wire-1' },
       { kind: 'preview' as const, recipeId: 'remote-recipe', cwd: directory, grantScoped: true, requestId: 'wire-1' },
@@ -259,7 +261,7 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
     }
     await writeEnvelope(path, signAllowlist(document, identity.key))
     const policy = await loadPolicy(path, [identity.anchor])
-    const seam = createSpawnSeam({ policy, audit: openAuditLog({ path: auditPath }), now: () => 1_700_000_000_000, consent: permissiveConsent([directory]) })
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000, consent: permissiveConsent([directory]) })
     const directKinds: Exclude<SpawnKind, 'preview'>[] = ['pane', 'git', 'tmux', 'probe']
 
     for (const kind of directKinds) {
@@ -314,7 +316,7 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
     const directory = await temporaryDirectory()
     const auditPath = join(directory, 'audit.ndjson')
     const sentinel = join(directory, 'pane-command-ran')
-    const audit = openAuditLog({ path: auditPath })
+    const audit = openAuditLogFixture({ path: auditPath })
     const seam = createSpawnSeam({
       policy: {
         allowsExecutable: executable => executable === 'tmux',
@@ -358,7 +360,7 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
     const identity = signingIdentity('refusal-policy')
     await writeEnvelope(path, signAllowlist(allowlist(), identity.key))
     const policy = await loadPolicy(path, [identity.anchor])
-    const seam = createSpawnSeam({ policy, audit: openAuditLog({ path: auditPath }), now: () => 1_700_000_000_000 })
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000 })
 
     const pane = await seam.authorize({
       kind: 'pane',
