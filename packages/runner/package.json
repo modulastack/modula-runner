@@ -1,6 +1,6 @@
 {
   "name": "modula-runner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Modula Runner — the local execution daemon (work in progress)",
   "license": "Apache-2.0",
@@ -31,8 +31,8 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@modulastack/linux-file-lock": "0.1.0",
-    "@modulastack/runner-protocol": "0.1.0",
+    "@modulastack/linux-file-lock": "0.2.0",
+    "@modulastack/runner-protocol": "0.2.0",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
   },

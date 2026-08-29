@@ -263,7 +263,7 @@ describe('release supply-chain gate', () => {
     const subject = sbom.dependencies.find(
       (dependency: { ref: string }) => dependency.ref === sbom.metadata.component['bom-ref'],
     )
-    expect(subject.dependsOn).toEqual(['modula-runner@0.1.0'])
+    expect(subject.dependsOn).toEqual(['modula-runner@0.2.0'])
   })
 
   it('reconciles installed, optional, absent, and omitted peer edges', async () => {

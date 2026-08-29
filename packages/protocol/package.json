@@ -1,6 +1,6 @@
 {
   "name": "@modulastack/runner-protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Versioned wire protocol between the Modula Runner and the control plane",
   "license": "Apache-2.0",
   "type": "module",

@@ -30,6 +30,7 @@ import type { RunnerHome, RunnerHomeFailure, RunnerHomeSelection, RunnerHomeStat
 import type { SessionJobControl } from './sessionJobControl.js'
 import type { SessionLauncher } from './sessionLaunch.js'
 import type { ContainmentStatus } from './previewContainment.js'
+import { createProductionRunnerRuntime, RunnerRuntimeUnavailableError } from './runnerRuntime.js'
 
 export const RUNNER_TOP_LEVEL_COMMANDS = [
   'help',
@@ -80,13 +81,15 @@ export interface RunnerApplication {
   execute(invocation: RunnerCliInvocation): Promise<RunnerExitCode>
 }
 
-export type RunnerShutdownResult =
+export type RunnerStopResult =
   | { status: 'confirmed' }
   | { status: 'unconfirmed'; detail: string }
 
+export type RunnerShutdownResult = RunnerStopResult | { status: 'failed'; detail: string }
+
 export interface RunnerRuntimeHandle {
   finished: Promise<RunnerShutdownResult>
-  stop(signal: 'SIGINT' | 'SIGTERM'): Promise<RunnerShutdownResult>
+  stop(signal: 'SIGINT' | 'SIGTERM'): Promise<RunnerStopResult>
   forceStop(): void
 }
 
@@ -100,17 +103,13 @@ export type RunnerRuntimeOptions = {
 
 export class RunnerRuntimeNotImplementedError extends Error {
   constructor() {
-    super('the runner runtime composition is interface-only and is not active')
+    super('the requested runner runtime composition is not implemented')
     this.name = 'RunnerRuntimeNotImplementedError'
   }
 }
 
-export function createRunnerRuntime(_options: RunnerRuntimeOptions): RunnerRuntimePort {
-  return {
-    async start(): Promise<never> {
-      throw new RunnerRuntimeNotImplementedError()
-    },
-  }
+export function createRunnerRuntime(options: RunnerRuntimeOptions): RunnerRuntimePort {
+  return createProductionRunnerRuntime(options)
 }
 
 export type RunnerContainmentStatus = Pick<ContainmentStatus, 'disposition' | 'prevention' | 'detail'>
@@ -318,15 +317,15 @@ async function runCommand(
     const sessions = composition.sessions(home)
     handle = await composition.runtime.start(home, composition.jobControl(sessions))
   } catch (error) {
-    if (error instanceof RunnerRuntimeNotImplementedError) {
-      return { exitCode: 1, stderr: 'protocol-inactive: session runtime awaits the separate protocol-v2 activation gate' }
+    if (error instanceof RunnerRuntimeUnavailableError) {
+      return { exitCode: 1, stderr: `runner-unavailable: pairing state is ${error.pairingState}` }
     }
     throw error
   }
   const result = await waitForRuntime(handle, signals)
-  return result.status === 'confirmed'
-    ? { exitCode: 0, stdout: 'runner stopped — all identified children terminated' }
-    : { exitCode: 1, stderr: result.detail.startsWith('unconfirmed') ? result.detail : `unconfirmed — ${result.detail}` }
+  if (result.status === 'confirmed') return { exitCode: 0, stdout: 'runner stopped — all identified children terminated' }
+  if (result.status === 'failed') return { exitCode: 1, stderr: result.detail }
+  return { exitCode: 1, stderr: result.detail.startsWith('unconfirmed') ? result.detail : `unconfirmed — ${result.detail}` }
 }
 
 function waitForRuntime(handle: RunnerRuntimeHandle, signals: RunnerCliSignals | undefined): Promise<RunnerShutdownResult> {

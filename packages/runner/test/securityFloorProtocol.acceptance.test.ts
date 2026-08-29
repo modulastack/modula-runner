@@ -27,17 +27,17 @@ const sessionStart = {
 const sessionStartPayload = { codec: 'json', body: sessionStart } as const
 
 describe('CP-5 active wire invariance acceptance', () => {
-  it('AS-08 keeps session launch inactive under v1 and gated behind the approved version-2 interface', () => {
-    expect(PROTOCOL_VERSION).toBe(1)
-    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(2)
+  it('AS-08 activates session launch only under the approved version-2 interface', () => {
+    expect(PROTOCOL_VERSION).toBe(2)
+    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION)
 
     expect(parseJobControlClientMessage(sessionStart)).toBeNull()
     expect(decodeJobControlClientMessage(sessionStartPayload)).toBeNull()
-    expect(parseSessionLaunchClientMessage(sessionStart, PROTOCOL_VERSION)).toBeNull()
-    expect(decodeSessionLaunchClientMessage(sessionStartPayload, PROTOCOL_VERSION)).toBeNull()
+    expect(parseSessionLaunchClientMessage(sessionStart, 1)).toBeNull()
+    expect(decodeSessionLaunchClientMessage(sessionStartPayload, 1)).toBeNull()
 
-    expect(parseSessionLaunchClientMessage(sessionStart, SESSION_LAUNCH_PROTOCOL_VERSION)).toEqual(sessionStart)
-    expect(decodeSessionLaunchClientMessage(sessionStartPayload, SESSION_LAUNCH_PROTOCOL_VERSION)).toEqual(sessionStart)
-    expect(parseSessionLaunchClientMessage(sessionStart, SESSION_LAUNCH_PROTOCOL_VERSION + 1)).toBeNull()
+    expect(parseSessionLaunchClientMessage(sessionStart, PROTOCOL_VERSION)).toEqual(sessionStart)
+    expect(decodeSessionLaunchClientMessage(sessionStartPayload, PROTOCOL_VERSION)).toEqual(sessionStart)
+    expect(parseSessionLaunchClientMessage(sessionStart, PROTOCOL_VERSION + 1)).toBeNull()
   })
 })

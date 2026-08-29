@@ -397,6 +397,7 @@ export {
   type RunnerRuntimeOptions,
   type RunnerRuntimePort,
   type RunnerShutdownResult,
+  type RunnerStopResult,
   type RunnerTopLevelCommand,
 } from './runnerApplication.js'
 export {

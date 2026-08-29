@@ -119,7 +119,7 @@ export class RunnerClient extends EventEmitter {
     this.phase = 'stopped'
     this.connected = false
     this.clearTimers()
-    this.transport.close()
+    this.transport.terminate()
     this.emit('stopped')
   }
 
@@ -211,7 +211,7 @@ export class RunnerClient extends EventEmitter {
       this.emit('protocol-error', { message: 'frame before welcome', frame: frame.type })
       return false
     }
-    // hello and open only travel runner → control plane in version 1.
+    // Hello and open travel only runner → control plane in every active version.
     if (frame.type === 'hello' || frame.type === 'open') {
       this.emit('protocol-error', { message: 'direction-invalid frame', frame: frame.type })
       return false

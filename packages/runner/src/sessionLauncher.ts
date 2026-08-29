@@ -1227,7 +1227,8 @@ async function timed<T>(
     value => ({ ok: true as const, value }),
     () => ({ ok: false as const, timeout: false, aborted: false }),
   ).finally(() => { settled = true })
-  const timeout = options.clock.sleep(milliseconds).then(async (): Promise<TimedResult<T>> => {
+  const timeoutController = new AbortController()
+  const timeout = options.clock.sleep(milliseconds, timeoutController.signal).then(async (): Promise<TimedResult<T>> => {
     await Promise.resolve()
     if (settled) return await operationResult
     controller.abort()
@@ -1236,6 +1237,7 @@ async function timed<T>(
   try {
     return await Promise.race([operationResult, timeout, parentAbort])
   } finally {
+    timeoutController.abort()
     if (abortFromParent) parentSignal?.removeEventListener('abort', abortFromParent)
   }
 }

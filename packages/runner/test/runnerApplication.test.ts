@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { sessionLaunchPayload } from '@modulastack/runner-protocol'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createGrants,
@@ -19,7 +20,10 @@ import {
   type RunnerCliSignals,
   type RunnerRuntimeHandle,
   type RunnerRuntimePort,
+  type SessionJobControl,
 } from '../src/index.js'
+import { createProductionRunnerRuntime } from '../src/runnerRuntime.js'
+import { StubControlPlane } from './stubControlPlane.js'
 
 const roots: string[] = []
 const token = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
@@ -143,6 +147,10 @@ function pending<T>() {
   return { promise, resolve }
 }
 
+function jobControlChannel(stub: StubControlPlane) {
+  return [...stub.channels].find(([, channel]) => channel.kind === 'job-control')?.[0]
+}
+
 describe('core runner application commands', () => {
   it('answers help and version without opening mutable state', async () => {
     const app = application()
@@ -212,11 +220,82 @@ describe('core runner application commands', () => {
     expect(forcedCall.stderr).toEqual(['unconfirmed — forced exit during cleanup\n'])
   })
 
-  it('keeps the foreground runtime explicitly inactive while protocol v1 is active', async () => {
+  it('surfaces a terminal runtime failure instead of reporting a clean stop', async () => {
+    const runtime: RunnerRuntimePort = {
+      start: async () => ({
+        finished: Promise.resolve({ status: 'failed', detail: 'runner-auth-failed: binding revoked after authorization rejection' }),
+        stop: async () => ({ status: 'confirmed' }),
+        forceStop: () => undefined,
+      }),
+    }
+    const call = invocation(['run'])
+    await expect(application(pairing(), projectRegistry(), {}, runtime).value.execute(call.value)).resolves.toBe(1)
+    expect(call.stderr).toEqual(['runner-auth-failed: binding revoked after authorization rejection\n'])
+    expect(call.stdout).toEqual([])
+  })
+
+  it('fails closed before dialing when the installed runtime has no paired binding', async () => {
     const call = invocation(['run'])
     const runtime = createRunnerRuntime({ clock: { now: Date.now, sleep: async () => undefined } })
-    await expect(application(pairing(), projectRegistry(), {}, runtime).value.execute(call.value)).resolves.toBe(1)
-    expect(call.stderr).toEqual(['protocol-inactive: session runtime awaits the separate protocol-v2 activation gate\n'])
+    const pairingStore: RunnerHomeState['pairing'] = {
+      reserve: async () => ({ status: 'reserved', reservationId: 'unused' }),
+      release: async () => undefined,
+      commitPending: async () => 'storage-unavailable',
+      snapshot: async () => ({ state: 'unpaired', record: null }),
+      markConfirmationUnknown: async () => 'storage-unavailable',
+      settle: async () => 'storage-unavailable',
+      revoke: async () => 'storage-unavailable',
+    }
+    await expect(application(pairing(), projectRegistry(), { pairing: pairingStore }, runtime).value.execute(call.value)).resolves.toBe(1)
+    expect(call.stderr).toEqual(['runner-unavailable: pairing state is unpaired\n'])
+  })
+
+  it('drains an accepted dispatch before checking for child-session cleanup', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    const dispatchStarted = pending<void>()
+    const releaseDispatch = pending<void>()
+    let childActive = false
+    let cleanupSawActiveChild = false
+    const jobControl: SessionJobControl = {
+      async *dispatch() {
+        dispatchStarted.resolve()
+        await releaseDispatch.promise
+        childActive = true
+      },
+      async *recover() {},
+    }
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => {
+        cleanupSawActiveChild = childActive
+        childActive = false
+        return []
+      },
+    })
+    const state = {
+      pairing: { snapshot: async () => ({ state: 'paired', record: { ...pairedRecord, controlPlaneOrigin: stub.url } }) },
+    } as unknown as RunnerHomeState
+    const handle = await runtime.start(state, jobControl)
+    try {
+      await vi.waitFor(() => expect(jobControlChannel(stub)).toBeDefined())
+      stub.sendToRunner(jobControlChannel(stub)!, sessionLaunchPayload({
+        type: 'SESSION_START',
+        bindingId: pairedRecord.bindingId,
+        requestId: '223e4567-e89b-42d3-a456-426614174001',
+        expiresAt: '2099-08-22T12:00:00Z',
+        terminalProfile: 'coder',
+        modelProfileId: 'daily',
+        target: { projectId: 'modulastack', worktreeName: 'lane-01', branch: 'feat/lane-01', baseBranch: 'main', relativeCwd: '.' },
+      }))
+      await dispatchStarted.promise
+      const stop = handle.stop('SIGTERM')
+      releaseDispatch.resolve()
+      await expect(stop).resolves.toEqual({ status: 'confirmed' })
+      expect(cleanupSawActiveChild).toBe(true)
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
   })
 
   it('accepts pairing codes only through a hidden interactive read', async () => {
