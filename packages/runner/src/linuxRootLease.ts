@@ -1,7 +1,7 @@
-import { tryExclusive, unlock } from '@modulastack/linux-file-lock'
 import { performance } from 'node:perf_hooks'
 import { statfs, type FileHandle } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
+import { loadDarwinRunnerHomeNative } from './darwinRunnerHomeNative.js'
 
 const ACQUIRE_TIMEOUT_MS = 2_000
 const RETRY_DELAY_MS = 2
@@ -38,13 +38,14 @@ export async function acquireLinuxRootLifetime(root: FileHandle): Promise<LinuxR
     if (transient) {
       transientLeases.delete(key)
       try {
-        await unlock(transient.fd)
+        await release(transient.fd)
       } catch {
         await transient.poison()
         return 'storage-unavailable'
       }
     }
-    if (!(await acquire(root.fd))) return 'storage-unavailable'
+    const result = await acquire(root.fd)
+    if (result !== 'acquired') return result === 'contended' ? 'contended' : 'storage-unavailable'
     lifetimeLeases.set(key, root.fd)
     return 'acquired'
   })
@@ -57,7 +58,7 @@ export async function releaseLinuxRootLifetime(root: FileHandle): Promise<boolea
     if (lifetimeLeases.get(key) !== root.fd) return false
     lifetimeLeases.delete(key)
     try {
-      await unlock(root.fd)
+      await release(root.fd)
       return true
     } catch {
       return false
@@ -78,7 +79,7 @@ export async function withLinuxRootLease<T>(
     if (lifetimeLeases.has(key)) return await runOperation(operation, unavailable)
     let lease = transientLeases.get(key)
     if (!lease) {
-      if (!(await acquire(root.fd))) return unavailable
+      if (await acquire(root.fd) !== 'acquired') return unavailable
       lease = { fd: root.fd, poison }
       transientLeases.set(key, lease)
     }
@@ -86,7 +87,7 @@ export async function withLinuxRootLease<T>(
     if ((pending.get(key) ?? 0) > 1) return result
     transientLeases.delete(key)
     try {
-      await unlock(lease.fd)
+      await release(lease.fd)
       return result
     } catch {
       await lease.poison()
@@ -103,23 +104,45 @@ async function runOperation<T>(operation: () => Promise<T>, unavailable: T): Pro
   }
 }
 
-async function acquire(fd: number): Promise<boolean> {
+async function acquire(fd: number): Promise<'acquired' | 'contended' | 'unavailable'> {
   const deadline = performance.now() + ACQUIRE_TIMEOUT_MS
+  let contended = false
   for (;;) {
     try {
-      if (await tryExclusive(fd) === 'acquired') return true
+      const result = await tryExclusive(fd)
+      if (result === 'acquired') return 'acquired'
+      contended = true
     } catch {
-      return false
+      return 'unavailable'
     }
-    if (performance.now() >= deadline) return false
+    if (performance.now() >= deadline) return contended ? 'contended' : 'unavailable'
     await delay(RETRY_DELAY_MS)
   }
+}
+
+async function release(fd: number): Promise<void> {
+  await unlock(fd)
+}
+
+async function linuxFileLock(): Promise<typeof import('@modulastack/linux-file-lock')> {
+  return await import('@modulastack/linux-file-lock')
+}
+
+async function tryExclusive(fd: number): Promise<'acquired' | 'contended'> {
+  if (process.platform === 'darwin') return loadDarwinRunnerHomeNative().tryExclusive(fd)
+  return await (await linuxFileLock()).tryExclusive(fd)
+}
+
+async function unlock(fd: number): Promise<void> {
+  if (process.platform === 'darwin') return loadDarwinRunnerHomeNative().unlock(fd)
+  await (await linuxFileLock()).unlock(fd)
 }
 
 async function admittedRootKey(root: FileHandle): Promise<string | null> {
   const key = await rootKey(root)
   if (!key) return null
   try {
+    if (process.platform === 'darwin') return loadDarwinRunnerHomeNative().isLocalFileSystem(root.fd) ? key : null
     const info = await statfs(linuxDescriptorRootPath(root), { bigint: true })
     return LOCAL_FILESYSTEMS.has(info.type) ? key : null
   } catch {

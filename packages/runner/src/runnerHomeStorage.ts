@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { constants, type BigIntStats, type Stats } from 'node:fs'
-import { lstat, mkdir, open, readdir, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import {
   RUNNER_HOME_RECORDS,
@@ -20,6 +20,15 @@ import {
   releaseLinuxRootLifetime,
   withLinuxRootLease,
 } from './linuxRootLease.js'
+import {
+  descriptorRootAdapter,
+  identityOf,
+  sameIdentity,
+  type DescriptorChildHandle,
+  type DescriptorRootAdapter,
+  type DescriptorRootEntryStat,
+  type DescriptorRootIdentity,
+} from './descriptorRootAdapter.js'
 
 const DIRECTORY_MODE = 0o700
 const RECORD_MODE = 0o600
@@ -49,8 +58,6 @@ const RECORD_FILES: Readonly<Record<RunnerHomeRecord, string>> = {
   audit: 'audit.jsonl',
 }
 
-type RootIdentity = { device: bigint; inode: bigint }
-
 export type FileRunnerHomeStorageOptions = {
   defaultRoot: string
   currentUserId?: number
@@ -69,17 +76,18 @@ export function fileRunnerHomeSealingKeyPath(root: string): string {
 }
 
 class FileRunnerHomeStorage implements RunnerHomeStorage {
+  private readonly rootAdapter: DescriptorRootAdapter
   private queue: Promise<unknown> = Promise.resolve()
   private root: string | null = null
   private rootHandle: FileHandle | null = null
-  private rootIdentity: RootIdentity | null = null
+  private rootIdentity: DescriptorRootIdentity | null = null
   private foregroundLease = false
   private poisoned = false
   private closed = false
   private readonly uid: number | undefined
 
   constructor(private readonly options: FileRunnerHomeStorageOptions) {
-    descriptorRootDirectory()
+    this.rootAdapter = descriptorRootAdapter()
     this.uid = options.currentUserId ?? process.getuid?.()
   }
 
@@ -110,7 +118,8 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   descriptorRoot(): Promise<string | null> {
     return this.serialize(async () => {
       if (!this.foregroundLease || !(await this.rootStillBound())) return null
-      return this.rootHandle ? linuxDescriptorRootPath(this.rootHandle) : null
+      if (!this.rootHandle || process.platform === 'darwin') return null
+      return linuxDescriptorRootPath(this.rootHandle)
     })
   }
 
@@ -127,7 +136,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
         root,
         { status: 'storage-unavailable' },
         async () => {
-          if (!(await cleanupInterruptedTemps(root, this.uid))) return { status: 'storage-unavailable' }
+          if (!(await cleanupInterruptedTemps(root, this.uid, this.rootAdapter))) return { status: 'storage-unavailable' }
           const current = await this.readRecordAt(root, record)
           if (current.status === 'storage-unavailable') return current
           const currentSha256 = current.status === 'found' ? current.sha256 : null
@@ -156,7 +165,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     let bound = this.rootHandle && await this.rootStillBound() ? this.rootHandle : null
     const inspectedRoot = bound
     let entries = inspectedRoot
-      ? await Promise.all(RUNNER_HOME_RECORDS.map(async record => await inspectEntry(inspectedRoot, record, this.uid)))
+      ? await Promise.all(RUNNER_HOME_RECORDS.map(async record => await inspectEntry(inspectedRoot, record, this.uid, this.rootAdapter)))
       : []
     if (bound && !(await this.rootStillBound())) {
       bound = null
@@ -164,7 +173,7 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
     }
     const info = bound ? await bound.stat() : await lstat(root)
     const sealingKey = bound
-      ? await inspectCustody(rootEntryPath(bound, 'sealing.key'), this.uid)
+      ? await inspectCustody(bound, 'sealing.key', this.uid, this.rootAdapter)
       : undefined
     return {
       rootKind: rootKindOf(info),
@@ -202,8 +211,8 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
 
   private async readRecordAt(root: FileHandle, record: RunnerHomeStateRecord): Promise<RunnerHomeStorageRead> {
     try {
-      const handle = await openRecord(rootEntryPath(root, RECORD_FILES[record]))
-      const result = handle ? await readSecure(handle, this.uid, RECORD_LIMITS[record]) : { status: 'missing' as const }
+      const handle = await openRecord(root, RECORD_FILES[record], this.rootAdapter)
+      const result = handle ? await readSecure(handle, this.uid, RECORD_LIMITS[record], this.rootAdapter) : { status: 'missing' as const }
       return (await this.rootStillBound()) ? result : { status: 'storage-unavailable' }
     } catch {
       return { status: 'storage-unavailable' }
@@ -211,17 +220,17 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
   }
 
   private async replaceRecord(root: FileHandle, record: RunnerHomeStateRecord, bytes: Uint8Array): Promise<RunnerHomeStorageWrite> {
-    const target = rootEntryPath(root, RECORD_FILES[record])
+    const target = RECORD_FILES[record]
     const temporary = `${target}.tmp-${randomBytes(16).toString('hex')}`
     try {
-      await writeTemporary(temporary, bytes, this.uid)
-      await rename(temporary, target)
-      await root.sync()
+      await writeTemporary(root, temporary, bytes, this.uid, this.rootAdapter)
+      await this.rootAdapter.rename(root, temporary, target)
+      await this.rootAdapter.sync(root)
       if (!(await this.rootStillBound())) return { status: 'storage-unavailable' }
       return { status: 'written', sha256: sha256(bytes) }
     } catch {
       // The operation already fails closed; an unremovable private temp must not replace that result.
-      await unlink(temporary).catch(() => undefined)
+      await this.rootAdapter.unlink(root, temporary).catch(() => undefined)
       return { status: 'storage-unavailable' }
     }
   }
@@ -300,20 +309,11 @@ async function openSecureRoot(root: string, uid: number | undefined): Promise<Fi
   return null
 }
 
-function descriptorRootDirectory(): string {
-  if (process.platform === 'linux') return '/proc/self/fd'
-  throw new Error(`file runner-home storage requires Linux descriptor-relative paths; found ${process.platform}`)
-}
+type InterruptedTemp = { name: string; identity: DescriptorRootIdentity; size: number }
 
-function rootEntryPath(root: FileHandle, entry: string): string {
-  return path.join(descriptorRootDirectory(), String(root.fd), entry)
-}
-
-type InterruptedTemp = { name: string; identity: RootIdentity; size: number }
-
-async function cleanupInterruptedTemps(root: FileHandle, uid: number | undefined): Promise<boolean> {
+async function cleanupInterruptedTemps(root: FileHandle, uid: number | undefined, adapter: DescriptorRootAdapter): Promise<boolean> {
   try {
-    const names = await readdir(rootEntryPath(root, '.'))
+    const names = await adapter.readdir(root)
     if (names.some(name => LEGACY_COORDINATION_ENTRIES.has(name))) return false
     const records = Object.entries(RECORD_FILES).filter(([record]) => record !== 'audit')
     const candidates: InterruptedTemp[] = []
@@ -323,25 +323,27 @@ async function cleanupInterruptedTemps(root: FileHandle, uid: number | undefined
       if (!matched) continue
       const [record, file] = matched
       if (!new RegExp(`^${escapeRegExp(file)}\\.tmp-[0-9a-f]{32}$`).test(name)) return false
-      const info = await lstat(rootEntryPath(root, name), { bigint: true })
+      const info = await adapter.statEntry(root, name)
+      if (!info) return false
       if (!secureRecord(info, uid) || Number(info.size) > RECORD_LIMITS[record as RunnerHomeStateRecord]) return false
       totalBytes += Number(info.size)
       candidates.push({ name, identity: identityOf(info), size: Number(info.size) })
     }
     if (candidates.length > MAX_INTERRUPTED_TEMPS || totalBytes > MAX_INTERRUPTED_TEMP_BYTES) return false
     for (const candidate of candidates) {
-      const target = rootEntryPath(root, candidate.name)
-      let handle: FileHandle | undefined
+      let handle: DescriptorChildHandle | null = null
       try {
-        handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-        const [held, visible] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })])
+        handle = await adapter.openEntry(root, candidate.name, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+        if (!handle) return false
+        const [held, visible] = await Promise.all([adapter.stat(handle), adapter.statEntry(root, candidate.name)])
+        if (!visible) return false
         if (!secureRecord(held, uid) || !sameIdentity(held, candidate.identity) || !sameIdentity(visible, candidate.identity)) return false
       } finally {
-        await handle?.close()
+        if (handle) await adapter.close(handle).catch(() => undefined)
       }
-      await unlink(target)
+      await adapter.unlink(root, candidate.name)
     }
-    if (candidates.length > 0) await root.sync()
+    if (candidates.length > 0) await adapter.sync(root)
     return true
   } catch {
     return false
@@ -352,102 +354,79 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-async function inspectEntry(root: FileHandle, record: RunnerHomeRecord, uid: number | undefined): Promise<RunnerHomeEntryInspection> {
-  const info = await lstat(rootEntryPath(root, RECORD_FILES[record])).catch(error => missingOnly(error))
+async function inspectEntry(root: FileHandle, record: RunnerHomeRecord, uid: number | undefined, adapter: DescriptorRootAdapter): Promise<RunnerHomeEntryInspection> {
+  const info = await adapter.statEntry(root, RECORD_FILES[record])
   if (info === null) return { record, kind: 'missing', owner: 'current-user', mode: 0, links: 0 }
   return { record, kind: entryKindOf(info), owner: ownerOf(info, uid), mode: permissionsOf(info), links: info.nlink }
 }
 
-async function inspectCustody(target: string, uid: number | undefined): Promise<RunnerHomeCustodyInspection> {
-  const info = await lstat(target).catch(error => missingOnly(error))
+async function inspectCustody(root: FileHandle, entry: string, uid: number | undefined, adapter: DescriptorRootAdapter): Promise<RunnerHomeCustodyInspection> {
+  const info = await adapter.statEntry(root, entry)
   if (info === null) return { kind: 'missing', owner: 'current-user', mode: 0, links: 0 }
   return { kind: entryKindOf(info), owner: ownerOf(info, uid), mode: permissionsOf(info), links: info.nlink }
 }
 
-async function openRecord(target: string): Promise<FileHandle | null> {
+async function openRecord(root: FileHandle, target: string, adapter: DescriptorRootAdapter): Promise<DescriptorChildHandle | null> {
   try {
-    return await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    return await adapter.openEntry(root, target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   } catch (error) {
     if (isCode(error, 'ENOENT')) return null
     throw error
   }
 }
 
-async function readSecure(handle: FileHandle, uid: number | undefined, limit: number): Promise<RunnerHomeStorageRead> {
+async function readSecure(handle: DescriptorChildHandle, uid: number | undefined, limit: number, adapter: DescriptorRootAdapter): Promise<RunnerHomeStorageRead> {
   try {
-    const info = await handle.stat()
+    const info = await adapter.stat(handle)
     if (!secureRecord(info, uid) || info.size > limit) return { status: 'storage-unavailable' }
-    const bytes = await readBounded(handle, limit, info.size)
+    const bytes = await readBounded(handle, limit, info.size, adapter)
     return bytes ? { status: 'found', bytes, sha256: sha256(bytes) } : { status: 'storage-unavailable' }
   } finally {
     // The bounded read result is already determined; closing cannot make its bytes less read.
-    await handle.close().catch(() => undefined)
+    await adapter.close(handle).catch(() => undefined)
   }
 }
 
-async function readBounded(handle: FileHandle, limit: number, expectedSize: number): Promise<Uint8Array | null> {
-  const buffer = Buffer.alloc(Math.min(expectedSize + 1, limit + 1))
-  let offset = 0
-  while (offset < buffer.length) {
-    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
-    if (bytesRead === 0) break
-    offset += bytesRead
-  }
-  return offset > limit || offset > expectedSize ? null : Buffer.from(buffer.subarray(0, offset))
+async function readBounded(handle: DescriptorChildHandle, limit: number, expectedSize: number, adapter: DescriptorRootAdapter): Promise<Uint8Array | null> {
+  const bytes = await adapter.read(handle, Math.min(expectedSize + 1, limit + 1))
+  return bytes.byteLength > limit || bytes.byteLength > expectedSize ? null : bytes
 }
 
-async function writeTemporary(target: string, bytes: Uint8Array, uid: number | undefined): Promise<void> {
-  let handle: FileHandle | undefined
+async function writeTemporary(root: FileHandle, target: string, bytes: Uint8Array, uid: number | undefined, adapter: DescriptorRootAdapter): Promise<void> {
+  let handle: DescriptorChildHandle | null = null
   try {
-    handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, RECORD_MODE)
-    if (!secureRecord(await handle.stat(), uid)) throw new Error('temporary runner-home record is insecure')
-    await writeAll(handle, bytes)
-    await handle.sync()
+    handle = await adapter.openEntry(root, target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, RECORD_MODE)
+    if (!handle) throw new Error('temporary runner-home record already exists')
+    if (!secureRecord(await adapter.stat(handle), uid)) throw new Error('temporary runner-home record is insecure')
+    await adapter.writeAll(handle, bytes)
+    await adapter.sync(handle)
   } finally {
-    await handle?.close()
+    if (handle) await adapter.close(handle).catch(() => undefined)
   }
 }
 
-async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
-  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  let offset = 0
-  while (offset < buffer.length) {
-    const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset)
-    if (bytesWritten === 0) throw new Error('runner-home write made no progress')
-    offset += bytesWritten
-  }
-}
-
-function secureDirectory(info: Stats | BigIntStats, uid: number | undefined): boolean {
+function secureDirectory(info: Stats | BigIntStats | DescriptorRootEntryStat, uid: number | undefined): boolean {
   return info.isDirectory() && ownerOf(info, uid) === 'current-user' && permissionsOf(info) === DIRECTORY_MODE
 }
 
-function secureRecord(info: Stats | BigIntStats, uid: number | undefined): boolean {
+function secureRecord(info: Stats | BigIntStats | DescriptorRootEntryStat, uid: number | undefined): boolean {
   return info.isFile() && ownerOf(info, uid) === 'current-user' && permissionsOf(info) === RECORD_MODE && Number(info.nlink) === 1
 }
 
-function identityOf(info: Stats | BigIntStats): RootIdentity {
-  return { device: BigInt(info.dev), inode: BigInt(info.ino) }
-}
-
-function sameIdentity(info: BigIntStats, expected: RootIdentity): boolean {
-  return info.dev === expected.device && info.ino === expected.inode
-}
-
-function ownerOf(info: Stats | BigIntStats, uid: number | undefined): 'current-user' | 'other' {
+function ownerOf(info: Stats | BigIntStats | DescriptorRootEntryStat, uid: number | undefined): 'current-user' | 'other' {
   return uid === undefined || Number(info.uid) === uid ? 'current-user' : 'other'
 }
 
-function permissionsOf(info: Stats | BigIntStats): number {
+function permissionsOf(info: Stats | BigIntStats | DescriptorRootEntryStat): number {
   return Number(info.mode) & 0o777
 }
 
-function rootKindOf(info: Stats): RunnerHomeInspection['rootKind'] {
+function rootKindOf(info: Stats | BigIntStats | DescriptorRootEntryStat): RunnerHomeInspection['rootKind'] {
   if (info.isSymbolicLink()) return 'symlink'
   return info.isDirectory() ? 'directory' : 'other'
 }
 
-function entryKindOf(info: Stats): RunnerHomeEntryInspection['kind'] {
+function entryKindOf(info: Stats | BigIntStats | DescriptorRootEntryStat): RunnerHomeEntryInspection['kind'] {
   if (info.isSymbolicLink()) return 'symlink'
   if (info.isDirectory()) return 'directory'
   return info.isFile() ? 'regular' : 'other'
