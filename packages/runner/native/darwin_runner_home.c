@@ -145,6 +145,30 @@ static int retry_unlinkat(int root_fd, const char *name) {
   return result;
 }
 
+static int retry_mkdirat(int root_fd, const char *name, mode_t mode) {
+  int result;
+  do {
+    result = mkdirat(root_fd, name, mode);
+  } while (result != 0 && errno == EINTR);
+  return result;
+}
+
+static int retry_rmdir(int root_fd, const char *name) {
+  int result;
+  do {
+    result = unlinkat(root_fd, name, AT_REMOVEDIR);
+  } while (result != 0 && errno == EINTR);
+  return result;
+}
+
+static int retry_ftruncate(int fd, off_t length) {
+  int result;
+  do {
+    result = ftruncate(fd, length);
+  } while (result != 0 && errno == EINTR);
+  return result;
+}
+
 static int retry_fstatfs(int fd, struct statfs *info) {
   int result;
   do {
@@ -329,6 +353,26 @@ static napi_value js_write_all(napi_env env, napi_callback_info cb) {
   return undefined;
 }
 
+static napi_value js_truncate(napi_env env, napi_callback_info cb) {
+  size_t argc = 2;
+  napi_value args[2];
+  napi_get_cb_info(env, cb, &argc, args, NULL, NULL);
+  int32_t fd;
+  double length;
+  if (argc < 2 || !get_int32_arg(env, args[0], &fd) || napi_get_value_double(env, args[1], &length) != napi_ok ||
+      length < 0 || length > INT64_MAX) {
+    napi_throw_type_error(env, NULL, "truncate requires fd and non-negative length");
+    return NULL;
+  }
+  if (retry_ftruncate(fd, (off_t)length) != 0) {
+    throw_errno(env, "ftruncate");
+    return NULL;
+  }
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 static napi_value js_close(napi_env env, napi_callback_info cb) {
   size_t argc = 1;
   napi_value args[1];
@@ -409,6 +453,50 @@ static napi_value js_unlinkat(napi_env env, napi_callback_info cb) {
   free(name);
   if (result != 0) {
     throw_errno(env, "unlinkat");
+    return NULL;
+  }
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value js_mkdirat(napi_env env, napi_callback_info cb) {
+  size_t argc = 3;
+  napi_value args[3];
+  napi_get_cb_info(env, cb, &argc, args, NULL, NULL);
+  int32_t root_fd, mode;
+  char *name;
+  if (argc < 3 || !get_int32_arg(env, args[0], &root_fd) || !get_int32_arg(env, args[2], &mode)) {
+    napi_throw_type_error(env, NULL, "mkdirat requires fd, name, and mode");
+    return NULL;
+  }
+  if (!get_valid_entry_arg(env, args[1], &name, "mkdirat")) return NULL;
+  int result = retry_mkdirat(root_fd, name, (mode_t)mode);
+  free(name);
+  if (result != 0) {
+    throw_errno(env, "mkdirat");
+    return NULL;
+  }
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value js_rmdir(napi_env env, napi_callback_info cb) {
+  size_t argc = 2;
+  napi_value args[2];
+  napi_get_cb_info(env, cb, &argc, args, NULL, NULL);
+  int32_t root_fd;
+  char *name;
+  if (argc < 2 || !get_int32_arg(env, args[0], &root_fd)) {
+    napi_throw_type_error(env, NULL, "rmdir requires fd and name");
+    return NULL;
+  }
+  if (!get_valid_entry_arg(env, args[1], &name, "rmdir")) return NULL;
+  int result = retry_rmdir(root_fd, name);
+  free(name);
+  if (result != 0) {
+    throw_errno(env, "rmdir");
     return NULL;
   }
   napi_value undefined;
@@ -547,6 +635,7 @@ static napi_value js_fd_flags(napi_env env, napi_callback_info cb) {
 }
 
 static napi_value js_errno_symbols(napi_env env, napi_callback_info cb) {
+  (void)cb;
   napi_value object;
   napi_create_object(env, &object);
   napi_value value;
@@ -568,10 +657,13 @@ static napi_value init(napi_env env, napi_value exports) {
     {"openat", 0, js_openat, 0, 0, 0, napi_default, 0},
     {"read", 0, js_read, 0, 0, 0, napi_default, 0},
     {"writeAll", 0, js_write_all, 0, 0, 0, napi_default, 0},
+    {"truncate", 0, js_truncate, 0, 0, 0, napi_default, 0},
     {"close", 0, js_close, 0, 0, 0, napi_default, 0},
     {"fsync", 0, js_fsync, 0, 0, 0, napi_default, 0},
     {"renameat", 0, js_renameat, 0, 0, 0, napi_default, 0},
     {"unlinkat", 0, js_unlinkat, 0, 0, 0, napi_default, 0},
+    {"mkdirat", 0, js_mkdirat, 0, 0, 0, napi_default, 0},
+    {"rmdir", 0, js_rmdir, 0, 0, 0, napi_default, 0},
     {"readdir", 0, js_readdir, 0, 0, 0, napi_default, 0},
     {"isLocalFileSystem", 0, js_is_local, 0, 0, 0, napi_default, 0},
     {"tryExclusive", 0, js_try_flock, 0, 0, 0, napi_default, 0},

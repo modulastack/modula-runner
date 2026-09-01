@@ -1,5 +1,5 @@
 import { type BigIntStats, type Stats } from 'node:fs'
-import { lstat, open, readdir, rename, statfs, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, rename, rmdir, statfs, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { loadDarwinRunnerHomeNative, type NativeStat } from './darwinRunnerHomeNative.js'
 
@@ -20,19 +20,22 @@ export type DescriptorRootEntryStat = {
 export type DescriptorChildHandle = FileHandle | { platform: 'darwin'; fd: number }
 
 export interface DescriptorRootAdapter {
-  rootEntryPath(root: FileHandle, entry: string): string
+  rootEntryPath(root: DescriptorChildHandle | FileHandle, entry: string): string
   inspectPath(target: string): Promise<DescriptorRootEntryStat | null>
   stat(handle: DescriptorChildHandle | FileHandle): Promise<DescriptorRootEntryStat>
-  statEntry(root: FileHandle, entry: string): Promise<DescriptorRootEntryStat | null>
-  openEntry(root: FileHandle, entry: string, flags: number, mode?: number): Promise<DescriptorChildHandle | null>
+  statEntry(root: DescriptorChildHandle | FileHandle, entry: string): Promise<DescriptorRootEntryStat | null>
+  openEntry(root: DescriptorChildHandle | FileHandle, entry: string, flags: number, mode?: number): Promise<DescriptorChildHandle | null>
   read(handle: DescriptorChildHandle, limit: number): Promise<Buffer>
   writeAll(handle: DescriptorChildHandle, bytes: Uint8Array): Promise<void>
+  truncate(handle: DescriptorChildHandle, length: number): Promise<void>
   sync(handle: DescriptorChildHandle | FileHandle): Promise<void>
   close(handle: DescriptorChildHandle): Promise<void>
-  rename(root: FileHandle, from: string, to: string): Promise<void>
-  unlink(root: FileHandle, entry: string): Promise<void>
-  readdir(root: FileHandle): Promise<string[]>
-  isLocalFileSystem(root: FileHandle): Promise<boolean>
+  rename(root: DescriptorChildHandle | FileHandle, from: string, to: string): Promise<void>
+  unlink(root: DescriptorChildHandle | FileHandle, entry: string): Promise<void>
+  mkdir(root: DescriptorChildHandle | FileHandle, entry: string, mode: number): Promise<void>
+  rmdir(root: DescriptorChildHandle | FileHandle, entry: string): Promise<void>
+  readdir(root: DescriptorChildHandle | FileHandle): Promise<string[]>
+  isLocalFileSystem(root: DescriptorChildHandle | FileHandle): Promise<boolean>
 }
 
 const LOCAL_LINUX_FILESYSTEMS = new Set([
@@ -48,7 +51,7 @@ export function descriptorRootAdapter(): DescriptorRootAdapter {
 }
 
 function linuxDescriptorRootAdapter(): DescriptorRootAdapter {
-  const rootEntryPath = (root: FileHandle, entry: string) => path.join('/proc/self/fd', String(root.fd), entry)
+  const rootEntryPath = (root: DescriptorChildHandle | FileHandle, entry: string) => path.join('/proc/self/fd', String((root as FileHandle).fd), entry)
   return {
     rootEntryPath,
     inspectPath: async target => statsToEntryStat(await lstat(target, { bigint: true }).catch(error => missingOnly(error))),
@@ -57,10 +60,13 @@ function linuxDescriptorRootAdapter(): DescriptorRootAdapter {
     openEntry: async (root, entry, flags, mode) => await open(rootEntryPath(root, entry), flags, mode).catch(error => missingOnly(error)),
     read: async (handle, limit) => await readFileHandle(handle as FileHandle, limit),
     writeAll: async (handle, bytes) => await writeAllFileHandle(handle as FileHandle, bytes),
+    truncate: async (handle, length) => await (handle as FileHandle).truncate(length),
     sync: async handle => await (handle as FileHandle).sync(),
     close: async handle => await (handle as FileHandle).close(),
     rename: async (root, from, to) => await rename(rootEntryPath(root, from), rootEntryPath(root, to)),
     unlink: async (root, entry) => await unlink(rootEntryPath(root, entry)),
+    mkdir: async (root, entry, mode) => await mkdir(rootEntryPath(root, entry), { mode }),
+    rmdir: async (root, entry) => await rmdir(rootEntryPath(root, entry)),
     readdir: async root => await readdir(rootEntryPath(root, '.')),
     isLocalFileSystem: async root => {
       const info = await statfs(rootEntryPath(root, '.'), { bigint: true })
@@ -80,23 +86,33 @@ function darwinDescriptorRootAdapter(): DescriptorRootAdapter {
       if ('platform' in handle) return nativeStatToEntryStat(native.fstat(handle.fd))!
       return statsToEntryStat(await handle.stat({ bigint: true }))!
     },
-    statEntry: async (root, entry) => nativeStatToEntryStat(native.fstatat(root.fd, entry)),
+    statEntry: async (root, entry) => nativeStatToEntryStat(native.fstatat(fdOf(root), entry)),
     openEntry: async (root, entry, flags, mode) => {
-      const fd = native.openat(root.fd, entry, flags, mode)
+      const fd = native.openat(fdOf(root), entry, flags, mode)
       return fd === null ? null : { platform: 'darwin', fd }
     },
     read: async (handle, limit) => native.read(darwinHandle(handle).fd, limit),
     writeAll: async (handle, bytes) => native.writeAll(darwinHandle(handle).fd, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)),
+    truncate: async (handle, length) => native.truncate(darwinHandle(handle).fd, length),
     sync: async handle => {
       if ('platform' in handle) native.fsync(handle.fd)
       else await handle.sync()
     },
-    close: async handle => native.close(darwinHandle(handle).fd),
-    rename: async (root, from, to) => native.renameat(root.fd, from, root.fd, to),
-    unlink: async (root, entry) => native.unlinkat(root.fd, entry),
-    readdir: async root => native.readdir(root.fd),
-    isLocalFileSystem: async root => native.isLocalFileSystem(root.fd),
+    close: async handle => {
+      if ('platform' in handle) native.close(handle.fd)
+      else await handle.close()
+    },
+    rename: async (root, from, to) => native.renameat(fdOf(root), from, fdOf(root), to),
+    unlink: async (root, entry) => native.unlinkat(fdOf(root), entry),
+    mkdir: async (root, entry, mode) => native.mkdirat(fdOf(root), entry, mode),
+    rmdir: async (root, entry) => native.rmdir(fdOf(root), entry),
+    readdir: async root => native.readdir(fdOf(root)),
+    isLocalFileSystem: async root => native.isLocalFileSystem(fdOf(root)),
   }
+}
+
+function fdOf(handle: DescriptorChildHandle | FileHandle): number {
+  return 'platform' in handle ? handle.fd : handle.fd
 }
 
 function darwinHandle(handle: DescriptorChildHandle): { platform: 'darwin'; fd: number } {

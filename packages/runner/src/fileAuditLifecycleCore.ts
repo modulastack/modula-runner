@@ -10,10 +10,6 @@ import {
   lstat,
   mkdir,
   open,
-  readdir,
-  rename,
-  rm,
-  unlink,
   type FileHandle,
 } from 'node:fs/promises'
 import path from 'node:path'
@@ -37,6 +33,14 @@ import { decodeAuditRecord, encodeAuditRecord } from './auditRecordCodec.js'
 import { createFileRunnerHomeStorage } from './runnerHomeStorage.js'
 import type { RunnerHomeStorage } from './runnerHome.js'
 import { linuxDescriptorRootPath, withLinuxRootLease } from './linuxRootLease.js'
+import {
+  descriptorRootAdapter,
+  identityOf as descriptorIdentityOf,
+  sameIdentity,
+  type DescriptorChildHandle,
+  type DescriptorRootAdapter,
+  type DescriptorRootEntryStat,
+} from './descriptorRootAdapter.js'
 
 export const DIRECTORY_MODE = 0o700
 export const FILE_MODE = 0o600
@@ -64,7 +68,7 @@ export type SealedSegment = {
 }
 export type OpenSegment = Omit<SegmentSummary, 'sha256'> & {
   sequence: number
-  handle: FileHandle
+  handle: DescriptorChildHandle
   identity: DirectoryIdentity
   hash: Hash
   commitBytes: number
@@ -100,9 +104,12 @@ type RecoveredSealed = {
 
 export type RecoveredLifecycle = {
   leaseRoot?: FileHandle
-  directory: FileHandle
+  root: FileHandle
+  adapter: DescriptorRootAdapter
+  directory: DescriptorChildHandle
   directoryIdentity: DirectoryIdentity
   directoryPath: string
+  directoryEntry: string
   uid: number | undefined
   sealed: SealedSegment[]
   current: OpenSegment
@@ -111,7 +118,12 @@ export type RecoveredLifecycle = {
   previousManifestSha256: string | null
 }
 
-export type AuditMigrationHook = (root: string, uid: number | undefined) => Promise<void>
+export type AuditMigrationHook = (
+  root: string,
+  uid: number | undefined,
+  rootHandle?: FileHandle,
+  adapter?: DescriptorRootAdapter,
+) => Promise<void>
 
 async function recoverWithRootLease(
   root: string,
@@ -132,9 +144,10 @@ async function recoverWithRootLease(
       rootHandle,
       null,
       async () => {
-        const boundRoot = linuxDescriptorRootPath(rootHandle)
-        await migrate(boundRoot, uid)
-        const value = await recoverLifecycle(boundRoot, uid, rootHandle)
+        const adapter = descriptorRootAdapter()
+        const boundRoot = process.platform === 'darwin' ? root : linuxDescriptorRootPath(rootHandle)
+        await migrate(boundRoot, uid, rootHandle, adapter)
+        const value = await recoverLifecycle(boundRoot, uid, rootHandle, adapter)
         candidate = { ...value, leaseRoot: rootHandle }
         return candidate
       },
@@ -149,9 +162,9 @@ async function recoverWithRootLease(
     // Cleanup below owns every handle created by a failed open/recovery attempt.
   }
   // Recovery is already unavailable; cleanup failures cannot produce a usable lifecycle.
-  await candidate?.current.handle.close().catch(() => undefined)
+  await closeHandle(candidate, candidate?.current.handle)
   // The audit directory handle has no owner after recovery failure.
-  await candidate?.directory.close().catch(() => undefined)
+  await closeHandle(candidate, candidate?.directory)
   // The root handle must release any lease even though recovery failed.
   await leaseRoot?.close().catch(() => undefined)
   return null
@@ -265,7 +278,7 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     try {
       const bytes = encodeAuditRecord(record, String(this.nextRecordSequence))
       if (this.mustRotate(bytes.byteLength)) await this.rotate()
-      await assertDirectoryBound(this.recovered.directory, this.recovered.directoryIdentity, this.recovered.directoryPath, this.recovered.uid)
+      await assertDirectoryBound(this.recovered)
       const pendingCommit = openCommit(
         this.current.sequence,
         this.current.byteCount,
@@ -281,10 +294,10 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
       await writeOpenCommit(this.recovered, pendingCommit, pendingBytes)
       this.metadataBytes += pendingBytes.byteLength - this.current.commitBytes
       this.current.commitBytes = pendingBytes.byteLength
-      await writeAll(this.current.handle, bytes)
-      await this.current.handle.sync()
-      await assertSegmentBound(this.current, this.recovered.directoryPath, this.recovered.uid)
-      await assertDirectoryBound(this.recovered.directory, this.recovered.directoryIdentity, this.recovered.directoryPath, this.recovered.uid)
+      await writeAll(this.recovered, this.current.handle, bytes)
+      await syncHandle(this.recovered, this.current.handle)
+      await assertSegmentBound(this.recovered, this.current)
+      await assertDirectoryBound(this.recovered)
       const nextHash = this.current.hash.copy().update(bytes)
       const commit = openCommit(
         this.current.sequence,
@@ -321,11 +334,10 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     if (this.current.records === 0) throw new Error('an empty audit segment cannot rotate')
     if (this.sealed.length + 1 >= MAX_RESIDENT_AUDIT_SEGMENTS) throw new Error('audit lifecycle requires operator archive')
     const sequence = this.current.sequence
-    const sealedPath = path.join(this.recovered.directoryPath, segmentName(sequence, 'jsonl'))
-    await this.current.handle.sync()
-    await assertSegmentBound(this.current, this.recovered.directoryPath, this.recovered.uid)
-    await this.current.handle.close()
-    await rename(path.join(this.recovered.directoryPath, segmentName(sequence, 'open')), sealedPath)
+    await syncHandle(this.recovered, this.current.handle)
+    await assertSegmentBound(this.recovered, this.current)
+    await closeHandle(this.recovered, this.current.handle)
+    await this.recovered.adapter.rename(this.recovered.directory, segmentName(sequence, 'open'), segmentName(sequence, 'jsonl'))
     await syncDirectory(this.recovered)
     const manifest = manifestFor(sequence, {
       byteCount: this.current.byteCount,
@@ -339,7 +351,7 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     const nextMetadata = this.metadataBytes + manifestBytes.byteLength + emptyCommitBytes.byteLength
       - this.current.commitBytes
     if (nextMetadata > MAX_AUDIT_METADATA_BYTES) throw new Error('audit metadata capacity exhausted')
-    await unlink(path.join(this.recovered.directoryPath, segmentName(sequence, 'commit.json')))
+    await this.recovered.adapter.unlink(this.recovered.directory, segmentName(sequence, 'commit.json'))
     await syncDirectory(this.recovered)
     this.previousManifestSha256 = sha256(manifestBytes)
     this.sealed.push({ manifest, manifestBytes })
@@ -351,9 +363,9 @@ class FileRunnerAuditLifecycle implements RunnerAuditLifecycle {
     if (this.closed) return
     this.closed = true
     const operations = [
-      async () => await this.current.handle.sync(),
-      async () => await this.current.handle.close(),
-      async () => await this.recovered.directory.close(),
+      async () => await syncHandle(this.recovered, this.current.handle),
+      async () => await closeHandle(this.recovered, this.current.handle),
+      async () => await closeHandle(this.recovered, this.recovered.directory),
       async () => await this.recovered.leaseRoot?.close(),
       async () => await this.storage?.release?.(),
       async () => await this.storage?.close?.(),
@@ -378,12 +390,12 @@ async function attemptAll(operations: readonly (() => Promise<unknown>)[]): Prom
 export async function readMigrationMarker(
   recovered: RecoveryPath,
 ): Promise<{ value: MigrationMarker; bytes: Buffer }> {
-  const target = path.join(recovered.directoryPath, MIGRATION_MARKER)
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, MIGRATION_MARKER, constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing migration marker')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid migration marker')
-    const bytes = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_METADATA_BYTES) throw new Error('invalid migration marker')
+    const bytes = await readAll(recovered, handle, Number(info.size))
     const value = JSON.parse(bytes.toString('utf8')) as MigrationMarker
     if (!Buffer.from(`${JSON.stringify(value)}\n`).equals(bytes)
       || value.schemaVersion !== 1 || !sha256Value(value.legacySha256)
@@ -394,24 +406,28 @@ export async function readMigrationMarker(
     }
     return { value, bytes }
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
 export async function recoverLifecycle(
-  root: string,
+  rootPath: string,
   uid: number | undefined,
   rootHandle?: FileHandle,
+  providedAdapter?: DescriptorRootAdapter,
 ): Promise<RecoveredLifecycle> {
-  const directoryPath = path.join(root, AUDIT_DIRECTORY)
-  await ensureAuditDirectory(root, directoryPath, uid, rootHandle)
-  const directory = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  const directoryPath = path.join(rootPath, AUDIT_DIRECTORY)
+  const adapter = providedAdapter ?? descriptorRootAdapter()
+  const rootDirectory = rootHandle ?? await open(rootPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  await ensureAuditDirectory(rootPath, directoryPath, uid, rootDirectory, adapter)
+  const directory = await adapter.openEntry(rootDirectory, AUDIT_DIRECTORY, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  if (!directory) throw new Error('missing audit directory')
   try {
-    const directoryInfo = await directory.stat({ bigint: true })
+    const directoryInfo = await adapter.stat(directory)
     if (!secureDirectory(directoryInfo, uid)) throw new Error('insecure audit directory')
-    const recovered = { directory, directoryIdentity: identityOf(directoryInfo), directoryPath, uid }
+    const recovered = { root: rootDirectory, adapter, directory, directoryIdentity: identityOf(directoryInfo), directoryPath, directoryEntry: AUDIT_DIRECTORY, uid }
     await removeInterruptedTemps(recovered)
-    const entries = await readdir(directoryPath)
+    const entries = await adapter.readdir(directory)
     const migration = entries.includes(MIGRATION_MARKER) ? await readMigrationMarker(recovered) : undefined
     const grouped = classifyEntries(entries)
     if (grouped.commits.some(sequence => !grouped.segments.includes(sequence) && !grouped.opens.includes(sequence))) {
@@ -450,7 +466,8 @@ export async function recoverLifecycle(
     }
   } catch (error) {
     // Recovery's original integrity failure is the actionable error; cleanup cannot replace it.
-    await directory.close().catch(() => undefined)
+    await adapter.close(directory).catch(() => undefined)
+    if (!rootHandle) await rootDirectory.close().catch(() => undefined)
     throw error
   }
 }
@@ -460,10 +477,12 @@ async function ensureAuditDirectory(
   directoryPath: string,
   uid: number | undefined,
   rootHandle?: FileHandle,
+  adapter = descriptorRootAdapter(),
 ): Promise<void> {
-  const held = await lstat(directoryPath).catch(error => missingOnly(error))
+  const held = rootHandle ? await adapter.statEntry(rootHandle, AUDIT_DIRECTORY) : await lstat(directoryPath).catch(error => missingOnly(error))
   if (held === null) {
-    await mkdir(directoryPath, { mode: DIRECTORY_MODE })
+    if (rootHandle) await adapter.mkdir(rootHandle, AUDIT_DIRECTORY, DIRECTORY_MODE)
+    else await mkdir(directoryPath, { mode: DIRECTORY_MODE })
     if (rootHandle) {
       await rootHandle.sync()
     } else {
@@ -475,7 +494,8 @@ async function ensureAuditDirectory(
       }
     }
   }
-  const info = await lstat(directoryPath)
+  const info = rootHandle ? await adapter.statEntry(rootHandle, AUDIT_DIRECTORY) : await lstat(directoryPath)
+  if (!info) throw new Error('missing audit directory')
   if (!secureDirectory(info, uid)) throw new Error('insecure audit directory')
 }
 
@@ -556,11 +576,11 @@ export async function recoverSealed(
       if (!scan) throw new Error('audit commit has no resident segment')
       const { commit } = await readOpenCommit(recovered, sequence)
       if (!commitMatches(commit, sequence, scan)) throw new Error('audit open commit mismatch')
-      await unlink(path.join(recovered.directoryPath, segmentName(sequence, 'commit.json')))
+      await recovered.adapter.unlink(recovered.directory, segmentName(sequence, 'commit.json'))
       await syncDirectory(recovered)
     }
     if (scan && tombstone) {
-      await unlink(path.join(recovered.directoryPath, segmentName(sequence, 'jsonl')))
+      await recovered.adapter.unlink(recovered.directory, segmentName(sequence, 'jsonl'))
       await syncDirectory(recovered)
       scan = null
     }
@@ -585,12 +605,12 @@ export async function recoverSealed(
 }
 
 export async function createOpenSegment(recovered: RecoveryPath, sequence: number): Promise<OpenSegment> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, 'open'))
-  const handle = await open(target, constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, 'open'), constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+  if (!handle) throw new Error('audit segment already exists')
   try {
-    const info = await handle.stat({ bigint: true })
+    const info = await recovered.adapter.stat(handle)
     if (!secureRecord(info, recovered.uid)) throw new Error('insecure audit segment')
-    await handle.sync()
+    await syncHandle(recovered, handle)
     await syncDirectory(recovered)
     const commit = openCommit(sequence, 0, 0, null, sha256(Buffer.alloc(0)))
     const commitBytes = encodeOpenCommit(commit)
@@ -608,7 +628,7 @@ export async function createOpenSegment(recovered: RecoveryPath, sequence: numbe
     }
   } catch (error) {
     // Segment creation already failed closed; a close error cannot make it available.
-    await handle.close().catch(() => undefined)
+    await closeHandle(recovered, handle)
     throw error
   }
 }
@@ -618,12 +638,12 @@ export async function openExistingSegment(
   sequence: number,
   hasCommit: boolean,
 ): Promise<OpenSegment> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, 'open'))
-  const handle = await open(target, constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, 'open'), constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing audit open segment')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_SEGMENT_BYTES)) throw new Error('insecure audit segment')
-    const raw = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_SEGMENT_BYTES) throw new Error('insecure audit segment')
+    const raw = await readAll(recovered, handle, Number(info.size))
     const held = hasCommit
       ? await readOpenCommit(recovered, sequence)
       : { commit: openCommit(sequence, 0, 0, null, sha256(Buffer.alloc(0))), bytes: Buffer.alloc(0) }
@@ -638,8 +658,8 @@ export async function openExistingSegment(
       throw new Error('audit open segment has an unproved tail')
     }
     if (tail.byteLength > 0) {
-      await handle.truncate(held.commit.bytes)
-      await handle.sync()
+      await recovered.adapter.truncate(handle, held.commit.bytes)
+      await syncHandle(recovered, handle)
     }
     const finalCommit = openCommit(sequence, scan.byteCount, scan.records, scan.lastRecordSequence, scan.sha256)
     const commitBytes = encodeOpenCommit(finalCommit)
@@ -658,7 +678,7 @@ export async function openExistingSegment(
       commitBytes: commitBytes.byteLength,
     }
   } catch (error) {
-    await handle.close()
+    await closeHandle(recovered, handle)
     throw error
   }
 }
@@ -668,14 +688,14 @@ async function scanSegment(
   sequence: number,
   extension: 'jsonl',
 ): Promise<SegmentScan> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, extension))
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, extension), constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing audit segment')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_SEGMENT_BYTES)) throw new Error('invalid audit segment')
-    return scanAuditBytes(await readAll(handle, Number(info.size)))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_SEGMENT_BYTES) throw new Error('invalid audit segment')
+    return scanAuditBytes(await readAll(recovered, handle, Number(info.size)))
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
@@ -685,12 +705,12 @@ async function scanLegacySegment(
   firstRecordSequence: number,
   lastRecordSequence: number,
 ): Promise<SegmentScan> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, 'jsonl'))
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, 'jsonl'), constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing legacy audit segment')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_SEGMENT_BYTES)) throw new Error('invalid legacy audit segment')
-    const bytes = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_SEGMENT_BYTES) throw new Error('invalid legacy audit segment')
+    const bytes = await readAll(recovered, handle, Number(info.size))
     const records = splitRecordLines(bytes)
     if (records.length === 0 || records.length > MAX_AUDIT_SEGMENT_RECORDS
       || lastRecordSequence - firstRecordSequence + 1 !== records.length) throw new Error('invalid legacy audit record count')
@@ -706,7 +726,7 @@ async function scanLegacySegment(
       sha256: sha256(bytes),
     }
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
@@ -792,7 +812,7 @@ function scanAuditBytes(bytes: Buffer): SegmentScan {
   }
 }
 
-function manifestFor(
+export function manifestFor(
   sequence: number,
   scan: SegmentSummary,
   previousManifestSha256: string | null,
@@ -812,7 +832,7 @@ function manifestFor(
   }
 }
 
-function openCommit(
+export function openCommit(
   sequence: number,
   bytes: number,
   records: number,
@@ -831,7 +851,7 @@ function openCommit(
   }
 }
 
-function encodeOpenCommit(commit: OpenCommit): Buffer {
+export function encodeOpenCommit(commit: OpenCommit): Buffer {
   return Buffer.from(`${JSON.stringify(commit)}\n`)
 }
 
@@ -840,38 +860,39 @@ async function writeOpenCommit(
   commit: OpenCommit,
   bytes = encodeOpenCommit(commit),
 ): Promise<void> {
-  const finalPath = path.join(recovered.directoryPath, segmentName(Number(commit.segmentSequence), 'commit.json'))
-  const temporary = `${finalPath.replace(/\.json$/, '')}.tmp-${randomBytes(16).toString('hex')}`
-  let handle: FileHandle | undefined
+  const finalName = segmentName(Number(commit.segmentSequence), 'commit.json')
+  const temporary = `${finalName.replace(/\.json$/, '')}.tmp-${randomBytes(16).toString('hex')}`
+  let handle: DescriptorChildHandle | null = null
   try {
-    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
-    await writeAll(handle, bytes)
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(temporary, finalPath)
+    handle = await openAuditEntry(recovered, temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+    if (!handle) throw new Error('audit temporary already exists')
+    await writeAll(recovered, handle, bytes)
+    await syncHandle(recovered, handle)
+    await closeHandle(recovered, handle)
+    handle = null
+    await recovered.adapter.rename(recovered.directory, temporary, finalName)
     await syncDirectory(recovered)
   } catch (error) {
     // The commit update failed closed; its temporary name is never authoritative.
-    await handle?.close().catch(() => undefined)
+    await closeHandle(recovered, handle)
     // An unremovable temp is ignored during recovery because only commit.json is authoritative.
-    await unlink(temporary).catch(() => undefined)
+    await recovered.adapter.unlink(recovered.directory, temporary).catch(() => undefined)
     throw error
   }
 }
 
 async function readOpenCommit(recovered: RecoveryPath, sequence: number): Promise<{ commit: OpenCommit; bytes: Buffer }> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, 'commit.json'))
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, 'commit.json'), constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing audit commit')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid audit commit')
-    const bytes = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_METADATA_BYTES) throw new Error('invalid audit commit')
+    const bytes = await readAll(recovered, handle, Number(info.size))
     const commit = JSON.parse(bytes.toString('utf8')) as OpenCommit
     if (!Buffer.from(`${JSON.stringify(commit)}\n`).equals(bytes)) throw new Error('noncanonical audit commit')
     return { commit, bytes }
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
@@ -902,38 +923,39 @@ function commitMatches(commit: OpenCommit, sequence: number, scan: SegmentSummar
 
 export async function writeManifest(recovered: RecoveryPath, manifest: AuditSegmentManifest): Promise<Buffer> {
   const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`)
-  const finalPath = path.join(recovered.directoryPath, segmentName(Number(manifest.sequence), 'manifest.json'))
-  const temporary = `${finalPath.replace(/\.json$/, '')}.tmp-${randomBytes(16).toString('hex')}`
-  let handle: FileHandle | undefined
+  const finalName = segmentName(Number(manifest.sequence), 'manifest.json')
+  const temporary = `${finalName.replace(/\.json$/, '')}.tmp-${randomBytes(16).toString('hex')}`
+  let handle: DescriptorChildHandle | null = null
   try {
-    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
-    await writeAll(handle, bytes)
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(temporary, finalPath)
+    handle = await openAuditEntry(recovered, temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, FILE_MODE)
+    if (!handle) throw new Error('audit temporary already exists')
+    await writeAll(recovered, handle, bytes)
+    await syncHandle(recovered, handle)
+    await closeHandle(recovered, handle)
+    handle = null
+    await recovered.adapter.rename(recovered.directory, temporary, finalName)
     await syncDirectory(recovered)
     return bytes
   } catch (error) {
     // The manifest write/rename failure is primary; best-effort private-temp cleanup changes no state.
-    await handle?.close().catch(() => undefined)
+    await closeHandle(recovered, handle)
     // An unremovable temp is inert because only the final manifest name commits a seal.
-    await unlink(temporary).catch(() => undefined)
+    await recovered.adapter.unlink(recovered.directory, temporary).catch(() => undefined)
     throw error
   }
 }
 
 async function readManifest(recovered: RecoveryPath, sequence: number): Promise<{ manifest: AuditSegmentManifest; bytes: Buffer }> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, 'manifest.json'))
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, 'manifest.json'), constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing audit manifest')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid audit manifest')
-    const bytes = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_METADATA_BYTES) throw new Error('invalid audit manifest')
+    const bytes = await readAll(recovered, handle, Number(info.size))
     const manifest = JSON.parse(bytes.toString('utf8')) as AuditSegmentManifest
     return { manifest, bytes }
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
@@ -1019,69 +1041,70 @@ async function readMetadata(
   sequence: number,
   extension: 'ack.json' | 'tombstone.json',
 ): Promise<{ value: unknown; bytes: Buffer }> {
-  const target = path.join(recovered.directoryPath, segmentName(sequence, extension))
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+  const handle = await openAuditEntry(recovered, segmentName(sequence, extension), constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle) throw new Error('missing audit metadata')
   try {
-    const info = await handle.stat({ bigint: true })
-    if (!secureRecord(info, recovered.uid) || info.size > BigInt(MAX_AUDIT_METADATA_BYTES)) throw new Error('invalid audit metadata')
-    const bytes = await readAll(handle, Number(info.size))
+    const info = await recovered.adapter.stat(handle)
+    if (!secureRecord(info, recovered.uid) || info.size > MAX_AUDIT_METADATA_BYTES) throw new Error('invalid audit metadata')
+    const bytes = await readAll(recovered, handle, Number(info.size))
     const value = JSON.parse(bytes.toString('utf8')) as unknown
     if (!Buffer.from(`${JSON.stringify(value)}\n`).equals(bytes)) throw new Error('noncanonical audit metadata')
     return { value, bytes }
   } finally {
-    await handle.close()
+    await closeHandle(recovered, handle)
   }
 }
 
 async function removeInterruptedTemps(recovered: RecoveryPath): Promise<void> {
-  const entries = await readdir(recovered.directoryPath)
+  const entries = await recovered.adapter.readdir(recovered.directory)
   let removed = false
   for (const entry of entries) {
     if (!TEMP_METADATA_PATTERN.test(entry)) continue
-    const target = path.join(recovered.directoryPath, entry)
-    const info = await lstat(target)
+    const info = await recovered.adapter.statEntry(recovered.directory, entry)
+    if (!info) throw new Error('missing audit temporary')
     if (!secureRecord(info, recovered.uid)) throw new Error('insecure audit temporary')
-    await unlink(target)
+    await recovered.adapter.unlink(recovered.directory, entry)
     removed = true
   }
   if (removed) await syncDirectory(recovered)
 }
 
 export type RecoveryPath = {
-  directory: FileHandle
+  root: FileHandle
+  adapter: DescriptorRootAdapter
+  directory: DescriptorChildHandle
   directoryIdentity: DirectoryIdentity
   directoryPath: string
+  directoryEntry: string
   uid: number | undefined
 }
 
 export async function syncDirectory(recovered: RecoveryPath): Promise<void> {
-  await recovered.directory.sync()
-  await assertDirectoryBound(recovered.directory, recovered.directoryIdentity, recovered.directoryPath, recovered.uid)
+  await syncHandle(recovered, recovered.directory)
+  await assertDirectoryBound(recovered)
 }
 
 async function assertSegmentBound(
+  recovered: RecoveryPath,
   segment: OpenSegment,
-  directoryPath: string,
-  uid: number | undefined,
 ): Promise<void> {
-  const target = path.join(directoryPath, segmentName(segment.sequence, 'open'))
-  const [held, current] = await Promise.all([segment.handle.stat({ bigint: true }), lstat(target, { bigint: true })])
-  if (!secureRecord(held, uid) || !secureRecord(current, uid)) throw new Error('audit segment custody changed')
-  if (held.dev !== segment.identity.device || held.ino !== segment.identity.inode
-    || current.dev !== segment.identity.device || current.ino !== segment.identity.inode) {
+  const [held, current] = await Promise.all([
+    recovered.adapter.stat(segment.handle),
+    recovered.adapter.statEntry(recovered.directory, segmentName(segment.sequence, 'open')),
+  ])
+  if (!current || !secureRecord(held, recovered.uid) || !secureRecord(current, recovered.uid)) throw new Error('audit segment custody changed')
+  if (!sameIdentity(held, segment.identity) || !sameIdentity(current, segment.identity)) {
     throw new Error('audit segment identity changed')
   }
 }
 
-async function assertDirectoryBound(
-  handle: FileHandle,
-  identity: DirectoryIdentity,
-  target: string,
-  uid: number | undefined,
-): Promise<void> {
-  const [held, current] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })])
-  if (!secureDirectory(held, uid) || !secureDirectory(current, uid)) throw new Error('audit directory custody changed')
-  if (held.dev !== identity.device || held.ino !== identity.inode || current.dev !== identity.device || current.ino !== identity.inode) {
+async function assertDirectoryBound(recovered: RecoveryPath): Promise<void> {
+  const [held, current] = await Promise.all([
+    recovered.adapter.stat(recovered.directory),
+    recovered.adapter.statEntry(recovered.root, recovered.directoryEntry),
+  ])
+  if (!current || !secureDirectory(held, recovered.uid) || !secureDirectory(current, recovered.uid)) throw new Error('audit directory custody changed')
+  if (!sameIdentity(held, recovered.directoryIdentity) || !sameIdentity(current, recovered.directoryIdentity)) {
     throw new Error('audit directory identity changed')
   }
 }
@@ -1098,24 +1121,14 @@ export function splitRecordLines(bytes: Buffer): Buffer[] {
   return records
 }
 
-export async function readAll(handle: FileHandle, size: number): Promise<Buffer> {
-  const bytes = Buffer.alloc(size)
-  let offset = 0
-  while (offset < size) {
-    const { bytesRead } = await handle.read(bytes, offset, size - offset, offset)
-    if (bytesRead === 0) throw new Error('audit file ended before its reported size')
-    offset += bytesRead
-  }
+export async function readAll(recovered: Pick<RecoveryPath, 'adapter'>, handle: DescriptorChildHandle, size: number): Promise<Buffer> {
+  const bytes = await recovered.adapter.read(handle, size)
+  if (bytes.byteLength !== size) throw new Error('audit file ended before its reported size')
   return bytes
 }
 
-export async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
-  let offset = 0
-  while (offset < bytes.byteLength) {
-    const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset)
-    if (bytesWritten === 0) throw new Error('audit write made no progress')
-    offset += bytesWritten
-  }
+export async function writeAll(recovered: Pick<RecoveryPath, 'adapter'>, handle: DescriptorChildHandle, bytes: Uint8Array): Promise<void> {
+  await recovered.adapter.writeAll(handle, bytes)
 }
 
 export function segmentName(
@@ -1132,16 +1145,35 @@ function parseSegmentSequence(value: string): number {
   return parsed
 }
 
-export function secureDirectory(info: Stats | BigIntStats, uid: number | undefined): boolean {
+export async function openAuditEntry(
+  recovered: RecoveryPath,
+  entry: string,
+  flags: number,
+  mode?: number,
+): Promise<DescriptorChildHandle | null> {
+  return await recovered.adapter.openEntry(recovered.directory, entry, flags, mode)
+}
+
+export async function syncHandle(recovered: Pick<RecoveryPath, 'adapter'> | undefined, handle: DescriptorChildHandle | FileHandle | null | undefined): Promise<void> {
+  if (!recovered || !handle) return
+  await recovered.adapter.sync(handle)
+}
+
+export async function closeHandle(recovered: Pick<RecoveryPath, 'adapter'> | undefined, handle: DescriptorChildHandle | null | undefined): Promise<void> {
+  if (!recovered || !handle) return
+  await recovered.adapter.close(handle).catch(() => undefined)
+}
+
+export function secureDirectory(info: Stats | BigIntStats | DescriptorRootEntryStat, uid: number | undefined): boolean {
   return info.isDirectory() && (uid === undefined || Number(info.uid) === uid) && (Number(info.mode) & 0o777) === DIRECTORY_MODE
 }
 
-export function secureRecord(info: Stats | BigIntStats, uid: number | undefined): boolean {
+export function secureRecord(info: Stats | BigIntStats | DescriptorRootEntryStat, uid: number | undefined): boolean {
   return info.isFile() && (uid === undefined || Number(info.uid) === uid) && (Number(info.mode) & 0o777) === FILE_MODE && Number(info.nlink) === 1
 }
 
-export function identityOf(info: BigIntStats): DirectoryIdentity {
-  return { device: info.dev, inode: info.ino }
+export function identityOf(info: BigIntStats | DescriptorRootEntryStat): DirectoryIdentity {
+  return descriptorIdentityOf(info)
 }
 
 export function sha256(bytes: Uint8Array): string {

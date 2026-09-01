@@ -77,7 +77,7 @@ describeOnDarwin('Darwin runner-home native descriptor adapter', () => {
     expect(result.status).toBe(0)
     expect(JSON.parse(result.stdout)).toEqual({
       status: 'verified',
-      sha256: '55b028f57545276d7729ad468fe40992870c5e7b35e3cf7eb5ad8cfbb8232bde',
+      sha256: '3f020304746900a51d130162bfc46fa5277cb1fc27d6137a7dcfc2aec8f83b0b',
     })
   })
 })

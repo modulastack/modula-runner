@@ -20,10 +20,13 @@ type DarwinRunnerHomeNative = {
   openat(rootFd: number, name: string, flags: number, mode?: number): number | null
   read(fd: number, limit: number): Buffer
   writeAll(fd: number, bytes: Buffer): void
+  truncate(fd: number, length: number): void
   close(fd: number): void
   fsync(fd: number): void
   renameat(fromFd: number, fromName: string, toFd: number, toName: string): void
   unlinkat(rootFd: number, name: string): void
+  mkdirat(rootFd: number, name: string, mode: number): void
+  rmdir(rootFd: number, name: string): void
   readdir(rootFd: number): string[]
   isLocalFileSystem(rootFd: number): boolean
   tryExclusive(fd: number): 'acquired' | 'contended'
@@ -34,7 +37,7 @@ type DarwinRunnerHomeNative = {
 
 const binary = {
   file: 'darwin-runner-home-arm64-node-22.0.0.node',
-  sha256: '55b028f57545276d7729ad468fe40992870c5e7b35e3cf7eb5ad8cfbb8232bde',
+  sha256: '3f020304746900a51d130162bfc46fa5277cb1fc27d6137a7dcfc2aec8f83b0b',
 }
 
 export function loadDarwinRunnerHomeNative(): DarwinRunnerHomeNative {
