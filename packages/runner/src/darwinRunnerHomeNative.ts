@@ -28,11 +28,13 @@ type DarwinRunnerHomeNative = {
   isLocalFileSystem(rootFd: number): boolean
   tryExclusive(fd: number): 'acquired' | 'contended'
   unlock(fd: number): void
+  fdFlags(fd: number): number
+  errnoSymbols(): { EBADF: 'EBADF'; EINVAL: 'EINVAL'; EIO: 'EIO'; ENOENT: 'ENOENT' }
 }
 
 const binary = {
   file: 'darwin-runner-home-arm64-node-22.0.0.node',
-  sha256: 'f4390997eda1e586a225c12420b521b4ba170723c4033d61ade8d083a1742dfc',
+  sha256: '55b028f57545276d7729ad468fe40992870c5e7b35e3cf7eb5ad8cfbb8232bde',
 }
 
 export function loadDarwinRunnerHomeNative(): DarwinRunnerHomeNative {
