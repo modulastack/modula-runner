@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { appendFile, mkdtemp, open as openFile, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -422,6 +423,9 @@ describe('CP-5 append-only audit acceptance available at the IC-1 interface', ()
     expect(outcomeAttempts).toBeGreaterThan(1)
     expect(exitSent).toBe(false)
     await session.dispose(false)
+    // The withheld EXIT never reaches the dead-pane kill, and disposal without a kill leaves the
+    // remain-on-exit pane by design; the test owns that server and takes it down itself.
+    spawnSync('tmux', ['-L', session.ref.socket, 'kill-server'], { stdio: 'ignore' })
   })
 
   it('AS-21 eventually records and emits pane EXIT after an outage longer than one retry burst', async () => {
