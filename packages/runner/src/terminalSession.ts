@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants as fsConstants, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { constants as osConstants, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -127,6 +127,11 @@ function assertSessionMetadata(spec: { command: string; cwd: string; profile: st
 
 let nodePtyHelperPrepared = false
 
+// node-pty's Darwin prebuild ships its spawn-helper without an execute bit, and npm preserves
+// that on install, so every pty spawn would fail with EACCES on a clean install. The helper is
+// the one exact file node-pty will exec for this platform and architecture; it gains only the
+// owner's execute bit — nothing is widened for other users — and the result is checked, so a
+// helper that still cannot run fails the attach here rather than as a silently dead pty.
 function ensureNodePtySpawnHelperExecutable() {
   if (nodePtyHelperPrepared || process.platform !== 'darwin') return
   const helper = path.resolve(
@@ -136,7 +141,9 @@ function ensureNodePtySpawnHelperExecutable() {
     `${process.platform}-${process.arch}`,
     'spawn-helper',
   )
-  chmodSync(helper, 0o755)
+  const mode = statSync(helper).mode & 0o777
+  if ((mode & 0o100) === 0) chmodSync(helper, mode | 0o100)
+  accessSync(helper, fsConstants.X_OK)
   nodePtyHelperPrepared = true
 }
 

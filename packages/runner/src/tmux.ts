@@ -364,9 +364,17 @@ async function runPoll(socket: string) {
   }
 }
 
+// A pane record: two 0/1 flags, then the session name to the end of the line.
+const PANE_RECORD = /^([01]) ([01]) (.+)$/
+
 function listPanes(socket: string, seam: SpawnSeam): Promise<Map<string, PaneStatus> | null> {
   if (!tmuxAllowed(seam)) return Promise.resolve(null)
-  const args = ['-L', socket, 'list-panes', '-a', '-F', '#{session_name}\t#{pane_in_mode}\t#{pane_dead}']
+  // The listing is one printable line per pane, flags first and the session name last: tmux
+  // rewrites control characters in command output (3.6 prints a tab as `_`), so a tab-separated
+  // record silently stops parsing on a newer server and every session reads as absent — which
+  // the aggregation below would report as dead. The two flags are single characters, so a
+  // free-form name — spaces included — is whatever follows them.
+  const args = ['-L', socket, 'list-panes', '-a', '-F', '#{pane_in_mode} #{pane_dead} #{session_name}']
   return new Promise(resolve => {
     execFile('tmux', args, { encoding: 'utf8', timeout: TMUX_TIMEOUT_MS }, (error, stdout) => {
       if (error && !answered(error)) return resolve(null)
@@ -374,8 +382,10 @@ function listPanes(socket: string, seam: SpawnSeam): Promise<Map<string, PaneSta
       // pane is in copy mode, and dead only when they all are — a command that
       // splits its own window must not be retired by its first pane exiting.
       const panes = new Map<string, PaneStatus>()
-      for (const line of stdout.split('\n').filter(Boolean)) {
-        const [name, held, dead] = line.split('\t')
+      for (const line of stdout.split('\n')) {
+        const record = PANE_RECORD.exec(line)
+        if (!record) continue
+        const [, held = '', dead = '', name = ''] = record
         if (!name) continue
         const seen = panes.get(name)
         panes.set(name, {
