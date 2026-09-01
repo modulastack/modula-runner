@@ -394,6 +394,7 @@ function statusValue(
     : null
   return {
     state: snapshot.state,
+    ...(snapshot.state === 'unpaired' ? { status: 'ready' as const } : {}),
     ...(record ? { runnerId: record.runnerId, controlPlaneOrigin: record.controlPlaneOrigin } : {}),
     containment: containment.disposition,
     prevention: containment.prevention,
@@ -512,12 +513,20 @@ async function ownedDirectory(candidate: string, cwd: string): Promise<string | 
     const lexical = await lstat(absolute)
     if (!lexical.isDirectory() || lexical.isSymbolicLink() || lexical.uid !== process.getuid?.()) return null
     const resolved = await realpath(absolute)
-    if (resolved !== absolute) return null
+    if (!samePath(resolved, absolute)) return null
     const held = await stat(resolved)
-    return held.isDirectory() && held.uid === process.getuid?.() ? resolved : null
+    return held.isDirectory() && held.uid === process.getuid?.() ? absolute : null
   } catch {
     return null
   }
+}
+
+function samePath(left: string, right: string) {
+  const normalize = (value: string) => {
+    const resolved = path.resolve(value)
+    return process.platform === 'darwin' ? resolved.replace(/^\/private\/var\//, '/var/') : resolved
+  }
+  return normalize(left) === normalize(right)
 }
 
 function runnerInfo(version: string) {

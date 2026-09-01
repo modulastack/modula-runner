@@ -9,11 +9,13 @@ const MAX_CHANNELS = 1024
 const COMPACT_THRESHOLD = 256
 
 type BufferedFrame = { frame: DataFrame; bytes: number }
+export type ChannelRecoveryMode = 'buffered' | 'application-reset'
 
 export type ChannelState = {
   id: string
   kind: ChannelKind
   attachToken: string
+  recovery: ChannelRecoveryMode
   sentSeq: number
   receivedSeq: number
   flushedSeq: number
@@ -48,12 +50,13 @@ export class ChannelStore {
     this.totalLimit = totalBufferBytes
   }
 
-  open(kind: ChannelKind): ChannelState {
+  open(kind: ChannelKind, recovery: ChannelRecoveryMode = 'buffered'): ChannelState {
     if (this.channels.size >= MAX_CHANNELS) throw new Error(`channel roster limit reached (${MAX_CHANNELS})`)
     const state: ChannelState = {
       id: randomUUID(),
       kind,
       attachToken: randomBytes(24).toString('base64url'),
+      recovery,
       sentSeq: 0,
       receivedSeq: 0,
       flushedSeq: 0,
@@ -67,6 +70,11 @@ export class ChannelStore {
 
   get(id: string) {
     return this.channels.get(id)
+  }
+
+  setRecovery(id: string, recovery: ChannelRecoveryMode) {
+    const state = this.require(id)
+    state.recovery = recovery
   }
 
   ids() {

@@ -31,12 +31,22 @@ afterAll(async () => {
 
 describe('CP-5 IC-4 runner-process auth-store tracing', () => {
   it('AS-25 attributes no Claude or Codex auth-store open to the representative runner PID', () => {
+    if (process.platform !== 'linux') {
+      expect(trace).toEqual(expect.objectContaining({ status: 'inconclusive', capability: 'linux-procfs' }))
+      expect(() => requireTracePass(trace)).toThrow(/INCONCLUSIVE \(linux-procfs\)/)
+      return
+    }
     requireTracePass(trace)
     expect(openedFileCalls(trace.runnerTrace)).not.toContain(claudeCanary)
     expect(openedFileCalls(trace.runnerTrace)).not.toContain(codexCanary)
   })
 
   it('AS-26 observes the CLI fixture auth reads only in descendant PID traces', () => {
+    if (process.platform !== 'linux') {
+      expect(trace).toEqual(expect.objectContaining({ status: 'inconclusive', capability: 'linux-procfs' }))
+      expect(() => requireTracePass(trace)).toThrow(/INCONCLUSIVE \(linux-procfs\)/)
+      return
+    }
     requireTracePass(trace)
     expect(openedFileCalls(trace.descendantTrace)).toContain(claudeCanary)
     expect(openedFileCalls(trace.descendantTrace)).toContain(codexCanary)
@@ -51,6 +61,11 @@ describe('CP-5 IC-4 runner-process auth-store tracing', () => {
       codexCanary,
       stracePath: join(directory, 'missing-strace'),
     })
+    if (process.platform !== 'linux') {
+      expect(result).toEqual(expect.objectContaining({ status: 'inconclusive', capability: 'linux-procfs' }))
+      expect(() => requireTracePass(result)).toThrow(/INCONCLUSIVE \(linux-procfs\)/)
+      return
+    }
     expect(result).toEqual(expect.objectContaining({ status: 'inconclusive', capability: 'syscall-tracing' }))
     expect(() => requireTracePass(result)).toThrow(/INCONCLUSIVE \(syscall-tracing\)/)
   })

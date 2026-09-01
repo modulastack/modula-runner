@@ -85,6 +85,7 @@ export async function migrateLegacyAudit(
   }
   if (migrating) throw new Error('orphaned legacy audit migration')
   } finally {
+    // Migration outcome is determined before cleanup; close cannot make it more authoritative.
     if (!rootHandle) await rootDirectory.close().catch(() => undefined)
   }
 }

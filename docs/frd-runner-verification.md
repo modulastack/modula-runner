@@ -120,7 +120,7 @@ silently disable the pty dependency.
 |---|---|
 | `modula-runner --help` / `--version` | No state mutation; version equals the candidate manifest. |
 | `modula-runner pair --control-plane <https-or-loopback-http-url>` | Reads the code from a hidden TTY prompt, redeems outbound, durably stores the pending binding, confirms by token proof, and never prints the code or token. No positional code is accepted by the production dispatcher. |
-| `modula-runner status [--json]` | Reports unpaired/pending/paired/revoked and the exact containment disposition—`network-namespace`, `detect-and-stop`, or `unavailable-by-platform`—plus `prevention` and bounded detail, without secrets or a false live-connectivity claim. |
+| `modula-runner status [--json]` | Reports unpaired/pending/paired/revoked and the exact containment disposition—`network-namespace` or `detect-and-stop`—plus `prevention` and bounded detail, without secrets or a false live-connectivity claim. |
 | `modula-runner run` | Foreground composition root. Loads trusted local policy and state before dialing; opens one outbound WSS connection; owns presence, hosts, capabilities, and shutdown. |
 | `modula-runner key add/list/remove` | Uses the existing hidden-secret and redacted-output contract. |
 | `modula-runner profile add/list/remove` | Creates complete local launch profiles from a runtime, access mode, model, and access-specific provider/key label or endpoint id. It accepts no command, argv template, secret, or endpoint address. List output is redacted and removal affects later launches only. |
@@ -255,9 +255,8 @@ A2 begins only after the launch-contract checkpoint.
   reports one discovered port, and exits/cleans up visibly.
 - **A3.2:** on namespace-capable Linux, a wildcard bind is unreachable from every non-loopback host
   address and an independent namespace for its whole verified lifetime.
-- **A3.3:** with Linux namespaces denied, status says `detect-and-stop`; on macOS it says
-  `unavailable-by-platform`. Both report `prevention: false`, state that detect-and-stop remains
-  active, and terminate an observed off-loopback bind without claiming prevention.
+- **A3.3:** with Linux namespaces denied or on macOS, status says `detect-and-stop`, reports
+  `prevention: false`, and terminates an observed off-loopback bind without claiming prevention.
 - **A3.4:** zero listeners, multiple listeners/ports, unknown recipes, ungranted paths, duplicate
   ids, and capacity overflow receive their named refusals rather than a guessed success.
 - **A3.5:** the evidence distinguishes network containment from the documented residual that an

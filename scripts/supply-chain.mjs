@@ -12,7 +12,7 @@ const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const defaultOutput = join(repositoryRoot, 'dist', 'release')
 const defaultWaivers = join(repositoryRoot, 'security', 'vulnerability-waivers.json')
 const defaultAliases = join(repositoryRoot, 'security', 'advisory-aliases.json')
-const workspaces = ['packages/linux-file-lock', 'packages/protocol', 'packages/runner']
+const workspaces = ['packages/darwin-file-lock', 'packages/linux-file-lock', 'packages/protocol', 'packages/runner']
 
 function run(command, args, cwd) {
   return runProcess(command, args, {
@@ -393,11 +393,13 @@ async function runGate(projectRoot, output, waiverPath, aliasPath = defaultAlias
 }
 
 async function copySeedProject(target) {
+  await mkdir(join(target, 'packages', 'darwin-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'linux-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'protocol'), { recursive: true })
   await mkdir(join(target, 'packages', 'runner'), { recursive: true })
   await cp(join(repositoryRoot, 'package.json'), join(target, 'package.json'))
   await cp(join(repositoryRoot, 'package-lock.json'), join(target, 'package-lock.json'))
+  await cp(join(repositoryRoot, 'packages', 'darwin-file-lock', 'package.json'), join(target, 'packages', 'darwin-file-lock', 'package.json'))
   await cp(join(repositoryRoot, 'packages', 'linux-file-lock', 'package.json'), join(target, 'packages', 'linux-file-lock', 'package.json'))
   await cp(join(repositoryRoot, 'packages', 'protocol', 'package.json'), join(target, 'packages', 'protocol', 'package.json'))
   await cp(join(repositoryRoot, 'packages', 'runner', 'package.json'), join(target, 'packages', 'runner', 'package.json'))

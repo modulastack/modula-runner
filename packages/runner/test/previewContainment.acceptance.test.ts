@@ -168,8 +168,10 @@ function requireNamespaceCapability() {
   requireContainmentPass(evidence)
 }
 
+const linuxNamespaceIt = process.platform === 'linux' ? it : it.skip
+
 describe('CP-5 IC-5 preview containment', () => {
-  it('AS-30 keeps a contained wildcard preview reachable through its reported host-loopback port', async () => {
+  linuxNamespaceIt('AS-30 keeps a contained wildcard preview reachable through its reported host-loopback port', async () => {
     requireNamespaceCapability()
     const directory = await workspace()
     const internalPort = await unusedPort()
@@ -185,7 +187,7 @@ describe('CP-5 IC-5 preview containment', () => {
     expect(await request('127.0.0.1', outcome.record.port)).toBe('internal-wildcard-bind-succeeded')
   }, 20_000)
 
-  it('AS-30 does not report the inherited bridge socket ready before the contained preview binds', async () => {
+  linuxNamespaceIt('AS-30 does not report the inherited bridge socket ready before the contained preview binds', async () => {
     requireNamespaceCapability()
     const directory = await workspace()
     const internalPort = await unusedPort()
@@ -216,7 +218,7 @@ describe('CP-5 IC-5 preview containment', () => {
     expect(await request('127.0.0.1', outcome.record.port)).toBe('delayed-preview-ready')
   }, 20_000)
 
-  it('AS-31 keeps successful wildcard binds unreachable from every non-loopback host address and an independent netns for their lifetime', async () => {
+  linuxNamespaceIt('AS-31 keeps successful wildcard binds unreachable from every non-loopback host address and an independent netns for their lifetime', async () => {
     requireNamespaceCapability()
     const directory = await workspace()
     const addresses = nonLoopbackAddresses()
@@ -246,7 +248,7 @@ describe('CP-5 IC-5 preview containment', () => {
     }
   }, 30_000)
 
-  it('AS-31 refuses a contained preview with two TCP listener ports instead of forwarding one arbitrarily', async () => {
+  linuxNamespaceIt('AS-31 refuses a contained preview with two TCP listener ports instead of forwarding one arbitrarily', async () => {
     requireNamespaceCapability()
     const directory = await workspace()
     const pidPath = join(directory, 'ambiguous.pid')
@@ -285,7 +287,7 @@ describe('CP-5 IC-5 preview containment', () => {
     expect(await canConnect('127.0.0.1', secondPort)).toBe(false)
   }, 15_000)
 
-  it('AS-32 keeps a double-forked setsid descendant in the isolated network namespace', async () => {
+  linuxNamespaceIt('AS-32 keeps a double-forked setsid descendant in the isolated network namespace', async () => {
     requireNamespaceCapability()
     const directory = await workspace()
     const pidPath = join(directory, 'escaped.pid')
@@ -321,7 +323,7 @@ describe('CP-5 IC-5 preview containment', () => {
     await assertUnreachableFromIndependentNamespace(nonLoopbackAddresses(), [outcome.record.port, internalPort])
   }, 25_000)
 
-  it('AS-33 states active prevention on a namespace-capable Linux host', () => {
+  linuxNamespaceIt('AS-33 states active prevention on a namespace-capable Linux host', () => {
     requireNamespaceCapability()
     expect(detectPreviewContainment().status).toEqual(expect.objectContaining({
       disposition: 'network-namespace',
@@ -359,13 +361,13 @@ describe('CP-5 IC-5 preview containment', () => {
     })
   }, 15_000)
 
-  it('AS-36 reports macOS containment as not applicable while detect-and-stop still governs exposure', async () => {
+  it('AS-36 reports macOS containment as detect-and-stop while never claiming namespace prevention', async () => {
     const containment = detectPreviewContainment({ platform: 'darwin' })
     expect(containment.status).toEqual(expect.objectContaining({
-      disposition: 'unavailable-by-platform',
+      disposition: 'detect-and-stop',
       platform: 'darwin',
       prevention: false,
-      detail: expect.stringMatching(/not applicable|unavailable.*platform/i),
+      detail: expect.stringMatching(/namespace prevention.*unavailable.*darwin|detect-and-stop/i),
     }))
     const directory = await workspace()
     const port = await unusedPort()

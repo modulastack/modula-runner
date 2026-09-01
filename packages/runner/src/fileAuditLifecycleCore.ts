@@ -467,6 +467,7 @@ export async function recoverLifecycle(
   } catch (error) {
     // Recovery's original integrity failure is the actionable error; cleanup cannot replace it.
     await adapter.close(directory).catch(() => undefined)
+    // Root-directory close is best-effort cleanup after the recovery failure has already won.
     if (!rootHandle) await rootDirectory.close().catch(() => undefined)
     throw error
   }
@@ -1161,6 +1162,7 @@ export async function syncHandle(recovered: Pick<RecoveryPath, 'adapter'> | unde
 
 export async function closeHandle(recovered: Pick<RecoveryPath, 'adapter'> | undefined, handle: DescriptorChildHandle | null | undefined): Promise<void> {
   if (!recovered || !handle) return
+  // Close is cleanup only; callers have already completed or reported the storage operation.
   await recovered.adapter.close(handle).catch(() => undefined)
 }
 

@@ -8,6 +8,7 @@
     "modula-runner": "packages/runner/dist/bin/modula-runner.js"
   },
   "workspaces": [
+    "packages/darwin-file-lock",
     "packages/linux-file-lock",
     "packages/protocol",
     "packages/runner"
@@ -16,6 +17,7 @@
     "node": "22.22.3"
   },
   "os": [
+    "darwin",
     "linux"
   ],
   "cpu": [

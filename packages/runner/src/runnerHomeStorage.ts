@@ -339,6 +339,7 @@ async function cleanupInterruptedTemps(root: FileHandle, uid: number | undefined
         if (!visible) return false
         if (!secureRecord(held, uid) || !sameIdentity(held, candidate.identity) || !sameIdentity(visible, candidate.identity)) return false
       } finally {
+        // Candidate validation has its verdict; close failure must not turn cleanup into acceptance.
         if (handle) await adapter.close(handle).catch(() => undefined)
       }
       await adapter.unlink(root, candidate.name)
@@ -401,6 +402,7 @@ async function writeTemporary(root: FileHandle, target: string, bytes: Uint8Arra
     await adapter.writeAll(handle, bytes)
     await adapter.sync(handle)
   } finally {
+    // The write path reports sync/open errors directly; close is best-effort descriptor cleanup.
     if (handle) await adapter.close(handle).catch(() => undefined)
   }
 }

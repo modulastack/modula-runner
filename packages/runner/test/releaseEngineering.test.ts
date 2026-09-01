@@ -33,12 +33,18 @@ function artifactPath(output: string) {
 
 const isolatedReleaseFixturePaths = [
   '.nvmrc', 'package.json', 'package-lock.json', 'README.md', 'LICENSE',
+  'packages/darwin-file-lock/package.json', 'packages/darwin-file-lock/index.js', 'packages/darwin-file-lock/index.d.ts',
+  'packages/darwin-file-lock/VENDORING.md',
+  'packages/darwin-file-lock/binaries/fs-ext-darwin-arm64-node-22.0.0.node',
   'packages/linux-file-lock/package.json', 'packages/linux-file-lock/index.js', 'packages/linux-file-lock/index.d.ts',
   'packages/linux-file-lock/UPSTREAM-LICENSE.txt', 'packages/linux-file-lock/VENDORING.md',
   'packages/linux-file-lock/binaries/fs-ext-linux-arm64-node-22.0.0.node',
   'packages/linux-file-lock/binaries/fs-ext-linux-x64-node-22.0.0.node',
   'packages/protocol/package.json', 'packages/protocol/README.md', 'packages/protocol/SCHEMA.md',
-  'packages/runner/package.json', 'scripts/cli-process.mjs', 'scripts/release.mjs',
+  'packages/runner/package.json',
+  'packages/runner/native/darwin_runner_home.c',
+  'packages/runner/native/darwin-runner-home-arm64-node-22.0.0.node',
+  'scripts/cli-process.mjs', 'scripts/release.mjs', 'scripts/verify-darwin-runner-home-native.mjs',
 ]
 
 async function copyReleaseFixtureFile(source: string, path: string) {
@@ -424,7 +430,7 @@ exit 64
     await writeFile(join(fixture.bin, 'npm'), `#!/bin/sh
 if test "$1" = --version; then printf '10.9.8\\n'; exit 0; fi
 if test "$1" = ci; then
-  node -e "const fs=require('node:fs'); const p='packages/runner/package.json'; const m=JSON.parse(fs.readFileSync(p)); m.version='9.9.9'; fs.writeFileSync(p, JSON.stringify(m))"
+  node -e "const fs=require('node:fs'); const p='packages/runner/package.json'; const m=JSON.parse(fs.readFileSync(p)); m.version='9.9.9'; m.dependencies['@modulastack/darwin-file-lock']='9.9.9'; m.optionalDependencies['@modulastack/linux-file-lock']='9.9.9'; fs.writeFileSync(p, JSON.stringify(m))"
   exit 0
 fi
 if test "$1 $2" = 'run build'; then
@@ -535,12 +541,13 @@ exit 64
     await Promise.all([
       mkdir(bin, { recursive: true }),
       mkdir(fixtureScripts, { recursive: true }),
+      mkdir(join(fixture, 'packages', 'darwin-file-lock'), { recursive: true }),
       mkdir(join(fixture, 'packages', 'linux-file-lock'), { recursive: true }),
       mkdir(join(fixture, 'packages', 'protocol'), { recursive: true }),
       mkdir(join(fixture, 'packages', 'runner'), { recursive: true }),
     ])
     for (const path of [
-      '.nvmrc', 'package.json', 'packages/linux-file-lock/package.json', 'packages/protocol/package.json', 'packages/runner/package.json',
+      '.nvmrc', 'package.json', 'packages/darwin-file-lock/package.json', 'packages/linux-file-lock/package.json', 'packages/protocol/package.json', 'packages/runner/package.json',
       'scripts/cli-process.mjs', 'scripts/release.mjs',
     ]) {
       await copyFile(join(root, path), join(fixture, path))
@@ -578,6 +585,9 @@ exit 33
     expect(listing.status).toBe(0)
     expect(contents.status).toBe(0)
     expect(listing.stdout).toContain('package/npm-shrinkwrap.json')
+    expect(listing.stdout).toContain('package/packages/darwin-file-lock/index.js')
+    expect(listing.stdout).toContain('package/packages/darwin-file-lock/VENDORING.md')
+    expect(listing.stdout).toContain('package/packages/darwin-file-lock/binaries/fs-ext-darwin-arm64-node-22.0.0.node')
     expect(listing.stdout).toContain('package/packages/linux-file-lock/index.js')
     expect(listing.stdout).toContain('package/packages/linux-file-lock/VENDORING.md')
     expect(listing.stdout).toContain('package/packages/linux-file-lock/binaries/fs-ext-linux-x64-node-22.0.0.node')
@@ -590,6 +600,7 @@ exit 33
     expect(contents.stdout.includes(Buffer.from(root))).toBe(false)
     for (const path of [
       'package/package.json',
+      'package/packages/darwin-file-lock/package.json',
       'package/packages/linux-file-lock/package.json',
       'package/packages/protocol/package.json',
       'package/packages/runner/package.json',
@@ -600,7 +611,7 @@ exit 33
     }
     const installManifest = archivedJson(firstArtifact, 'package/package.json')
     expect(installManifest.engines).toEqual({ node: pinnedNode })
-    expect(installManifest.os).toEqual(['linux'])
+    expect(installManifest.os).toEqual(['darwin', 'linux'])
     expect(installManifest.cpu).toEqual(['x64', 'arm64'])
     expect(installManifest.name).toBe('modula-runner')
     expect(installManifest.private).toBeUndefined()
@@ -943,7 +954,7 @@ exit 64
     expect(releaseRunbook).toContain('cyclonedx validate')
     expect(releaseRunbook).not.toContain('npm run gate')
     expect(releaseRunbook).toContain('platform-specific acceptance suite is separate')
-    expect(releaseRunbook).toContain('unprivileged user and network namespaces plus `tmux`')
+    expect(releaseRunbook).toContain('macOS arm64 verifies the detect-and-stop preview posture')
     expect(releaseRunbook).toContain('cmp "dist/release/$artifact" "$dir/$artifact"')
     expect(releaseRunbook).toContain('If every command above succeeds')
   })

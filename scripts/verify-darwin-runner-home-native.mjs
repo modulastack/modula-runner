@@ -7,7 +7,8 @@ import path from 'node:path'
 const root = process.cwd()
 const source = path.join(root, 'packages', 'runner', 'native', 'darwin_runner_home.c')
 const committed = path.join(root, 'packages', 'runner', 'native', 'darwin-runner-home-arm64-node-22.0.0.node')
-const loader = path.join(root, 'packages', 'runner', 'src', 'darwinRunnerHomeNative.ts')
+const packaged = path.join(root, 'packages', 'darwin-file-lock', 'binaries', 'fs-ext-darwin-arm64-node-22.0.0.node')
+const loader = path.join(root, 'packages', 'darwin-file-lock', 'index.js')
 const include = path.resolve(path.dirname(process.execPath), '..', 'include', 'node')
 const deterministicUuid = Buffer.from('00000000000000000000000000000053', 'hex')
 
@@ -23,6 +24,8 @@ try {
   if (!firstBytes.equals(secondBytes)) throw new Error('native addon builds are not byte-identical')
   const committedBytes = await readFile(committed)
   if (!firstBytes.equals(committedBytes)) throw new Error('source-built addon does not match committed addon')
+  const packagedBytes = await readFile(packaged)
+  if (!committedBytes.equals(packagedBytes)) throw new Error('committed addon does not match packaged Darwin native addon')
   const digest = sha256(committedBytes)
   const loaderText = await readFile(loader, 'utf8')
   if (!loaderText.includes(`sha256: '${digest}'`)) throw new Error(`loader digest does not match committed addon: ${digest}`)

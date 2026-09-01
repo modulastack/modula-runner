@@ -82,6 +82,7 @@ export async function archiveRunnerAuditFile(
   } catch {
     return await unavailableArchive(storage, destination, recovered)
   } finally {
+    // Archive failure is already mapped to unavailable; a close failure cannot add custody proof.
     await rootHandle?.close().catch(() => undefined)
   }
 }

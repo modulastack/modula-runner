@@ -122,10 +122,10 @@ async function validatedKeyPath(target: string): Promise<string> {
   const keyPath = path.resolve(target)
   const parent = path.dirname(keyPath)
   const [resolvedParent, info] = await Promise.all([realpath(parent), lstat(parent)])
-  if (resolvedParent !== parent || !info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) {
+  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) {
     throw new Error('allowlist signing key directory custody is invalid')
   }
-  return keyPath
+  return path.join(resolvedParent, path.basename(keyPath))
 }
 
 async function readBounded(handle: FileHandle, limit: number, label: string): Promise<Buffer> {

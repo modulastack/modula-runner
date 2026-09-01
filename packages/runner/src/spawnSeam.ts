@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import type { RefusalReason } from '@modulastack/runner-protocol'
 import type { AuditLog, SpawnOutcome } from './auditLog.js'
 import type { CommandPolicy } from './allowlist.js'
@@ -137,20 +138,20 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   // seam supplies the whole command line. A direct executable is checked by name; its args are
   // the runner's own machinery, not the wire's. A null policy is the fail-closed state — an
   // unverifiable allowlist is not a permissive one — so nothing resolves and everything refuses.
-  const resolve = (request: SpawnRequest): { command: string; args: readonly string[] } | null => {
+  const resolve = (request: SpawnRequest): { command: string; args: readonly string[]; auditExecutable: string | null } | null => {
     if (request.recipeId !== undefined) {
       const recipe = options.policy?.recipe(request.recipeId)
-      return recipe ? { command: recipe.command, args: recipe.args } : null
+      return recipe ? { command: canonicalExecutable(recipe.command), args: recipe.args, auditExecutable: null } : null
     }
-    if (request.executable !== undefined && options.policy?.allowsExecutable(request.executable)) {
-      return { command: request.executable, args: request.args ?? [] }
+    if (request.executable !== undefined && executableAllowed(options.policy, request.executable)) {
+      return { command: canonicalExecutable(request.executable), args: request.args ?? [], auditExecutable: canonicalExecutable(request.executable) }
     }
     return null
   }
 
   const check = (executable: string, recipeId?: string): boolean => {
     if (recipeId !== undefined) return options.policy?.recipe(recipeId) != null
-    return options.policy?.allowsExecutable(executable) ?? false
+    return executableAllowed(options.policy, executable)
   }
 
   const auditRefusal = (request: SpawnRequest, reason: RefusalReason) =>
@@ -176,7 +177,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
     // A grant-scoped request requires a grant, so it fails closed: with no consent policy to
     // consult there is no way to prove the cwd is granted, and an unprovable grant is a refused
     // one — never taken as-is. With consent present, an ungranted cwd is refused the same way.
-    let cwd = request.cwd
+    let cwd = canonicalExecutable(request.cwd)
     if (request.grantScoped) {
       if (!options.consent) {
         await auditRefusal(request, 'path-not-granted')
@@ -201,7 +202,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
         spawnId,
         spawnKind: request.kind,
         requestId: request.requestId ?? null,
-        executable: request.recipeId !== undefined ? resolved.command : (request.executable ?? null),
+        executable: request.recipeId !== undefined ? resolved.command : resolved.auditExecutable,
         recipeId: request.recipeId ?? null,
         cwd,
         at: at(),
@@ -258,6 +259,22 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   }
 
   return { check, recordRefusal: auditRefusal, authorize, run }
+}
+
+function executableAllowed(policy: CommandPolicy | null, executable: string): boolean {
+  if (!policy) return false
+  if (policy.allowsExecutable(executable)) return true
+  const canonical = canonicalExecutable(executable)
+  if (canonical !== executable && policy.allowsExecutable(canonical)) return true
+  return policy.executables.some(allowed => canonicalExecutable(allowed) === canonical)
+}
+
+function canonicalExecutable(executable: string): string {
+  try {
+    return realpathSync(executable)
+  } catch {
+    return executable
+  }
 }
 
 // Retries a spawn's outcome completion until the record is durable, bounded. A rejected append

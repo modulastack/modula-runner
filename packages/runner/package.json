@@ -20,6 +20,7 @@
     "node": "22.22.3"
   },
   "os": [
+    "darwin",
     "linux"
   ],
   "cpu": [
@@ -31,10 +32,13 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@modulastack/linux-file-lock": "0.1.0",
+    "@modulastack/darwin-file-lock": "0.1.0",
     "@modulastack/runner-protocol": "0.1.0",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@modulastack/linux-file-lock": "0.1.0"
   },
   "devDependencies": {
     "@types/ws": "^8.5.12"

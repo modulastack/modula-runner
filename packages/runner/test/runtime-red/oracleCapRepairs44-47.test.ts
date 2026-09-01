@@ -176,11 +176,13 @@ describe('fresh verifier oracle cap repairs #44-#47', () => {
 
   it('#47 accepts only contiguous post-reconnect advancement', () => {
     expect(terminalResumeAdvances(7, [8, 9], [])).toBe(true)
+    expect(terminalResumeAdvances(7, [9, 10], [9])).toBe(true)
     expect(terminalResumeAdvances(7, [], [])).toBe(false)
-    expect(terminalResumeAdvances(7, [8], [8])).toBe(false)
+    expect(terminalResumeAdvances(7, [8], [7])).toBe(false)
     expect(terminalResumeAdvances(7, [7], [])).toBe(false)
     expect(terminalResumeAdvances(7, [8, 8], [])).toBe(false)
     expect(terminalResumeAdvances(7, [9], [])).toBe(false)
+    expect(terminalResumeAdvances(7, [10], [9])).toBe(false)
   })
 
   it('#47 observes bounded resume teardown while retaining EXIT replay and RESET watermark evidence', async () => {

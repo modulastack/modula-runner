@@ -443,7 +443,12 @@ function contained(root: string, candidate: string): boolean {
 }
 
 function samePath(left: string, right: string): boolean {
-  return path.resolve(left) === path.resolve(right)
+  return canonicalPathText(left) === canonicalPathText(right)
+}
+
+function canonicalPathText(value: string): string {
+  const resolved = path.resolve(value)
+  return process.platform === 'darwin' ? resolved.replace(/^\/private\/var\//, '/var/') : resolved
 }
 
 function failed(reason: 'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed' | 'recovery-uncertain') {

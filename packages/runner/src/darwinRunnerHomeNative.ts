@@ -1,8 +1,4 @@
-import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 type NativeStat = {
   dev: bigint
@@ -35,20 +31,12 @@ type DarwinRunnerHomeNative = {
   errnoSymbols(): { EBADF: 'EBADF'; EINVAL: 'EINVAL'; EIO: 'EIO'; ENOENT: 'ENOENT' }
 }
 
-const binary = {
-  file: 'darwin-runner-home-arm64-node-22.0.0.node',
-  sha256: '3f020304746900a51d130162bfc46fa5277cb1fc27d6137a7dcfc2aec8f83b0b',
-}
-
 export function loadDarwinRunnerHomeNative(): DarwinRunnerHomeNative {
   if (process.platform !== 'darwin' || process.arch !== 'arm64' || process.versions.node.split('.')[0] !== '22') {
     throw new Error(`Darwin runner-home native storage requires Node 22 on darwin arm64; found ${process.platform} ${process.arch} ${process.versions.node}`)
   }
-  const source = fileURLToPath(import.meta.url)
-  const url = path.resolve(path.dirname(source), '..', 'native', binary.file)
-  const digest = createHash('sha256').update(readFileSync(url)).digest('hex')
-  if (digest !== binary.sha256) throw new Error('Darwin runner-home native binary integrity check failed')
-  return createRequire(import.meta.url)(url) as DarwinRunnerHomeNative
+  const loader = createRequire(import.meta.url)('@modulastack/darwin-file-lock') as { loadBinding(): DarwinRunnerHomeNative }
+  return loader.loadBinding()
 }
 
 export type { NativeStat, DarwinRunnerHomeNative }
