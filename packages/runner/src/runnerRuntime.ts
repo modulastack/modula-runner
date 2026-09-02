@@ -162,13 +162,18 @@ class RuntimeHandle implements RunnerRuntimeHandle {
   private apply(effect: SessionJobControlEffect) {
     if (this.stopping || effect.kind === 'not-session') return
     if (!this.channel || effect.channelId !== this.channel.id) return
-    if (effect.kind === 'send') this.channel.send(effect.payload)
-    else {
-      const retired = this.channel
-      this.channel = undefined
-      retired.close(effect.error)
-      throw new Error('job-control failed closed')
+    if (effect.kind === 'send') {
+      this.channel.send(effect.payload)
+      return
     }
+    const retired = this.channel
+    this.channel = undefined
+    retired.close(effect.error)
+    // Storage that cannot record is the runner's own fault and stops it. Launch traffic the
+    // peer should not have sent is not: the contract asks only that the job-control channel
+    // close, so the connection gets a replacement instead of dying with every session on it.
+    if (effect.error === 'storage-unavailable') throw new Error('job-control failed closed')
+    this.track(() => this.activateChannel())
   }
 
   private retireChannel(detail: unknown, reopen: boolean) {

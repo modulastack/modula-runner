@@ -388,6 +388,75 @@ describe('core runner application commands', () => {
     }
   })
 
+  it('reopens job control after a peer launch fault instead of stopping the runner', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    let shutdowns = 0
+    let finishedResult: unknown
+    const jobControl: SessionJobControl = {
+      async *dispatch(input) {
+        yield { kind: 'close-job-control', channelId: input.context.channelId, error: 'unsupported-session-launch' }
+      },
+      async *recover() {},
+    }
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => {
+        shutdowns += 1
+        return []
+      },
+    })
+    const handle = await runtime.start(pairedState(stub), jobControl)
+    void handle.finished.then(result => { finishedResult = result })
+    try {
+      await vi.waitFor(() => expect(jobControlChannel(stub)).toBeDefined())
+      const retired = jobControlChannel(stub)!
+      stub.sendToRunner(retired, sessionStart('223e4567-e89b-42d3-a456-426614174004'))
+      await vi.waitFor(() => expect(stub.closes).toEqual([{ channel: retired, reason: 'unsupported-session-launch' }]))
+      expect(shutdowns).toBe(0)
+      expect(finishedResult).toBeUndefined()
+      await vi.waitFor(() => {
+        expect(jobControlChannel(stub)).toBeDefined()
+        expect(jobControlChannel(stub)).not.toBe(retired)
+      }, { timeout: 5_000 })
+      expect(stub.opens).toEqual([jobControlChannel(stub)])
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
+  it('stops the runner when job control closes because storage is unavailable', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    let shutdowns = 0
+    const jobControl: SessionJobControl = {
+      async *dispatch(input) {
+        yield { kind: 'close-job-control', channelId: input.context.channelId, error: 'storage-unavailable' }
+      },
+      async *recover() {},
+    }
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => {
+        shutdowns += 1
+        return []
+      },
+    })
+    const handle = await runtime.start(pairedState(stub), jobControl)
+    try {
+      await vi.waitFor(() => expect(jobControlChannel(stub)).toBeDefined())
+      stub.sendToRunner(jobControlChannel(stub)!, sessionStart('223e4567-e89b-42d3-a456-426614174005'))
+      await expect(handle.finished).resolves.toEqual({
+        status: 'failed',
+        detail: 'runner-runtime-failed: local session processing failed closed',
+      })
+      expect(shutdowns).toBe(1)
+      expect(stub.opens).toEqual([])
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
   it('accepts pairing codes only through a hidden interactive read', async () => {
     const pair = vi.fn(async () => ({ bindingId: pairedRecord.bindingId, runnerId: pairedRecord.runnerId }))
     const app = application(pairing({ pair }))
