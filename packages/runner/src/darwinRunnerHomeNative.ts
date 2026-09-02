@@ -31,12 +31,18 @@ type DarwinRunnerHomeNative = {
   errnoSymbols(): { EBADF: 'EBADF'; EINVAL: 'EINVAL'; EIO: 'EIO'; ENOENT: 'ENOENT' }
 }
 
+// The addon is verified on the load that executes it and then held. A contended lease polls this
+// every 2ms, and the module is require-cached after the first load, so re-reading and re-hashing
+// the file spends the work on bytes that are no longer the ones running. The platform guard stays
+// outside the cache so a wrong-platform call still throws.
+let binding: DarwinRunnerHomeNative | null = null
+
 export function loadDarwinRunnerHomeNative(): DarwinRunnerHomeNative {
   if (process.platform !== 'darwin' || process.arch !== 'arm64' || process.versions.node.split('.')[0] !== '22') {
     throw new Error(`Darwin runner-home native storage requires Node 22 on darwin arm64; found ${process.platform} ${process.arch} ${process.versions.node}`)
   }
-  const loader = createRequire(import.meta.url)('@modulastack/darwin-file-lock') as { loadBinding(): DarwinRunnerHomeNative }
-  return loader.loadBinding()
+  binding ??= (createRequire(import.meta.url)('@modulastack/darwin-file-lock') as { loadBinding(): DarwinRunnerHomeNative }).loadBinding()
+  return binding
 }
 
 export type { NativeStat, DarwinRunnerHomeNative }

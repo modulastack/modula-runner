@@ -1,9 +1,9 @@
 import { constants } from 'node:fs'
-import { mkdtemp, open, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, open, rm, writeFile, type FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { descriptorRootAdapter, type DescriptorChildHandle } from '../src/descriptorRootAdapter.js'
+import { descriptorRootAdapter, type DescriptorRootAdapter } from '../src/descriptorRootAdapter.js'
 
 const describeOnDarwin = process.platform === 'darwin' ? describe : describe.skip
 const roots: string[] = []
@@ -18,9 +18,14 @@ async function temporaryDirectory(): Promise<string> {
   return root
 }
 
-function descriptorNumber(handle: DescriptorChildHandle | null): number {
-  if (!handle || !('platform' in handle)) throw new Error('expected a Darwin child descriptor')
-  return handle.fd
+async function openChild(
+  adapter: DescriptorRootAdapter,
+  root: FileHandle,
+  entry: string,
+): Promise<{ platform: 'darwin'; fd: number }> {
+  const handle = await adapter.openEntry(root, entry, constants.O_RDONLY | constants.O_NOFOLLOW)
+  if (!handle || !('platform' in handle)) throw new Error(`expected a Darwin child descriptor for ${entry}`)
+  return handle
 }
 
 describeOnDarwin('Darwin descriptor root adapter', () => {
@@ -31,18 +36,18 @@ describeOnDarwin('Darwin descriptor root adapter', () => {
     const adapter = descriptorRootAdapter()
     const rootHandle = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
     try {
-      const stale = await adapter.openEntry(rootHandle, 'first', constants.O_RDONLY | constants.O_NOFOLLOW)
-      const recycledFd = descriptorNumber(stale)
-      await adapter.close(stale!)
-      const live = await adapter.openEntry(rootHandle, 'second', constants.O_RDONLY | constants.O_NOFOLLOW)
-      // The premise of the case: openat hands back the lowest free descriptor, so the new segment
-      // holds the number the sealed one just released.
-      expect(descriptorNumber(live)).toBe(recycledFd)
+      const stale = await openChild(adapter, rootHandle, 'first')
+      const released = stale.fd
+      await adapter.close(stale)
+      const live = await openChild(adapter, rootHandle, 'second')
+      // The case has no teeth unless openat really did hand the new entry the number the closed one
+      // released, which is what makes the second close reach a live descriptor.
+      expect(live.fd).toBe(released)
 
-      await adapter.close(stale!)
+      await adapter.close(stale)
 
-      expect((await adapter.read(live!, 32)).toString()).toBe('second-bytes')
-      await adapter.close(live!)
+      expect((await adapter.read(live, 32)).toString()).toBe('second-bytes')
+      await adapter.close(live)
     } finally {
       await rootHandle.close()
     }
