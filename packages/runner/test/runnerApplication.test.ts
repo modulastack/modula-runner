@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { sessionLaunchPayload } from '@modulastack/runner-protocol'
+import { sessionLaunchPayload, type Payload } from '@modulastack/runner-protocol'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createGrants,
@@ -151,6 +151,33 @@ function jobControlChannel(stub: StubControlPlane) {
   return [...stub.channels].find(([, channel]) => channel.kind === 'job-control')?.[0]
 }
 
+function pairedState(stub: StubControlPlane) {
+  return {
+    pairing: { snapshot: async () => ({ state: 'paired', record: { ...pairedRecord, controlPlaneOrigin: stub.url } }) },
+  } as unknown as RunnerHomeState
+}
+
+function sessionStart(requestId: string) {
+  return sessionLaunchPayload({
+    type: 'SESSION_START',
+    bindingId: pairedRecord.bindingId,
+    requestId,
+    expiresAt: '2099-08-22T12:00:00Z',
+    terminalProfile: 'coder',
+    modelProfileId: 'daily',
+    target: { projectId: 'modulastack', worktreeName: 'lane-01', branch: 'feat/lane-01', baseBranch: 'main', relativeCwd: '.' },
+  })
+}
+
+function requestIdOf(payload: Payload) {
+  const body = payload.codec === 'json' ? payload.body as { requestId?: unknown } : null
+  return typeof body?.requestId === 'string' ? body.requestId : 'unrecognized'
+}
+
+function liveSession() {
+  return new Promise<void>(() => undefined)
+}
+
 describe('core runner application commands', () => {
   it('answers help and version without opening mutable state', async () => {
     const app = application()
@@ -292,6 +319,69 @@ describe('core runner application commands', () => {
       releaseDispatch.resolve()
       await expect(stop).resolves.toEqual({ status: 'confirmed' })
       expect(cleanupSawActiveChild).toBe(true)
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
+  it('dispatches a second session start while the first session is still live', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    const live = liveSession()
+    const entered: string[] = []
+    const jobControl: SessionJobControl = {
+      async *dispatch(input) {
+        entered.push(requestIdOf(input.payload))
+        await live
+      },
+      async *recover() {},
+    }
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => [],
+    })
+    const handle = await runtime.start(pairedState(stub), jobControl)
+    try {
+      await vi.waitFor(() => expect(jobControlChannel(stub)).toBeDefined())
+      const channel = jobControlChannel(stub)!
+      stub.sendToRunner(channel, sessionStart('223e4567-e89b-42d3-a456-426614174001'))
+      await vi.waitFor(() => expect(entered).toHaveLength(1))
+      stub.sendToRunner(channel, sessionStart('223e4567-e89b-42d3-a456-426614174002'))
+      await vi.waitFor(() => expect(entered).toEqual([
+        '223e4567-e89b-42d3-a456-426614174001',
+        '223e4567-e89b-42d3-a456-426614174002',
+      ]), { timeout: 5_000 })
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
+  it('reattaches after a reconnect while a session is still live', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    const live = liveSession()
+    let dispatched = false
+    let recoveries = 0
+    const jobControl: SessionJobControl = {
+      async *dispatch() {
+        dispatched = true
+        await live
+      },
+      async *recover() {
+        recoveries += 1
+      },
+    }
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => [],
+    })
+    const handle = await runtime.start(pairedState(stub), jobControl)
+    try {
+      await vi.waitFor(() => expect(recoveries).toBe(1))
+      stub.sendToRunner(jobControlChannel(stub)!, sessionStart('223e4567-e89b-42d3-a456-426614174003'))
+      await vi.waitFor(() => expect(dispatched).toBe(true))
+      stub.dropConnections()
+      await vi.waitFor(() => expect(recoveries).toBe(2), { timeout: 5_000 })
     } finally {
       handle.forceStop()
       await stub.stop()

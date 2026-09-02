@@ -72,6 +72,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
   private channelHadActivity = false
   private settleInterruptedChannel = false
   private queue: Promise<void> = Promise.resolve()
+  private readonly dispatches = new Set<Promise<void>>()
   private stopPromise: Promise<RunnerStopResult> | undefined
   private cleanupPromise: Promise<RunnerStopResult> | undefined
   private stopping = false
@@ -107,7 +108,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
 
   private bindEvents() {
     this.client.on('connected', detail => this.connected(detail))
-    this.client.on('data', detail => this.track(() => this.received(detail)))
+    this.client.on('data', detail => this.dispatch(() => this.received(detail)))
     this.client.on('offline', () => {
       this.markChannelInterrupted()
       this.selectedProtocol = null
@@ -218,7 +219,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
     this.channel?.close('runner shutdown')
     this.channel = undefined
     this.client.stop()
-    await this.queue
+    await this.drain()
     const result = await this.cleanup()
     this.finish(result)
     return result
@@ -246,9 +247,25 @@ class RuntimeHandle implements RunnerRuntimeHandle {
   }
 
   private track(operation: () => Promise<void>) {
-    this.queue = this.queue.then(operation).catch(async () => {
+    this.queue = this.queue.then(() => this.failClosed(operation))
+  }
+
+  // A launch parks until its session ends, so chaining request dispatch onto the lifecycle
+  // queue would let one live session block recovery, revocation, connection failure and every
+  // later request on the connection. Dispatches run beside the queue; shutdown drains both.
+  private dispatch(operation: () => Promise<void>) {
+    const running = this.failClosed(operation).finally(() => { this.dispatches.delete(running) })
+    this.dispatches.add(running)
+  }
+
+  private failClosed(operation: () => Promise<void>): Promise<void> {
+    return Promise.resolve().then(operation).catch(async () => {
       if (!this.stopping) await this.terminalFailure('runner-runtime-failed: local session processing failed closed')
     })
+  }
+
+  private async drain() {
+    await Promise.allSettled([this.queue, ...this.dispatches])
   }
 }
 
