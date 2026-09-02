@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
+import path from 'node:path'
 import type { RefusalReason } from '@modulastack/runner-protocol'
 import type { AuditLog, SpawnOutcome } from './auditLog.js'
 import type { CommandPolicy } from './allowlist.js'
@@ -141,10 +142,11 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   const resolve = (request: SpawnRequest): { command: string; args: readonly string[]; auditExecutable: string | null } | null => {
     if (request.recipeId !== undefined) {
       const recipe = options.policy?.recipe(request.recipeId)
-      return recipe ? { command: canonicalExecutable(recipe.command), args: recipe.args, auditExecutable: null } : null
+      return recipe ? { command: canonicalPath(recipe.command), args: recipe.args, auditExecutable: null } : null
     }
     if (request.executable !== undefined && executableAllowed(options.policy, request.executable)) {
-      return { command: canonicalExecutable(request.executable), args: request.args ?? [], auditExecutable: canonicalExecutable(request.executable) }
+      const command = canonicalPath(request.executable)
+      return { command, args: request.args ?? [], auditExecutable: command }
     }
     return null
   }
@@ -177,7 +179,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
     // A grant-scoped request requires a grant, so it fails closed: with no consent policy to
     // consult there is no way to prove the cwd is granted, and an unprovable grant is a refused
     // one — never taken as-is. With consent present, an ungranted cwd is refused the same way.
-    let cwd = canonicalExecutable(request.cwd)
+    let cwd = canonicalPath(request.cwd)
     if (request.grantScoped) {
       if (!options.consent) {
         await auditRefusal(request, 'path-not-granted')
@@ -261,19 +263,27 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   return { check, recordRefusal: auditRefusal, authorize, run }
 }
 
+// One predicate decides admission: the signed document's own membership test, applied to the name
+// asked for and — for an operator who named a symlinked absolute path — to what it resolves to.
+// Matching a listed entry's realpath instead would be a second, weaker gate over the same set.
 function executableAllowed(policy: CommandPolicy | null, executable: string): boolean {
   if (!policy) return false
   if (policy.allowsExecutable(executable)) return true
-  const canonical = canonicalExecutable(executable)
-  if (canonical !== executable && policy.allowsExecutable(canonical)) return true
-  return policy.executables.some(allowed => canonicalExecutable(allowed) === canonical)
+  const canonical = canonicalPath(executable)
+  return canonical !== executable && policy.allowsExecutable(canonical)
 }
 
-function canonicalExecutable(executable: string): string {
+// Only absolute paths are canonicalized. macOS needs this because /var and /tmp are symlinks, so a
+// grant, a temp dir or a worktree root records a different spelling than the one it is compared
+// against. A bare executable name has no such spelling: resolving it here would bind it to the
+// process working directory, while the exec that follows performs a PATH search — so it is left
+// alone and resolution stays where the exec happens, in exactly one place.
+function canonicalPath(value: string): string {
+  if (!path.isAbsolute(value)) return value
   try {
-    return realpathSync(executable)
+    return realpathSync(value)
   } catch {
-    return executable
+    return value
   }
 }
 

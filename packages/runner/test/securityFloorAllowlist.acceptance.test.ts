@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { appendFile, mkdtemp, open as openFile, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, open as openFile, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -395,5 +395,51 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
         reason: 'not-allowlisted',
       }),
     ])
+  })
+
+  it('AS-06 leaves an allowlisted bare command to PATH rather than a same-named file in the working directory', async () => {
+    const directory = await temporaryDirectory()
+    const path = join(directory, 'allowlist.json')
+    const auditPath = join(directory, 'audit.ndjson')
+    const identity = signingIdentity('bare-command-policy')
+    await writeEnvelope(path, signAllowlist(allowlist(['decoy-tool']), identity.key))
+    await writeFile(join(directory, 'decoy-tool'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const policy = await loadPolicy(path, [identity.anchor])
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000 })
+
+    const previousCwd = process.cwd()
+    let admitted: VettedSpawn | undefined
+    try {
+      process.chdir(directory)
+      const result = await seam.authorize({ kind: 'probe', executable: 'decoy-tool', cwd: directory, grantScoped: false })
+      if (result.status === 'admitted') admitted = result.authorization.vetted
+    } finally {
+      // chdir is process-wide, so it is restored before any assertion can abort the case, and this
+      // case must never be copied into a concurrent describe.
+      process.chdir(previousCwd)
+    }
+
+    expect(admitted?.command).toBe('decoy-tool')
+    expect(await auditRecords(auditPath)).toEqual([
+      expect.objectContaining({ kind: 'spawn-admitted', spawnKind: 'probe', executable: 'decoy-tool' }),
+    ])
+  })
+
+  it('AS-06 admits the executable the signed document names, not another path that resolves to the same file', async () => {
+    const directory = await temporaryDirectory()
+    const path = join(directory, 'allowlist.json')
+    const auditPath = join(directory, 'audit.ndjson')
+    const identity = signingIdentity('alias-policy')
+    const wrapper = join(directory, 'wrapper')
+    await symlink(process.execPath, wrapper)
+    await writeEnvelope(path, signAllowlist(allowlist([wrapper]), identity.key))
+    const policy = await loadPolicy(path, [identity.anchor])
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000 })
+
+    const listed = await seam.authorize({ kind: 'probe', executable: wrapper, cwd: directory, grantScoped: false })
+    const aliased = await seam.authorize({ kind: 'probe', executable: process.execPath, cwd: directory, grantScoped: false })
+
+    expect(listed).toMatchObject({ status: 'admitted' })
+    expect(aliased).toMatchObject({ status: 'refused', reason: 'not-allowlisted' })
   })
 })
