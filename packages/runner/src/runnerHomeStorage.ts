@@ -63,7 +63,14 @@ export type FileRunnerHomeStorageOptions = {
   currentUserId?: number
 }
 
-export function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): RunnerHomeStorage {
+// The file storage answers one question the shared interface does not: whether a descriptor some
+// caller opened by path is the inode this lease covers. Only a caller that shares this home needs
+// it, so it stays off `RunnerHomeStorage` and its doubles.
+export type LeasedRunnerHomeStorage = RunnerHomeStorage & {
+  leasesDescriptor(handle: FileHandle): Promise<boolean>
+}
+
+export function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): LeasedRunnerHomeStorage {
   return new FileRunnerHomeStorage(options)
 }
 
@@ -120,6 +127,17 @@ class FileRunnerHomeStorage implements RunnerHomeStorage {
       if (!this.foregroundLease || !(await this.rootStillBound())) return null
       if (!this.rootHandle || process.platform === 'darwin') return null
       return linuxDescriptorRootPath(this.rootHandle)
+    })
+  }
+
+  leasesDescriptor(handle: FileHandle): Promise<boolean> {
+    return this.serialize(async () => {
+      const identity = this.rootIdentity
+      if (!this.foregroundLease || !identity || !(await this.boundRoot())) return false
+      // A descriptor that cannot be stat'ed cannot be shown to be the leased inode, and an
+      // unprovable match is a refused one — the caller must not touch the home on it.
+      const info = await handle.stat({ bigint: true }).catch(() => null)
+      return info !== null && sameIdentity(info, identity)
     })
   }
 

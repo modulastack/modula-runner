@@ -69,6 +69,12 @@ export async function archiveRunnerAuditFile(
     destination = await openArchiveDestination(root, options.destination, uid, adapter)
     rootHandle = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
     if (!secureDirectory(await rootHandle.stat({ bigint: true }), uid)) return await unavailableArchive(storage, destination)
+    // Both platform adapters take a root descriptor, so the home is opened by path a second time
+    // here, after the lease was taken on the first resolution. O_NOFOLLOW refuses a symlinked final
+    // component but not a re-pointed ancestor, so only the lease can say the two resolutions found
+    // one inode — without that the archive would seal, rename and unlink in a directory it holds no
+    // lease on, which is the proof every other operation on this home takes before touching it.
+    if (!(await storage.leasesDescriptor(rootHandle))) return await unavailableArchive(storage, destination)
     if (await sameHandleIdentity(rootHandle, adapter, destination.directory, destination.adapter)) return await unavailableArchive(storage, destination)
     await migrate(root, uid, rootHandle, adapter)
     recovered = await recoverLifecycle(root, uid, rootHandle, adapter)

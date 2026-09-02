@@ -1,13 +1,19 @@
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createFileRunnerHomeStorage as createStorage, type FileRunnerHomeStorageOptions, type RunnerHomeStorage } from '../src/index.js'
+import {
+  createFileRunnerHomeStorage as createStorage,
+  type FileRunnerHomeStorageOptions,
+  type LeasedRunnerHomeStorage,
+  type RunnerHomeStorage,
+} from '../src/index.js'
 
 const roots: string[] = []
 const storages: RunnerHomeStorage[] = []
 
-function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): RunnerHomeStorage {
+function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): LeasedRunnerHomeStorage {
   const storage = createStorage(options)
   storages.push(storage)
   return storage
@@ -216,6 +222,29 @@ describe('file runner-home storage', () => {
     await winner.release!()
     await expect(contender.acquire!()).resolves.toBe('acquired')
     await contender.release!()
+  })
+
+  it('certifies only the leased inode when a caller opens the home by path', async () => {
+    const { parent, root } = await temporaryHome()
+    const foreignRoot = path.join(parent, 'foreign-home')
+    await mkdir(foreignRoot, { mode: 0o700 })
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    await storage.inspect({})
+    const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    const leased = await open(root, flags)
+    const foreign = await open(foreignRoot, flags)
+    try {
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(false)
+      await expect(storage.acquire!()).resolves.toBe('acquired')
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(true)
+      await expect(storage.leasesDescriptor(foreign)).resolves.toBe(false)
+
+      await rename(root, path.join(parent, 'moved-home'))
+      await mkdir(root, { mode: 0o700 })
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(false)
+    } finally {
+      await Promise.all([leased.close(), foreign.close()])
+    }
   })
 
   it('gives legacy PID lock files no ownership authority', async () => {
