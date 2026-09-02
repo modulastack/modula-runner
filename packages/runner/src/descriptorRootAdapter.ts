@@ -98,9 +98,15 @@ function darwinDescriptorRootAdapter(): DescriptorRootAdapter {
       if ('platform' in handle) native.fsync(handle.fd)
       else await handle.sync()
     },
+    // A Darwin handle is a raw descriptor number, so a second close would act on whatever openat
+    // has since handed that number to — the guard FileHandle already carries, given to every
+    // Darwin caller at once. A stale handle now fails EBADF instead of closing a live segment.
     close: async handle => {
-      if ('platform' in handle) native.close(handle.fd)
-      else await handle.close()
+      if (!('platform' in handle)) return await handle.close()
+      if (handle.fd < 0) return
+      const fd = handle.fd
+      handle.fd = -1
+      native.close(fd)
     },
     rename: async (root, from, to) => native.renameat(fdOf(root), from, fdOf(root), to),
     unlink: async (root, entry) => native.unlinkat(fdOf(root), entry),
