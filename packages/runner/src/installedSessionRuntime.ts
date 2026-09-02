@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { AccessResolver } from './accessProfiles.js'
+import { AccessResolver, type AccessResolution } from './accessProfiles.js'
 import { CapabilityMonitor, DEFAULT_RUNTIME_CATALOG } from './capabilities.js'
 import type { RunnerClient } from './client.js'
 import { LocalEndpointRegistry } from './localEndpoints.js'
@@ -31,27 +31,12 @@ export type InstalledSessionRuntime = {
 export function createInstalledSessionRuntime(home: RunnerHomeState, clock: RunnerClock): InstalledSessionRuntime {
   const seam = createSpawnSeam({ policy: home.policy, audit: home.audit, consent: home.grants, now: clock.now })
   const terminals = new DeferredSessionTerminals()
+  const capabilities = new CapabilityMonitor({ seam, runtimes: DEFAULT_RUNTIME_CATALOG })
   const launcher = createSessionLauncher({
     bindingId: () => terminals.bindingId(),
     projects: home.projects,
     receipts: home.receipts,
-    access: {
-      resolve: async (modelProfileId, signal) => {
-        if (signal.aborted) return { status: 'refused', reason: 'runtime-unavailable' }
-        const configuration = await home.configuration.snapshot()
-        const endpoints = new LocalEndpointRegistry(configuration.endpoints)
-        const capabilities = new CapabilityMonitor({ seam, runtimes: DEFAULT_RUNTIME_CATALOG, endpoints })
-        await capabilities.refresh()
-        if (signal.aborted) return { status: 'refused', reason: 'runtime-unavailable' }
-        return new AccessResolver({
-          profiles: configuration.profiles,
-          runtimes: DEFAULT_RUNTIME_CATALOG,
-          keys: home.keys,
-          endpoints,
-          capabilities: () => capabilities.snapshot(),
-        }).resolve(modelProfileId)
-      },
-    },
+    access: { resolve: (modelProfileId, signal) => resolveAccess(home, capabilities, modelProfileId, signal) },
     worktrees: createSessionWorktreePort({ seam, grants: home.grants }),
     channels: terminals.channels,
     recoveryChannels: terminals.recoveryChannels,
@@ -65,8 +50,39 @@ export function createInstalledSessionRuntime(home: RunnerHomeState, clock: Runn
     launcher,
     jobControl: createSessionJobControl({ launcher, audit: home.audit, clock }),
     bind(client, bindingId) { terminals.bind(createSessionTerminalPorts({ client, seam }), bindingId) },
-    shutdown: () => terminals.shutdown(),
+    shutdown: async () => {
+      capabilities.stop()
+      return await terminals.shutdown()
+    },
   }
+}
+
+// The monitor is the long-lived one its own contract describes — the snapshot a launch reads
+// is the last probed one, kept current by the cadence — so a launch neither builds one nor
+// waits on a full sweep once the first has landed. The endpoint half is deliberately absent:
+// resolution reads only the runtime half, and a `local` profile is answered by the resolver's
+// own fresh probe. The configuration snapshot stays per launch, because removing an endpoint
+// or a profile has to take effect without waiting for anything.
+async function resolveAccess(
+  home: RunnerHomeState,
+  capabilities: CapabilityMonitor,
+  modelProfileId: string,
+  signal: AbortSignal,
+): Promise<AccessResolution> {
+  if (signal.aborted) return { status: 'refused', reason: 'runtime-unavailable' }
+  const configuration = await home.configuration.snapshot()
+  if (!capabilities.snapshot()) {
+    capabilities.start()
+    await capabilities.refresh()
+  }
+  if (signal.aborted) return { status: 'refused', reason: 'runtime-unavailable' }
+  return new AccessResolver({
+    profiles: configuration.profiles,
+    runtimes: DEFAULT_RUNTIME_CATALOG,
+    keys: home.keys,
+    endpoints: new LocalEndpointRegistry(configuration.endpoints),
+    capabilities: () => capabilities.snapshot(),
+  }).resolve(modelProfileId)
 }
 
 class DeferredSessionTerminals {
