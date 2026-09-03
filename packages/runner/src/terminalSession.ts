@@ -637,16 +637,10 @@ export class TerminalSession {
       env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
     })
     this.attachPty = proc
-    let trimInitialPaint = this.viewerAttached
     // Callbacks answer only for the process that owns the attachment: a stale
     // client losing a race must not feed or retire the live one.
     proc.onData(data => {
-      if (this.attachPty !== proc) return
-      if (trimInitialPaint) {
-        trimInitialPaint = false
-        return
-      }
-      this.queueOutput(data)
+      if (this.attachPty === proc) this.queueOutput(data)
     })
     proc.onExit(() => {
       if (this.attachPty === proc) this.handleAttachExit()
