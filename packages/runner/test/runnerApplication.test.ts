@@ -151,9 +151,12 @@ function jobControlChannel(stub: StubControlPlane) {
   return [...stub.channels].find(([, channel]) => channel.kind === 'job-control')?.[0]
 }
 
-function pairedState(stub: StubControlPlane) {
+function pairedState(stub: StubControlPlane, pairingOverrides: Record<string, unknown> = {}) {
   return {
-    pairing: { snapshot: async () => ({ state: 'paired', record: { ...pairedRecord, controlPlaneOrigin: stub.url } }) },
+    pairing: {
+      snapshot: async () => ({ state: 'paired', record: { ...pairedRecord, controlPlaneOrigin: stub.url } }),
+      ...pairingOverrides,
+    },
   } as unknown as RunnerHomeState
 }
 
@@ -176,6 +179,23 @@ function requestIdOf(payload: Payload) {
 
 function liveSession() {
   return new Promise<void>(() => undefined)
+}
+
+function parkedRecovery(live: Promise<void>) {
+  let recoveries = 0
+  const jobControl: SessionJobControl = {
+    async *dispatch() {},
+    async *recover(context) {
+      recoveries += 1
+      yield {
+        kind: 'send',
+        channelId: context.channelId,
+        payload: sessionLaunchPayload({ type: 'SESSION_ACCEPTED', requestId: '223e4567-e89b-42d3-a456-426614174006' }),
+      }
+      await live
+    },
+  }
+  return { jobControl, recoveries: () => recoveries }
 }
 
 describe('core runner application commands', () => {
@@ -382,6 +402,65 @@ describe('core runner application commands', () => {
       await vi.waitFor(() => expect(dispatched).toBe(true))
       stub.dropConnections()
       await vi.waitFor(() => expect(recoveries).toBe(2), { timeout: 5_000 })
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
+  it('revokes a rejected binding while a recovery stream is still parked', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    const recovery = parkedRecovery(liveSession())
+    const revocations: string[] = []
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => [],
+    })
+    const home = pairedState(stub, {
+      revoke: async (bindingId: string) => {
+        revocations.push(bindingId)
+        return 'updated'
+      },
+    })
+    const handle = await runtime.start(home, recovery.jobControl)
+    let finishedResult: unknown
+    void handle.finished.then(result => { finishedResult = result })
+    try {
+      await vi.waitFor(() => expect(stub.received.map(item => requestIdOf(item.payload)))
+        .toEqual(['223e4567-e89b-42d3-a456-426614174006']))
+      stub.options.token = 'rotated-token'
+      stub.dropConnections()
+      await vi.waitFor(() => expect(finishedResult).toEqual({
+        status: 'failed',
+        detail: 'runner-auth-failed: binding revoked after authorization rejection',
+      }), { timeout: 5_000 })
+      expect(revocations).toEqual([pairedRecord.bindingId])
+    } finally {
+      handle.forceStop()
+      await stub.stop()
+    }
+  })
+
+  it('recovers again and reopens job control while an earlier recovery stream is parked', async () => {
+    const stub = await new StubControlPlane({ token, supportedVersions: [2] }).start()
+    const recovery = parkedRecovery(liveSession())
+    const runtime = createProductionRunnerRuntime({
+      clock: { now: Date.now, sleep: async () => undefined },
+      shutdown: async () => [],
+    })
+    const handle = await runtime.start(pairedState(stub), recovery.jobControl)
+    try {
+      await vi.waitFor(() => expect(recovery.recoveries()).toBe(1))
+      stub.dropConnections()
+      await vi.waitFor(() => expect(recovery.recoveries()).toBe(2), { timeout: 5_000 })
+      const retired = jobControlChannel(stub)!
+      stub.closeToRunner(retired, 'peer fault')
+      await vi.waitFor(() => {
+        expect(jobControlChannel(stub)).toBeDefined()
+        expect(jobControlChannel(stub)).not.toBe(retired)
+      }, { timeout: 5_000 })
+      expect(stub.opens).toEqual([jobControlChannel(stub)])
+      await vi.waitFor(() => expect(recovery.recoveries()).toBe(3))
     } finally {
       handle.forceStop()
       await stub.stop()

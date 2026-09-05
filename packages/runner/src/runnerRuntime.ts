@@ -130,7 +130,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
       this.selectedProtocol = protocol
       this.connectionId = randomUUID()
       if (!this.channel) this.channel = this.client.openChannel('job-control')
-      this.track(() => this.recoverChannel())
+      this.dispatch(() => this.recoverChannel())
     } catch {
       this.track(async () => { throw new Error('job-control activation failed') })
     }
@@ -173,7 +173,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
     // peer should not have sent is not: the contract asks only that the job-control channel
     // close, so the connection gets a replacement instead of dying with every session on it.
     if (effect.error === 'storage-unavailable') throw new Error('job-control failed closed')
-    this.track(() => this.activateChannel())
+    this.dispatch(() => this.activateChannel())
   }
 
   private retireChannel(detail: unknown, reopen: boolean) {
@@ -181,7 +181,7 @@ class RuntimeHandle implements RunnerRuntimeHandle {
     if (!this.channel || channelId !== this.channel.id) return
     this.markChannelInterrupted()
     this.channel = undefined
-    if (reopen && this.selectedProtocol !== null && this.client.isConnected()) this.track(() => this.activateChannel())
+    if (reopen && this.selectedProtocol !== null && this.client.isConnected()) this.dispatch(() => this.activateChannel())
   }
 
   private markChannelInterrupted() {
@@ -255,9 +255,10 @@ class RuntimeHandle implements RunnerRuntimeHandle {
     this.queue = this.queue.then(() => this.failClosed(operation))
   }
 
-  // A launch parks until its session ends, so chaining request dispatch onto the lifecycle
-  // queue would let one live session block recovery, revocation, connection failure and every
-  // later request on the connection. Dispatches run beside the queue; shutdown drains both.
+  // A launch parks until its session ends, and recovery re-adopts a live session the same way,
+  // so chaining request dispatch or recovery onto the lifecycle queue would let one live session
+  // block revocation, connection failure, channel reopening and every later request on the
+  // connection. Only terminal work stays on the queue; shutdown drains the queue and these too.
   private dispatch(operation: () => Promise<void>) {
     const running = this.failClosed(operation).finally(() => { this.dispatches.delete(running) })
     this.dispatches.add(running)
