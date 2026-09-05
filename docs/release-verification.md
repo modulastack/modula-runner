@@ -154,10 +154,11 @@ npm run release:build
 cmp "dist/release/$artifact" "$dir/$artifact"
 ```
 
-The platform-specific acceptance suite is separate from the byte rebuild: preview containment tests
-require a Linux host with unprivileged user and network namespaces plus `tmux`, while other supported
-verification hosts may not provide those capabilities. Release CI runs that suite on its prepared
-Linux runner. The exact build and `cmp` are the portable R1 reproducibility proof.
+The platform-specific acceptance suite is separate from the byte rebuild: namespace-prevention
+preview containment tests require a Linux host with unprivileged user and network namespaces plus
+`tmux`. macOS arm64 verifies the detect-and-stop preview posture, runner-home descriptor storage,
+audit custody, and installed runtime. The exact build and `cmp` remain the portable R1
+reproducibility proof.
 
 `cmp` must produce no output and exit zero. Sigstore certificates, attestation records, SBOM UUIDs and
 timestamps, and GitHub release metadata are intentionally not byte-reproducible; the signed `.tgz`

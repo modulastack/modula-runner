@@ -14,6 +14,7 @@ import {
 } from '@modulastack/runner-protocol'
 import { backoffDelay, type BackoffOptions } from './backoff.js'
 import { ChannelStore } from './channels.js'
+import type { ChannelRecoveryMode } from './channels.js'
 import { Heartbeat } from './liveness.js'
 import { ChannelReconciler } from './reconciliation.js'
 import { Transport } from './transport.js'
@@ -40,6 +41,11 @@ export type ChannelHandle = {
   kind: ChannelKind
   send: (payload: Payload) => void
   close: (reason?: string) => void
+  setRecovery: (recovery: ChannelRecoveryMode) => void
+}
+
+export type OpenChannelOptions = {
+  recovery?: ChannelRecoveryMode
 }
 
 type Phase = 'idle' | 'running' | 'stopped' | 'failed'
@@ -131,9 +137,9 @@ export class RunnerClient extends EventEmitter {
     return this.store.ids()
   }
 
-  openChannel(kind: ChannelKind): ChannelHandle {
+  openChannel(kind: ChannelKind, options: OpenChannelOptions = {}): ChannelHandle {
     this.assertUsable()
-    const state = this.store.open(kind)
+    const state = this.store.open(kind, options.recovery)
     if (this.connected) this.sendRaw({ type: 'open', channel: state.id, kind, attachToken: state.attachToken })
     return {
       id: state.id,
@@ -145,6 +151,7 @@ export class RunnerClient extends EventEmitter {
         this.reconciler.pump(state.id)
       },
       close: reason => this.reconciler.close(state.id, reason),
+      setRecovery: recovery => this.store.setRecovery(state.id, recovery),
     }
   }
 

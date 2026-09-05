@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { hasControlCharacter } from '@modulastack/runner-protocol'
@@ -131,7 +132,11 @@ export function createGrants(options: GrantsOptions): Grants {
 
 // An in-memory grant store, for tests and for a runner that has not been told where to persist.
 export function createMemoryGrantStore(initial: readonly string[] = []): GrantStore {
-  let records: GrantRecord[] = initial.map(target => ({ path: path.resolve(target), grantedAt: '1970-01-01T00:00:00.000Z' }))
+  let records: GrantRecord[] = initial.map(target => ({
+    path: resolveInitialGrant(target),
+    alias: path.resolve(target),
+    grantedAt: '1970-01-01T00:00:00.000Z',
+  }))
   let queue: Promise<unknown> = Promise.resolve()
   return {
     read: async () => records.map(record => ({ ...record })),
@@ -145,6 +150,14 @@ export function createMemoryGrantStore(initial: readonly string[] = []): GrantSt
       queue = result.catch(() => {})
       return result
     },
+  }
+}
+
+function resolveInitialGrant(target: string): string {
+  try {
+    return realpathSync(path.resolve(target))
+  } catch {
+    return path.resolve(target)
   }
 }
 

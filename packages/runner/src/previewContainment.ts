@@ -23,18 +23,15 @@ import { fileURLToPath } from 'node:url'
 // It is honest about its limits. Where the kernel denies an unprivileged user+network namespace,
 // there is no prevention to offer, so the runner degrades to detect-and-stop and *says so* — a
 // containment that silently became detection would be worse than one that never claimed to exist.
-// On macOS there is no clean equivalent at all, so containment is not applicable by platform, and
-// the surface says that too rather than implying a guarantee it cannot keep. Detect-and-stop always
-// runs underneath as defense in depth, so a host-visible listener that should have been contained is
-// still found and stopped if it ever appears.
+// On macOS there is no clean equivalent at all, so the runner makes only the detect-and-stop
+// promise. It never claims namespace prevention there, but it still runs bounded local inspection
+// and tears down host-visible non-loopback listeners.
 
 export type ContainmentDisposition =
   // OS-level prevention is active: previews run in a loopback-only network namespace.
   | 'network-namespace'
   // The host denied namespace creation; previews run under detect-and-stop only, stated plainly.
   | 'detect-and-stop'
-  // No clean equivalent on this platform (macOS); prevention is not applicable, stated plainly.
-  | 'unavailable-by-platform'
 
 export type ContainmentStatus = {
   disposition: ContainmentDisposition
@@ -84,7 +81,7 @@ export function detectPreviewContainment(options: ContainmentOptions = {}): Prev
 }
 
 function detectDisposition(platform: NodeJS.Platform): ContainmentDisposition {
-  if (platform !== 'linux') return 'unavailable-by-platform'
+  if (platform !== 'linux') return 'detect-and-stop'
   return namespaceContainmentAvailable() ? 'network-namespace' : 'detect-and-stop'
 }
 
@@ -100,11 +97,10 @@ function namespaceContainment(platform: NodeJS.Platform): PreviewContainment {
   }
 }
 
-function fallbackContainment(disposition: 'detect-and-stop' | 'unavailable-by-platform', platform: NodeJS.Platform): PreviewContainment {
-  const detail =
-    disposition === 'unavailable-by-platform'
-      ? `OS preview containment is unavailable on this platform (${platform}); prevention is not applicable — previews run under detect-and-stop only.`
-      : 'OS preview containment is unavailable on this host (namespace creation denied); previews run under detect-and-stop only.'
+function fallbackContainment(disposition: 'detect-and-stop', platform: NodeJS.Platform): PreviewContainment {
+  const detail = platform === 'linux'
+    ? 'OS preview containment is unavailable on this host (namespace creation denied); previews run under detect-and-stop only.'
+    : `OS preview namespace prevention is unavailable on this platform (${platform}); previews run under detect-and-stop only.`
   return { status: { disposition, platform, prevention: false, detail }, spawn: spawnDirect }
 }
 

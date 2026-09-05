@@ -96,6 +96,17 @@ describe('channel store', () => {
     expect(store.nextOutbound(second.id, 0).frame?.seq).toBe(1)
   })
 
+  it('ignores a recovery mode set on a dropped channel while still recording it on a live one', () => {
+    const store = new ChannelStore()
+    const dropped = store.open('terminal')
+    store.drop(dropped.id)
+    expect(() => store.setRecovery(dropped.id, 'application-reset')).not.toThrow()
+
+    const live = store.open('terminal')
+    store.setRecovery(live.id, 'application-reset')
+    expect(store.get(live.id)?.recovery).toBe('application-reset')
+  })
+
   it('offers a reset when eviction has outrun the flush position', () => {
     const store = new ChannelStore(1)
     const { id } = store.open('terminal')

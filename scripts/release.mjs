@@ -36,8 +36,9 @@ async function releaseVersion(projectRoot = root) {
   const workspace = await readJson('package.json', projectRoot)
   const runner = await readJson('packages/runner/package.json', projectRoot)
   const protocol = await readJson('packages/protocol/package.json', projectRoot)
+  const darwinFileLock = await readJson('packages/darwin-file-lock/package.json', projectRoot)
   const fileLock = await readJson('packages/linux-file-lock/package.json', projectRoot)
-  const versions = [workspace.version, runner.version, protocol.version, fileLock.version]
+  const versions = [workspace.version, runner.version, protocol.version, darwinFileLock.version, fileLock.version]
   if (new Set(versions).size !== 1) {
     throw new Error(`workspace versions differ: root ${workspace.version}, runner ${runner.version}, protocol ${protocol.version}, file lock ${fileLock.version}`)
   }
@@ -58,12 +59,20 @@ async function validateToolchain(projectRoot = root, environment = process.env) 
 }
 
 async function validateReleaseRuntime(projectRoot, expectedNode) {
-  const paths = ['package.json', 'packages/runner/package.json', 'packages/linux-file-lock/package.json']
-  for (const path of paths) {
+  const platformManifests = ['package.json', 'packages/runner/package.json']
+  for (const path of platformManifests) {
     const manifest = await readJson(path, projectRoot)
     if (manifest.engines?.node !== expectedNode) throw new Error(`${path} must require Node ${expectedNode}`)
-    if (JSON.stringify(manifest.os) !== '["linux"]') throw new Error(`${path} must support Linux only`)
+    if (JSON.stringify(manifest.os) !== '["darwin","linux"]') throw new Error(`${path} must support Darwin and Linux only`)
     if (JSON.stringify(manifest.cpu) !== '["x64","arm64"]') throw new Error(`${path} must support x64 and arm64 only`)
+  }
+  const runner = await readJson('packages/runner/package.json', projectRoot)
+  if (runner.dependencies?.['@modulastack/darwin-file-lock'] !== runner.version) throw new Error('runner must depend on the Darwin native package')
+  if (runner.optionalDependencies?.['@modulastack/linux-file-lock'] !== runner.version) throw new Error('runner must retain the optional Linux native package')
+  for (const path of ['packages/darwin-file-lock/package.json', 'packages/linux-file-lock/package.json']) {
+    const manifest = await readJson(path, projectRoot)
+    if (manifest.engines?.node !== expectedNode) throw new Error(`${path} must require Node ${expectedNode}`)
+    if (manifest.os || manifest.cpu) throw new Error(`${path} must rely on runtime guards instead of npm's cross-product platform claims`)
   }
 }
 
@@ -87,14 +96,14 @@ async function copyPackage(packageName, staging, projectRoot) {
   delete manifest.private
   await mkdir(target, { recursive: true })
   await writeFile(join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
-  if (packageName === 'linux-file-lock') {
+  if (packageName === 'linux-file-lock' || packageName === 'darwin-file-lock') {
     await Promise.all([
       copyFile(join(source, 'index.js'), join(target, 'index.js')),
       copyFile(join(source, 'index.d.ts'), join(target, 'index.d.ts')),
-      copyFile(join(source, 'UPSTREAM-LICENSE.txt'), join(target, 'UPSTREAM-LICENSE.txt')),
       copyFile(join(source, 'VENDORING.md'), join(target, 'VENDORING.md')),
       cp(join(source, 'binaries'), join(target, 'binaries'), { recursive: true }),
     ])
+    if (packageName === 'linux-file-lock') await copyFile(join(source, 'UPSTREAM-LICENSE.txt'), join(target, 'UPSTREAM-LICENSE.txt'))
     return
   }
   await cp(join(source, 'dist'), join(target, 'dist'), { recursive: true })
@@ -116,9 +125,11 @@ function releaseShrinkwrap(shrinkwrap, manifest) {
     engines: manifest.engines,
   }
   shrinkwrap.packages[''] = root
+  delete shrinkwrap.packages['packages/darwin-file-lock']
   delete shrinkwrap.packages['packages/linux-file-lock']
   delete shrinkwrap.packages['packages/protocol']
   delete shrinkwrap.packages['packages/runner']
+  delete shrinkwrap.packages['node_modules/@modulastack/darwin-file-lock']
   delete shrinkwrap.packages['node_modules/@modulastack/linux-file-lock']
   delete shrinkwrap.packages['node_modules/@modulastack/runner-protocol']
   delete shrinkwrap.packages['node_modules/modula-runner']
@@ -131,6 +142,7 @@ function releaseShrinkwrap(shrinkwrap, manifest) {
 async function rewriteWorkspaceImports(staging) {
   const runnerDist = join(staging, 'packages', 'runner', 'dist')
   const targets = {
+    '@modulastack/darwin-file-lock': join(staging, 'packages', 'darwin-file-lock', 'index.js'),
     '@modulastack/linux-file-lock': join(staging, 'packages', 'linux-file-lock', 'index.js'),
     '@modulastack/runner-protocol': join(staging, 'packages', 'protocol', 'dist', 'index.js'),
   }
@@ -187,6 +199,7 @@ async function stageRelease(staging, version, toolchain, projectRoot) {
   await writeFile(join(staging, 'npm-shrinkwrap.json'), `${JSON.stringify(shrinkwrap, null, 2)}\n`)
   await copyFile(join(projectRoot, 'README.md'), join(staging, 'README.md'))
   await copyFile(join(projectRoot, 'LICENSE'), join(staging, 'LICENSE'))
+  await copyPackage('darwin-file-lock', staging, projectRoot)
   await copyPackage('linux-file-lock', staging, projectRoot)
   await copyPackage('protocol', staging, projectRoot)
   await copyPackage('runner', staging, projectRoot)
@@ -194,7 +207,23 @@ async function stageRelease(staging, version, toolchain, projectRoot) {
   await chmod(join(staging, 'packages', 'runner', 'dist', 'bin', 'modula-runner.js'), 0o755)
   const lockfileSha256 = await sha256(join(staging, 'npm-shrinkwrap.json'))
   const sourceLockfileSha256 = await sha256(join(projectRoot, 'package-lock.json'))
-  const metadata = { artifact: 'modula-runner', version, expectedTag: `v${version}`, toolchain, lockfileSha256, sourceLockfileSha256 }
+  const darwinNativePath = join(projectRoot, 'packages', 'darwin-file-lock', 'binaries', 'fs-ext-darwin-arm64-node-22.0.0.node')
+  const metadata = {
+    artifact: 'modula-runner',
+    version,
+    expectedTag: `v${version}`,
+    toolchain,
+    lockfileSha256,
+    sourceLockfileSha256,
+    native: {
+      darwinArm64: {
+        packagePath: 'packages/darwin-file-lock/binaries/fs-ext-darwin-arm64-node-22.0.0.node',
+        sourcePath: 'packages/runner/native/darwin_runner_home.c',
+        verification: 'scripts/verify-darwin-runner-home-native.mjs',
+        sha256: await sha256(darwinNativePath),
+      },
+    },
+  }
   await writeFile(join(staging, 'BUILD-METADATA.json'), `${JSON.stringify(metadata, null, 2)}\n`)
 }
 
@@ -231,6 +260,9 @@ async function buildRelease(output, compile = true, options = {}) {
       rm(join(context.projectRoot, 'packages', 'runner', 'dist'), { recursive: true, force: true }),
     ])
     run('npm', ['run', 'build'], { cwd: context.projectRoot, env: context.environment })
+  }
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    run('node', ['scripts/verify-darwin-runner-home-native.mjs'], { cwd: context.projectRoot, env: context.environment })
   }
   await mkdir(output, { recursive: true })
   await Promise.all([

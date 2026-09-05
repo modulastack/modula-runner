@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import path from 'node:path'
 import type { RefusalReason } from '@modulastack/runner-protocol'
 import type { AuditLog, SpawnOutcome } from './auditLog.js'
 import type { CommandPolicy } from './allowlist.js'
@@ -137,20 +139,21 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   // seam supplies the whole command line. A direct executable is checked by name; its args are
   // the runner's own machinery, not the wire's. A null policy is the fail-closed state — an
   // unverifiable allowlist is not a permissive one — so nothing resolves and everything refuses.
-  const resolve = (request: SpawnRequest): { command: string; args: readonly string[] } | null => {
+  const resolve = (request: SpawnRequest): { command: string; args: readonly string[]; auditExecutable: string | null } | null => {
     if (request.recipeId !== undefined) {
       const recipe = options.policy?.recipe(request.recipeId)
-      return recipe ? { command: recipe.command, args: recipe.args } : null
+      return recipe ? { command: canonicalPath(recipe.command), args: recipe.args, auditExecutable: null } : null
     }
-    if (request.executable !== undefined && options.policy?.allowsExecutable(request.executable)) {
-      return { command: request.executable, args: request.args ?? [] }
+    if (request.executable !== undefined) {
+      const command = admittedCommand(options.policy, request.executable)
+      if (command !== null) return { command, args: request.args ?? [], auditExecutable: command }
     }
     return null
   }
 
   const check = (executable: string, recipeId?: string): boolean => {
     if (recipeId !== undefined) return options.policy?.recipe(recipeId) != null
-    return options.policy?.allowsExecutable(executable) ?? false
+    return admittedCommand(options.policy, executable) !== null
   }
 
   const auditRefusal = (request: SpawnRequest, reason: RefusalReason) =>
@@ -176,7 +179,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
     // A grant-scoped request requires a grant, so it fails closed: with no consent policy to
     // consult there is no way to prove the cwd is granted, and an unprovable grant is a refused
     // one — never taken as-is. With consent present, an ungranted cwd is refused the same way.
-    let cwd = request.cwd
+    let cwd = canonicalPath(request.cwd)
     if (request.grantScoped) {
       if (!options.consent) {
         await auditRefusal(request, 'path-not-granted')
@@ -201,7 +204,7 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
         spawnId,
         spawnKind: request.kind,
         requestId: request.requestId ?? null,
-        executable: request.recipeId !== undefined ? resolved.command : (request.executable ?? null),
+        executable: request.recipeId !== undefined ? resolved.command : resolved.auditExecutable,
         recipeId: request.recipeId ?? null,
         cwd,
         at: at(),
@@ -258,6 +261,33 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   }
 
   return { check, recordRefusal: auditRefusal, authorize, run }
+}
+
+// One predicate decides admission and names the command it admitted: the signed document's own
+// membership test, applied to the name asked for and — for an operator who named a symlinked
+// absolute path — to what it resolves to. Matching a listed entry's realpath instead would be a
+// second, weaker gate over the same set. The single resolution is the point: resolving again to
+// build the command would let a symlink swapped in between be checked as one target and executed
+// as another, so the value returned here is both the thing approved and the thing spawned.
+function admittedCommand(policy: CommandPolicy | null, executable: string): string | null {
+  if (!policy) return null
+  const canonical = canonicalPath(executable)
+  if (policy.allowsExecutable(executable)) return canonical
+  return canonical !== executable && policy.allowsExecutable(canonical) ? canonical : null
+}
+
+// Only absolute paths are canonicalized. macOS needs this because /var and /tmp are symlinks, so a
+// grant, a temp dir or a worktree root records a different spelling than the one it is compared
+// against. A bare executable name has no such spelling: resolving it here would bind it to the
+// process working directory, while the exec that follows performs a PATH search — so it is left
+// alone and resolution stays where the exec happens, in exactly one place.
+function canonicalPath(value: string): string {
+  if (!path.isAbsolute(value)) return value
+  try {
+    return realpathSync(value)
+  } catch {
+    return value
+  }
 }
 
 // Retries a spawn's outcome completion until the record is durable, bounded. A rejected append

@@ -246,6 +246,7 @@ export class TerminalHost {
   private sessionEvents(channel: ChannelHandle): TerminalSessionEvents {
     return {
       send: message => {
+        if (message.type === 'READY') channel.setRecovery('application-reset')
         this.deliver(channel, message)
         if (message.type === 'EXIT') this.reportExit(channel.id, message)
       },

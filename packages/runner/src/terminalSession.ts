@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants as fsConstants, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { constants as osConstants, tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -25,6 +26,8 @@ import type { SecretEnv } from './secretEnv.js'
 import { completeDurably, type Authorization, type SpawnSeam } from './spawnSeam.js'
 import type { SpawnOutcome } from './auditLog.js'
 
+const require = createRequire(import.meta.url)
+
 export type FlowPolicy = { highWaterBytes: number; lowWaterBytes: number; flushMs: number }
 
 // The same watermarks the localhost terminal stack runs today.
@@ -45,6 +48,8 @@ const REPLAY_REFILL_MS = 2_000
 // an outage that outlasts one burst. Paced well above the burst's own retry so an audit outage
 // stays a slow retry, never a tight loop.
 const EXIT_OUTCOME_REDRIVE_MS = 1_000
+const PANE_LANDING_POLL_MS = 25
+const PANE_LANDING_READBACK_MS = 500
 
 const EXIT_FILE_ENV = 'MODULA_RUNNER_EXIT_FILE'
 // The wrapper writes the wrapped command's exit code before the tmux session can
@@ -118,6 +123,48 @@ function assertSessionMetadata(spec: { command: string; cwd: string; profile: st
       throw new Error(`${field} must be a non-empty string of at most ${MAX_METADATA_LENGTH} characters`)
     }
   }
+}
+
+let nodePtyHelperPrepared = false
+
+// node-pty's Darwin prebuild ships its spawn-helper without an execute bit, and npm preserves
+// that on install, so every pty spawn would fail with EACCES on a clean install. This is the
+// file node-pty execs only when it loaded that prebuild: it searches build/Release first, and an
+// install built from source deletes the prebuilds tree outright and execs the helper its own
+// build produced already executable. So an absent helper, or one a root-owned or read-only
+// install will not let this process repair, is not this function's to answer for and is left to
+// pty.spawn to report. Only the case the execute bit exists for stays hard: a helper that is
+// present and still cannot run fails the attach here rather than as a silently dead pty. It
+// gains the owner's execute bit and nothing else — nothing is widened for other users.
+function ensureNodePtySpawnHelperExecutable() {
+  if (nodePtyHelperPrepared || process.platform !== 'darwin') return
+  const helper = path.resolve(
+    path.dirname(require.resolve('node-pty')),
+    '..',
+    'prebuilds',
+    `${process.platform}-${process.arch}`,
+    'spawn-helper',
+  )
+  let mode: number
+  try {
+    mode = statSync(helper).mode & 0o777
+  } catch {
+    // No prebuild here means node-pty is loading a locally built binding whose helper is already
+    // executable, so there is nothing to prepare and a genuinely broken install must surface as
+    // pty.spawn's own error instead of a failed attach.
+    nodePtyHelperPrepared = true
+    return
+  }
+  if ((mode & 0o100) === 0) {
+    try {
+      chmodSync(helper, mode | 0o100)
+    } catch {
+      // A root-owned or read-only install cannot be repaired from here; the check below still
+      // decides whether the helper is usable exactly as it stands.
+    }
+  }
+  accessSync(helper, fsConstants.X_OK)
+  nodePtyHelperPrepared = true
 }
 
 // The secret half of a launch reaches the command through a file the wrapper sources and
@@ -390,11 +437,16 @@ export class TerminalSession {
     const verifyLanding = authorization.verifyLanding
     if (!verifyLanding) return true
     if (!processCwdReadBackAvailable()) return true
-    const pid = await panePid(ref, seam)
-    if (pid === null) return await TerminalSession.paneAlreadyEnded(ref, seam)
-    const actual = await workingDirectoryOf(pid)
-    if (actual === null) return await TerminalSession.paneAlreadyEnded(ref, seam)
-    return await verifyLanding(actual)
+    const deadline = Date.now() + PANE_LANDING_READBACK_MS
+    do {
+      if (await TerminalSession.paneAlreadyEnded(ref, seam)) return true
+      const pid = await panePid(ref, seam)
+      if (pid === null) return await TerminalSession.paneAlreadyEnded(ref, seam)
+      const actual = await workingDirectoryOf(pid)
+      if (actual !== null) return await verifyLanding(actual)
+      await new Promise(resolve => setTimeout(resolve, PANE_LANDING_POLL_MS))
+    } while (Date.now() < deadline)
+    return await TerminalSession.paneAlreadyEnded(ref, seam)
   }
 
   // Only an ended pane makes an unreadable cwd harmless: a live pane whose directory cannot be read
@@ -596,6 +648,7 @@ export class TerminalSession {
     // the session's creation already cleared it; this keeps the "every tmux invocation passes
     // the seam" rule true even if a policy changed between create and attach.
     if (!this.seam.check('tmux')) return
+    ensureNodePtySpawnHelperExecutable()
     const proc = pty.spawn('tmux', tmuxAttachArgs(this.ref), {
       name: 'xterm-256color',
       cols: this.cols,
@@ -892,6 +945,7 @@ export class TerminalSession {
   }
 
   private replay() {
+    const supersedeQueued = !this.replayBarrier
     this.replayBarrier = true
     if (this.replaying) {
       this.replayQueued = true
@@ -902,9 +956,11 @@ export class TerminalSession {
     // capture is about to take — the snapshot happens later — so it is set
     // aside rather than re-sent after it. A capture that fails hands it back:
     // duplication is cosmetic, loss is not.
-    const superseded = this.outputQueue
-    this.outputQueue = []
-    this.queuedBytes = 0
+    const superseded = supersedeQueued ? this.outputQueue : []
+    if (supersedeQueued) {
+      this.outputQueue = []
+      this.queuedBytes = 0
+    }
     void captureTmuxScrollback(this.ref, this.policy.replayLines, this.seam, () => !this.disposed && !this.finished)
       .then(data => this.emitReplay(data, superseded))
       .then(() => {

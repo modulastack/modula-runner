@@ -102,11 +102,13 @@ async function expectInvalidPeerSemanticsRejected(
 async function temporaryWorkspace() {
   const target = await mkdtemp(join(tmpdir(), 'modula-runner-supply-test-'))
   workspaces.push(target)
+  await mkdir(join(target, 'packages', 'darwin-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'linux-file-lock'), { recursive: true })
   await mkdir(join(target, 'packages', 'protocol'), { recursive: true })
   await mkdir(join(target, 'packages', 'runner'), { recursive: true })
   await cp(join(root, 'package.json'), join(target, 'package.json'))
   await cp(join(root, 'package-lock.json'), join(target, 'package-lock.json'))
+  await cp(join(root, 'packages', 'darwin-file-lock', 'package.json'), join(target, 'packages', 'darwin-file-lock', 'package.json'))
   await cp(join(root, 'packages', 'linux-file-lock', 'package.json'), join(target, 'packages', 'linux-file-lock', 'package.json'))
   await cp(join(root, 'packages', 'protocol', 'package.json'), join(target, 'packages', 'protocol', 'package.json'))
   await cp(join(root, 'packages', 'runner', 'package.json'), join(target, 'packages', 'runner', 'package.json'))
@@ -257,7 +259,7 @@ describe('release supply-chain gate', () => {
     expect(sbom.specVersion).toBe('1.5')
     expect(sbom.metadata.component.name).toBe('modula-runner-workspace')
     expect(sbom.components.map((component: { name: string }) => component.name)).toEqual([
-      'node-addon-api', 'node-pty', 'ws', '@modulastack/linux-file-lock', '@modulastack/runner-protocol', 'modula-runner',
+      'node-addon-api', 'node-pty', 'ws', '@modulastack/darwin-file-lock', '@modulastack/linux-file-lock', '@modulastack/runner-protocol', 'modula-runner',
     ])
     expect(JSON.stringify(sbom)).not.toContain('cdx:npm:package:development')
     const subject = sbom.dependencies.find(

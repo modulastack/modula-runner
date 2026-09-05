@@ -529,12 +529,15 @@ jobs:
              .workflow_run.head_repository_id==$repository' \
             <<<"$artifact_json" >/dev/null
 
-          mapfile -d '' archives < <(find "$DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 -type f -print0)
+          archives=()
+          while IFS= read -r -d '' archive_path; do
+            archives+=("$archive_path")
+          done < <(find "$DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 -type f -print0)
           test "${#archives[@]}" -eq 1
           test -z "$(find "$DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
           archive="${archives[0]}"
-          test "$(stat -c '%s' "$archive")" -eq "$ARTIFACT_SIZE"
-          test "sha256:$(sha256sum "$archive" | cut -d' ' -f1)" = "$ARTIFACT_DIGEST"
+          test "$(python3 -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "$archive")" -eq "$ARTIFACT_SIZE"
+          test "sha256:$(python3 -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$archive")" = "$ARTIFACT_DIGEST"
 
           directory="$RUNNER_TEMP/validated-build-evidence"
           rm -rf -- "$directory"
@@ -682,8 +685,8 @@ jobs:
           for name in "${expected[@]}"; do
             source="$directory/$name"
             test -s "$source"
-            size="$(stat -c '%s' "$source")"
-            digest="$(sha256sum "$source" | cut -d' ' -f1)"
+            size="$(python3 -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "$source")"
+            digest="$(python3 -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$source")"
             test "$(jq --arg name "$name" '[.assets[] | select(.name==$name)] | length' \
               "$manifest")" -eq 1
             jq -e --arg name "$name" --arg digest "$digest" --argjson size "$size" \
@@ -692,8 +695,21 @@ jobs:
           done
           artifact="$directory/modula-runner-${version}.tgz"
           sbom="$directory/modula-runner.cdx.json"
-          test "$(sha256sum "$artifact" | cut -d' ' -f1)" = "$BUILD_PACKAGE_DIGEST"
-          (cd "$directory" && sha256sum --strict --check SHA256SUMS)
+          test "$(python3 -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$artifact")" = "$BUILD_PACKAGE_DIGEST"
+          python3 - "$directory/SHA256SUMS" "$directory" <<'PY'
+          import hashlib
+          import os
+          import sys
+
+          sums, directory = sys.argv[1:]
+          for line in open(sums, encoding="utf-8"):
+              digest, name = line.strip().split(None, 1)
+              name = name.lstrip("*")
+              path = os.path.join(directory, name)
+              actual = hashlib.file_digest(open(path, "rb"), "sha256").hexdigest()
+              if actual != digest:
+                  raise SystemExit(f"checksum mismatch: {name}")
+          PY
           jq -e '.production.blocked==[] and
             (.developmentOnly.blocking==false) and
             (.waiversApplied | type)=="array"' "$directory/audit-summary.json" >/dev/null

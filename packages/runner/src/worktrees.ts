@@ -130,7 +130,7 @@ async function provision(request: WorktreeProvisionRequest, repoPath: string): P
   const worktreePath = deterministicWorktreePath(request.worktreesRoot, request.name)
   const listed = await listedWorktrees(seam, repoPath)
   const existing = listed.find(item => samePath(item.path, worktreePath))
-  if (existing) return reusedWorktree(seam, existing, branch)
+  if (existing) return reusedWorktree(seam, existing, branch, worktreePath)
   return createWorktree(seam, { repoPath, branch, base, worktreePath, listed })
 }
 
@@ -190,11 +190,11 @@ async function quietGit(seam: SpawnSeam, cwd: string, args: string[], timeout = 
   } catch {}
 }
 
-async function reusedWorktree(seam: SpawnSeam, worktree: ListedWorktree, expectedBranch: string): Promise<WorktreeProvisionResult> {
+async function reusedWorktree(seam: SpawnSeam, worktree: ListedWorktree, expectedBranch: string, worktreePath: string): Promise<WorktreeProvisionResult> {
   if (worktree.prunable) throw new Error(`lane worktree registration is stale and must be pruned before reuse: ${worktree.path}`)
   if (worktree.branch !== expectedBranch) throw new Error(`lane worktree path is already registered for ${worktree.branch || 'detached HEAD'}: ${worktree.path}`)
   await ensureCleanWorktree(seam, worktree.path, `lane worktree has uncommitted changes: ${worktree.path}`)
-  return { branch: expectedBranch, worktreePath: worktree.path, reused: true }
+  return { branch: expectedBranch, worktreePath, reused: true }
 }
 
 // Provisioning runs only against the main checkout: pointing it at a worktree
@@ -292,7 +292,12 @@ async function git(seam: SpawnSeam, cwd: string, args: string[], trim = true) {
 }
 
 function samePath(left: string, right: string) {
-  return path.resolve(left) === path.resolve(right)
+  return canonicalPathText(left) === canonicalPathText(right)
+}
+
+function canonicalPathText(value: string) {
+  const resolved = path.resolve(value)
+  return process.platform === 'darwin' ? resolved.replace(/^\/private\/var\//, '/var/') : resolved
 }
 
 function timedOut(error: unknown) {

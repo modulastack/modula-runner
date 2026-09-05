@@ -182,10 +182,20 @@ export class ChannelReconciler {
     // watermark: replaying the whole retained buffer is the only position that
     // cannot silently lose frames, and the contiguity rule discards the duplicates.
     const impossibleAck = result.receivedSeq > (this.presented.get(result.id) ?? 0)
+    const appReset = !impossibleAck && state.recovery === 'application-reset' && result.receivedSeq < state.sentSeq
     state.flushedSeq = impossibleAck ? 0 : result.receivedSeq
-    const outcome = this.pump(result.id)
+    const outcome = appReset ? this.resetForApplicationReplay(result.id, state.sentSeq) : this.pump(result.id)
     if (impossibleAck) events.push({ name: 'protocol-error', detail: { message: 'resume beyond sent sequence', channel: result.id } })
     if (!this.closing.has(result.id)) events.push({ name: 'channel-resumed', detail: { channel: result.id, replayed: outcome.sent, reset: outcome.reset } })
+  }
+
+  private resetForApplicationReplay(id: string, sentSeq: number): PumpOutcome {
+    this.deps.sendFrame({ type: 'reset', channel: id, seq: sentSeq + 1 })
+    const state = this.deps.store.get(id)
+    if (state) state.flushedSeq = sentSeq
+    if (this.reconciling) this.deferredResets.push(id)
+    else this.deps.onOutboundReset(id)
+    return { sent: 0, reset: true }
   }
 
   private reannounce(id: string, events: ReconcileEvent[]) {

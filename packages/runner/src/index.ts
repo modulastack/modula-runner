@@ -360,6 +360,7 @@ export {
 export {
   createFileRunnerHomeStorage,
   type FileRunnerHomeStorageOptions,
+  type LeasedRunnerHomeStorage,
 } from './runnerHomeStorage.js'
 export {
   createRunnerTrustStore,

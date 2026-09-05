@@ -65,16 +65,18 @@ npm run release:reproducible  # performs two isolated npm ci/build/pack passes
 ```
 
 `release:build` compiles the runner and protocol workspaces and creates
-`dist/release/modula-runner-<version>.tgz`. The package also embeds the private Linux file-lock
-workspace, its vendoring record and license, and reviewed Node 22 native members for Linux x64 and
-arm64. The current artifact requires Node `22.22.3` and Linux; Darwin remains unsupported until
-Forge issue #53 supplies its native descriptor-relative backend and evidence.
+`dist/release/modula-runner-<version>.tgz`. The package embeds the private native file-lock
+workspaces: reviewed Node 22 members for Linux x64/arm64 and the verified Darwin arm64
+descriptor-relative runner-home backend. The current artifact requires Node `22.22.3` and supports
+Linux x64, Linux arm64, and macOS arm64. macOS x64 is rejected at runtime because npm cannot express
+that OS/CPU matrix without claiming the unsupported cross-product.
 
 The package contains a production-only `npm-shrinkwrap.json`, license, README, and deterministic
 build metadata. Staging internalizes runner imports of the bundled workspaces and promotes the
 runner's external runtime dependencies to the installable root manifest; otherwise an installed
 archive would contain sibling workspace bytes but still ask Node to resolve an unpublished package.
-Build metadata binds both the staged shrinkwrap and the original source lockfile. The package
+Build metadata binds both the staged shrinkwrap, the original source lockfile, and the Darwin native
+source/build provenance plus SHA-256. The package
 contains no tests or TypeScript source. `release:reproducible` snapshots tracked working-tree
 source before either comparison begins, performs exactly two independently isolated
 install/build/staging/packing passes, fails unless their package bytes match, and preserves the first

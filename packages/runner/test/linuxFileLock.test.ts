@@ -3,8 +3,14 @@ import { mkdtemp, open, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { tryExclusive, unlock } from '@modulastack/linux-file-lock'
 import { acquireLinuxRootLifetime, releaseLinuxRootLifetime, withLinuxRootLease } from '../src/linuxRootLease.js'
+
+const linuxOnly = process.platform === 'linux'
+const linuxIt = linuxOnly ? it : it.skip
+const linuxLock = linuxOnly
+  ? await import('@modulastack/linux-file-lock')
+  : { tryExclusive: async () => 'contended' as const, unlock: async () => undefined }
+const { tryExclusive, unlock } = linuxLock
 
 const binaries = {
   arm64: '80c10393d3698397e35d30f0edca8d05f938c9f5f8be1a747d0bd56cedce6d06',
@@ -24,7 +30,7 @@ describe('private Linux file-lock boundary', () => {
     }
   })
 
-  it('hands a retained transient lease to a queued lifetime acquisition', async () => {
+  linuxIt('hands a retained transient lease to a queued lifetime acquisition', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'runner-root-lease-handoff-'))
     const first = await open(directory, 'r')
     const second = await open(directory, 'r')
@@ -52,7 +58,7 @@ describe('private Linux file-lock boundary', () => {
     }
   })
 
-  it('takes an exclusive kernel lease on a directory file descriptor', async () => {
+  linuxIt('takes an exclusive kernel lease on a directory file descriptor', async () => {
     const first = await open('.', 'r')
     const second = await open('.', 'r')
     try {

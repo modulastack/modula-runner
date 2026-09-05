@@ -1,19 +1,42 @@
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { createFileRunnerHomeStorage as createStorage, type FileRunnerHomeStorageOptions, type RunnerHomeStorage } from '../src/index.js'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  createFileRunnerHomeStorage as createStorage,
+  type FileRunnerHomeStorageOptions,
+  type LeasedRunnerHomeStorage,
+  type RunnerHomeStorage,
+} from '../src/index.js'
+
+// The darwin adapter refuses any host that is not arm64, and that refusal is only safe if it is
+// reached before the storage touches the disk. Staging an adapter that refuses lets every platform
+// assert the ordering; unstaged, the real adapter is used and no other case here is affected.
+const stagedAdapterRefusal = vi.hoisted(() => ({ message: '' }))
+
+vi.mock('../src/descriptorRootAdapter.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/descriptorRootAdapter.js')>()
+  return {
+    ...actual,
+    descriptorRootAdapter: () => {
+      if (stagedAdapterRefusal.message) throw new Error(stagedAdapterRefusal.message)
+      return actual.descriptorRootAdapter()
+    },
+  }
+})
 
 const roots: string[] = []
 const storages: RunnerHomeStorage[] = []
 
-function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): RunnerHomeStorage {
+function createFileRunnerHomeStorage(options: FileRunnerHomeStorageOptions): LeasedRunnerHomeStorage {
   const storage = createStorage(options)
   storages.push(storage)
   return storage
 }
 
 afterEach(async () => {
+  stagedAdapterRefusal.message = ''
   await Promise.all(storages.splice(0).map(storage => storage.close?.()))
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
@@ -218,6 +241,29 @@ describe('file runner-home storage', () => {
     await contender.release!()
   })
 
+  it('certifies only the leased inode when a caller opens the home by path', async () => {
+    const { parent, root } = await temporaryHome()
+    const foreignRoot = path.join(parent, 'foreign-home')
+    await mkdir(foreignRoot, { mode: 0o700 })
+    const storage = createFileRunnerHomeStorage({ defaultRoot: root })
+    await storage.inspect({})
+    const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    const leased = await open(root, flags)
+    const foreign = await open(foreignRoot, flags)
+    try {
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(false)
+      await expect(storage.acquire!()).resolves.toBe('acquired')
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(true)
+      await expect(storage.leasesDescriptor(foreign)).resolves.toBe(false)
+
+      await rename(root, path.join(parent, 'moved-home'))
+      await mkdir(root, { mode: 0o700 })
+      await expect(storage.leasesDescriptor(leased)).resolves.toBe(false)
+    } finally {
+      await Promise.all([leased.close(), foreign.close()])
+    }
+  })
+
   it('gives legacy PID lock files no ownership authority', async () => {
     const { root } = await temporaryHome()
     const storage = createFileRunnerHomeStorage({ defaultRoot: root })
@@ -226,6 +272,14 @@ describe('file runner-home storage', () => {
     await expect(storage.acquire!()).resolves.toBe('acquired')
     await storage.release!()
     await expect(readFile(path.join(root, 'runner.lock'), 'utf8')).resolves.toContain('legacy')
+  })
+
+  it('settles the platform adapter in the constructor, before the home can be created', async () => {
+    const { root } = await temporaryHome()
+    stagedAdapterRefusal.message = 'runner-home native storage requires a supported platform'
+
+    expect(() => createFileRunnerHomeStorage({ defaultRoot: root })).toThrow(/supported platform/)
+    await expect(lstat(root)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('keeps close terminal and rejects every later admission', async () => {

@@ -259,11 +259,19 @@ export function terminalResumeAdvances(
   postReconnectSequences: readonly number[],
   resetSequences: readonly number[],
 ): boolean {
-  return Number.isSafeInteger(highestBeforeDisconnect) && highestBeforeDisconnect >= 1
-    && resetSequences.length === 0
+  if (!Number.isSafeInteger(highestBeforeDisconnect) || highestBeforeDisconnect < 1) return false
+  const bufferedReplay = resetSequences.length === 0
     && postReconnectSequences.length > 0
     && postReconnectSequences.every((sequence, index) => Number.isSafeInteger(sequence)
       && sequence === highestBeforeDisconnect + index + 1)
+  const resetSequence = resetSequences.at(-1)
+  const applicationReplay = resetSequence !== undefined
+    && Number.isSafeInteger(resetSequence)
+    && resetSequence > highestBeforeDisconnect
+    && postReconnectSequences.length > 0
+    && postReconnectSequences.every((sequence, index) => Number.isSafeInteger(sequence)
+      && sequence === resetSequence + index)
+  return bufferedReplay || applicationReplay
 }
 
 function hasContiguousPostReplayFrame(stub: StubControlPlane, channelId: string, replayedSequence: number): boolean {
