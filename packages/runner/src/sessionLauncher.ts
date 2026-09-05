@@ -317,6 +317,10 @@ async function* recoverProcess(
     return
   }
   const status = await safe(() => options.recoveryChannels!.status(prior.channelId, prior.generation, prior.connectionEpoch))
+  // A channel still reported live is on this connection, so the launch that opened it is still
+  // attached and owns the session: there is nothing to take over, and reporting it failed would
+  // contradict a process that keeps running. Losing the connection reports it lost and recovers.
+  if (status.ok && status.value === 'live') return
   if (!status.ok || (status.value !== 'closed' && status.value !== 'lost')) {
     yield await fail(options, startingReceipt, 'recovery-uncertain')
     return

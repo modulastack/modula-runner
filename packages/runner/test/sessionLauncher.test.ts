@@ -178,6 +178,16 @@ function recoveryReceipt(): SessionReceipt {
   }
 }
 
+function startedOnLiveChannel(): SessionReceipt {
+  const base = recoveryReceipt()
+  return {
+    ...base,
+    state: 'started',
+    phaseTimestamps: { ...base.phaseTimestamps, started: '2026-08-21T00:00:03Z' },
+    channel: { generation: 1, lifecycle: 'live', channelId: 'channel-old', connectionEpoch: 'epoch-1' },
+  }
+}
+
 function recoveryChannelPorts(
   channels: SessionLauncherOptions['channels'],
 ): NonNullable<SessionLauncherOptions['recoveryChannels']> {
@@ -468,6 +478,38 @@ describe('production session launcher', () => {
     }])
     expect(verify).toHaveBeenCalledOnce()
     expect(subject.processStarts()).toBe(0)
+  })
+
+  it('leaves a started session alone when its channel is still live on this connection', async () => {
+    const held = recoveryReceipts(startedOnLiveChannel())
+    const base = options()
+    const adopt = vi.fn(async () => { throw new Error('must not adopt') })
+    const subject = options({
+      receipts: held.value,
+      recoveryChannels: { ...base.value.recoveryChannels!, status: async () => 'live' },
+      processes: { ...base.value.processes, adopt },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([])
+    expect(adopt).not.toHaveBeenCalled()
+    expect(held.current()).toMatchObject({ state: 'started', revision: startedOnLiveChannel().revision })
+  })
+
+  it('recovers that same started session once its channel is reported lost', async () => {
+    const held = recoveryReceipts(startedOnLiveChannel())
+    const base = options()
+    const adopt = vi.fn(base.value.processes.adopt)
+    const subject = options({
+      receipts: held.value,
+      recoveryChannels: { ...base.value.recoveryChannels!, status: async () => 'lost' },
+      processes: { ...base.value.processes, adopt },
+    })
+    const actions = await collect(createSessionLauncher(subject.value).recover())
+    expect(actions[0]).toEqual({
+      kind: 'message', message: { type: 'SESSION_STARTED', requestId: request.requestId, channelId: 'channel-1', sessionId: 'session-stable' },
+    })
+    expect(actions.at(-1)).toMatchObject({ kind: 'message', message: { type: 'SESSION_FINISHED' } })
+    expect(adopt).toHaveBeenCalledOnce()
+    expect(held.current()).toMatchObject({ state: 'finished', channelId: 'channel-1' })
   })
 
   it('adopts only an exact surviving session under its stable id and a new channel', async () => {
