@@ -72,9 +72,13 @@ export class ChannelStore {
     return this.channels.get(id)
   }
 
+  // A closed channel has no recovery mode left to set, and the terminal host's send path is
+  // documented to survive a channel closing under it — a READY answered after the viewer's
+  // channel went away must not take the session down. Every sequence-bearing operation keeps
+  // require(), because silently ignoring an absent channel there would lose frames.
   setRecovery(id: string, recovery: ChannelRecoveryMode) {
-    const state = this.require(id)
-    state.recovery = recovery
+    const state = this.channels.get(id)
+    if (state) state.recovery = recovery
   }
 
   ids() {
