@@ -144,16 +144,16 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
       const recipe = options.policy?.recipe(request.recipeId)
       return recipe ? { command: canonicalPath(recipe.command), args: recipe.args, auditExecutable: null } : null
     }
-    if (request.executable !== undefined && executableAllowed(options.policy, request.executable)) {
-      const command = canonicalPath(request.executable)
-      return { command, args: request.args ?? [], auditExecutable: command }
+    if (request.executable !== undefined) {
+      const command = admittedCommand(options.policy, request.executable)
+      if (command !== null) return { command, args: request.args ?? [], auditExecutable: command }
     }
     return null
   }
 
   const check = (executable: string, recipeId?: string): boolean => {
     if (recipeId !== undefined) return options.policy?.recipe(recipeId) != null
-    return executableAllowed(options.policy, executable)
+    return admittedCommand(options.policy, executable) !== null
   }
 
   const auditRefusal = (request: SpawnRequest, reason: RefusalReason) =>
@@ -263,14 +263,17 @@ export function createSpawnSeam(options: SpawnSeamOptions): SpawnSeam {
   return { check, recordRefusal: auditRefusal, authorize, run }
 }
 
-// One predicate decides admission: the signed document's own membership test, applied to the name
-// asked for and — for an operator who named a symlinked absolute path — to what it resolves to.
-// Matching a listed entry's realpath instead would be a second, weaker gate over the same set.
-function executableAllowed(policy: CommandPolicy | null, executable: string): boolean {
-  if (!policy) return false
-  if (policy.allowsExecutable(executable)) return true
+// One predicate decides admission and names the command it admitted: the signed document's own
+// membership test, applied to the name asked for and — for an operator who named a symlinked
+// absolute path — to what it resolves to. Matching a listed entry's realpath instead would be a
+// second, weaker gate over the same set. The single resolution is the point: resolving again to
+// build the command would let a symlink swapped in between be checked as one target and executed
+// as another, so the value returned here is both the thing approved and the thing spawned.
+function admittedCommand(policy: CommandPolicy | null, executable: string): string | null {
+  if (!policy) return null
   const canonical = canonicalPath(executable)
-  return canonical !== executable && policy.allowsExecutable(canonical)
+  if (policy.allowsExecutable(executable)) return canonical
+  return canonical !== executable && policy.allowsExecutable(canonical) ? canonical : null
 }
 
 // Only absolute paths are canonicalized. macOS needs this because /var and /tmp are symlinks, so a

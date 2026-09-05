@@ -1,11 +1,11 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { appendFile, mkdtemp, open as openFile, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, open as openFile, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_ALLOWLIST_EXECUTABLES,
   DEFAULT_FLOW,
@@ -27,6 +27,38 @@ import {
 } from '../src/index.js'
 import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
 import { permissiveConsent } from './spawnSeamSupport.js'
+
+// The seam resolves a caller-named path inside one synchronous tick, so no real filesystem race
+// fits between two resolutions of it. This wrapper never fabricates a result — it observes the
+// platform's own realpathSync and, for a path a case stages, performs the relink an attacker with
+// write access to that symlink would, immediately after the first resolution. Nothing is staged
+// by default, so every other case in this file resolves paths exactly as it did before.
+const pathResolutions = vi.hoisted(() => ({
+  resolved: [] as string[],
+  relinkAfterFirstResolution: null as { path: string; target: string } | null,
+}))
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  const realpathSync = ((target: string, ...rest: unknown[]) => {
+    const resolved = (actual.realpathSync as (...args: unknown[]) => string)(target, ...rest)
+    pathResolutions.resolved.push(String(target))
+    const staged = pathResolutions.relinkAfterFirstResolution
+    if (staged && target === staged.path) {
+      pathResolutions.relinkAfterFirstResolution = null
+      actual.unlinkSync(staged.path)
+      actual.symlinkSync(staged.target, staged.path)
+    }
+    return resolved
+  }) as typeof actual.realpathSync
+  const patched = { ...actual, realpathSync }
+  return { ...patched, default: patched }
+})
+
+afterEach(() => {
+  pathResolutions.resolved.length = 0
+  pathResolutions.relinkAfterFirstResolution = null
+})
 
 const execFileAsync = promisify(execFile)
 const temporaryDirectories: string[] = []
@@ -441,5 +473,61 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
 
     expect(listed).toMatchObject({ status: 'admitted' })
     expect(aliased).toMatchObject({ status: 'refused', reason: 'not-allowlisted' })
+  })
+
+  it('AS-06 spawns and audits the target its admission approved when the symlink moves under it', async () => {
+    const root = await realpath(await temporaryDirectory())
+    const path = join(root, 'allowlist.json')
+    const auditPath = join(root, 'audit.ndjson')
+    const identity = signingIdentity('relinked-alias-policy')
+    const approved = join(root, 'approved-tool')
+    const substituted = join(root, 'substituted-tool')
+    const named = join(root, 'named-tool')
+    await writeFile(approved, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    await writeFile(substituted, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    await symlink(approved, named)
+    await writeEnvelope(path, signAllowlist(allowlist([approved]), identity.key))
+    const policy = await loadPolicy(path, [identity.anchor])
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000 })
+    pathResolutions.relinkAfterFirstResolution = { path: named, target: substituted }
+
+    const result = await seam.authorize({ kind: 'probe', executable: named, cwd: root, grantScoped: false })
+
+    expect(result).toMatchObject({ status: 'admitted' })
+    expect(result.status === 'admitted' ? result.authorization.vetted.command : null).toBe(approved)
+    expect(pathResolutions.resolved.filter(entry => entry === named)).toEqual([named])
+    expect(await auditRecords(auditPath)).toEqual([
+      expect.objectContaining({ kind: 'spawn-admitted', spawnKind: 'probe', executable: approved }),
+    ])
+  })
+
+  it('AS-06 resolves an admitted absolute executable exactly once and a bare one not at all', async () => {
+    const root = await realpath(await temporaryDirectory())
+    const path = join(root, 'allowlist.json')
+    const auditPath = join(root, 'audit.ndjson')
+    const identity = signingIdentity('resolution-count-policy')
+    const approved = join(root, 'approved-tool')
+    const named = join(root, 'named-tool')
+    await writeFile(approved, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    await symlink(approved, named)
+    await writeEnvelope(path, signAllowlist(allowlist([named, 'tmux']), identity.key))
+    const policy = await loadPolicy(path, [identity.anchor])
+    const seam = createSpawnSeam({ policy, audit: openAuditLogFixture({ path: auditPath }), now: () => 1_700_000_000_000 })
+
+    const result = await seam.authorize({ kind: 'probe', executable: named, cwd: root, grantScoped: false })
+
+    expect(result).toMatchObject({ status: 'admitted' })
+    expect(pathResolutions.resolved.filter(entry => entry === named)).toEqual([named])
+
+    // The accepted cost of resolving before the membership test: a listed absolute name resolves
+    // once per check where it used to resolve none. Short-circuiting that away is how the seam
+    // regains two resolutions of one name, so the count is asserted rather than left free.
+    pathResolutions.resolved.length = 0
+    expect(seam.check(named)).toBe(true)
+    expect(pathResolutions.resolved).toEqual([named])
+
+    pathResolutions.resolved.length = 0
+    expect(seam.check('tmux')).toBe(true)
+    expect(pathResolutions.resolved).toEqual([])
   })
 })
