@@ -128,10 +128,14 @@ function assertSessionMetadata(spec: { command: string; cwd: string; profile: st
 let nodePtyHelperPrepared = false
 
 // node-pty's Darwin prebuild ships its spawn-helper without an execute bit, and npm preserves
-// that on install, so every pty spawn would fail with EACCES on a clean install. The helper is
-// the one exact file node-pty will exec for this platform and architecture; it gains only the
-// owner's execute bit — nothing is widened for other users — and the result is checked, so a
-// helper that still cannot run fails the attach here rather than as a silently dead pty.
+// that on install, so every pty spawn would fail with EACCES on a clean install. This is the
+// file node-pty execs only when it loaded that prebuild: it searches build/Release first, and an
+// install built from source deletes the prebuilds tree outright and execs the helper its own
+// build produced already executable. So an absent helper, or one a root-owned or read-only
+// install will not let this process repair, is not this function's to answer for and is left to
+// pty.spawn to report. Only the case the execute bit exists for stays hard: a helper that is
+// present and still cannot run fails the attach here rather than as a silently dead pty. It
+// gains the owner's execute bit and nothing else — nothing is widened for other users.
 function ensureNodePtySpawnHelperExecutable() {
   if (nodePtyHelperPrepared || process.platform !== 'darwin') return
   const helper = path.resolve(
@@ -141,8 +145,24 @@ function ensureNodePtySpawnHelperExecutable() {
     `${process.platform}-${process.arch}`,
     'spawn-helper',
   )
-  const mode = statSync(helper).mode & 0o777
-  if ((mode & 0o100) === 0) chmodSync(helper, mode | 0o100)
+  let mode: number
+  try {
+    mode = statSync(helper).mode & 0o777
+  } catch {
+    // No prebuild here means node-pty is loading a locally built binding whose helper is already
+    // executable, so there is nothing to prepare and a genuinely broken install must surface as
+    // pty.spawn's own error instead of a failed attach.
+    nodePtyHelperPrepared = true
+    return
+  }
+  if ((mode & 0o100) === 0) {
+    try {
+      chmodSync(helper, mode | 0o100)
+    } catch {
+      // A root-owned or read-only install cannot be repaired from here; the check below still
+      // decides whether the helper is usable exactly as it stands.
+    }
+  }
   accessSync(helper, fsConstants.X_OK)
   nodePtyHelperPrepared = true
 }
