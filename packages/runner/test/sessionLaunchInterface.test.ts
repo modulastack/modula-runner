@@ -44,9 +44,9 @@ async function next(actions: AsyncIterable<SessionLaunchAction>) {
 }
 
 describe('session-launch interface checkpoint', () => {
-  it('keeps the active runtime on v1 and fails explicitly instead of launching', async () => {
-    expect(PROTOCOL_VERSION).toBe(1)
-    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(2)
+  it('keeps the explicit unimplemented launcher fail-closed after v2 activation', async () => {
+    expect(PROTOCOL_VERSION).toBe(2)
+    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION)
     const launcher = createUnimplementedSessionLauncher()
     await expect(next(launcher.handle(request))).rejects.toBeInstanceOf(SessionLaunchNotImplementedError)
     await expect(next(launcher.recover())).rejects.toBeInstanceOf(SessionLaunchNotImplementedError)

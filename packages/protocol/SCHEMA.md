@@ -1,6 +1,6 @@
 # Runner protocol schema
 
-*Protocol version **1** · package `@modulastack/runner-protocol` · consumed by the runner
+*Protocol version **2** · package `@modulastack/runner-protocol` · consumed by the runner
 (this repository) and by the control plane.*
 
 The seam this protocol serves is defined in [`docs/runner-seam.md`](../../docs/runner-seam.md).
@@ -54,9 +54,9 @@ bug to fix.
 ## Versioning
 
 - The protocol version is a positive integer. `PROTOCOL_VERSION` is the newest version the
-  active runtime speaks; `MIN_PROTOCOL_VERSION` is the oldest. The interface-first
-  `SESSION_LAUNCH_PROTOCOL_VERSION` may name a later reviewed shape without advertising it;
-  it does not widen the active hello range.
+  active runtime speaks; `MIN_PROTOCOL_VERSION` is the oldest. `SESSION_LAUNCH_PROTOCOL_VERSION`
+  names the first version that carries session launch. It equals the active version now that
+  the installed runtime and matching control-plane counterpart are implemented.
 - The runner's `hello` offers a contiguous range `{min, max}`. The control plane holds a
   set of supported versions — by policy the current version and the one before it
   (**N and N−1**) — and `negotiate()` picks the highest version in both; the connection
@@ -371,12 +371,12 @@ its reason — `not-allowlisted`, `path-not-granted`, `runner-paused`, `non-loop
 This is the wire form of the seam's fourth principle: an offline or unwilling runner is
 visible, and a request that will not be served never looks like one still in progress.
 
-### Inactive session-launch v2 interface
+### Session-launch v2 interface
 
-`SESSION_LAUNCH_PROTOCOL_VERSION = 2` publishes the reviewed endpoint interface without
-activating it. `PROTOCOL_VERSION` remains 1, the current job-control decoder continues to
-reject `SESSION_START`, and the v2 parsers require an explicit negotiated version of 2.
-No runner runtime handles these messages in this checkpoint.
+`SESSION_LAUNCH_PROTOCOL_VERSION = 2` is active only after negotiation selects protocol 2.
+The contiguous active range remains 1–2 for N−1 compatibility: a connection that selects
+version 1 rejects `SESSION_START` and launches nothing, while version 2 routes the validated
+message through the runner's durable session job-control path.
 
 Control plane → runner:
 

@@ -51,7 +51,7 @@ describe('schema and validators agree', () => {
     for (const kind of CHANNEL_KINDS) expect(mentioned.has(kind)).toBe(true)
   })
 
-  it('states the active version and the inactive session-launch version separately', () => {
+  it('states the active version and the session-launch activation version', () => {
     expect(schema).toContain(`*Protocol version **${PROTOCOL_VERSION}**`)
     expect(schema).toContain(`SESSION_LAUNCH_PROTOCOL_VERSION = ${SESSION_LAUNCH_PROTOCOL_VERSION}`)
   })

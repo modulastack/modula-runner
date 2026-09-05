@@ -1,14 +1,26 @@
 import { createHmac } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
 import {
+  MAX_FRAME_BYTES,
   MAX_PAIRING_RESPONSE_BYTES,
   PAIRING_CONFIRM_PATH,
   PAIRING_REDEEM_PATH,
+  SESSION_LAUNCH_PROTOCOL_VERSION,
   pairingConfirmationMessage,
   pairingSecretBytes,
   parsePairingConfirmationRequest,
   parsePairingRedemptionRequest,
+  parseSessionLaunchServerMessage,
+  sessionLaunchPayload,
+  decodeFrame,
+  encodeFrame,
+  type Frame,
+  type RunnerInfo,
+  type SessionLaunchServerMessage,
+  type SessionStartMessage,
 } from '@modulastack/runner-protocol'
+import { WebSocket, WebSocketServer } from 'ws'
 
 export type PairingConfirmationOutcome =
   | 'confirmed'
@@ -53,7 +65,14 @@ type Binding = {
   runnerId: string
   token: string
   confirmationNonce: string
+  runner: RunnerInfo
   state: 'pending' | 'confirmed' | 'revoked'
+}
+
+type SocketState = {
+  binding: Binding
+  negotiated: number | null
+  channels: Map<string, { kind: string; receivedSeq: number; sentSeq: number }>
 }
 
 const pairingCode = `${Buffer.alloc(16, 0x31).toString('base64url')}.${Buffer.alloc(14, 0x32).toString('base64url')}`
@@ -61,13 +80,24 @@ const maxObservations = 64
 
 export class PairingContractStub {
   readonly observations: PairingObservation[] = []
+  readonly sessionMessages: SessionLaunchServerMessage[] = []
   private readonly bindings = new Map<string, Binding>()
+  private readonly sockets = new Set<WebSocket>()
+  private readonly wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES, perMessageDeflate: false })
+  private readonly sessionStarted: Promise<SessionLaunchServerMessage>
+  private readonly sessionFinished: Promise<SessionLaunchServerMessage>
+  private startSession!: (message: SessionLaunchServerMessage) => void
+  private finishSession!: (message: SessionLaunchServerMessage) => void
   private server: Server | null = null
+  private sessionRequest: SessionStartMessage | undefined
   private port = 0
   private redemptionCount = 0
   private confirmationCount = 0
 
-  constructor(private readonly options: PairingStubOptions = {}) {}
+  constructor(private readonly options: PairingStubOptions = {}) {
+    this.sessionStarted = new Promise(resolve => { this.startSession = resolve })
+    this.sessionFinished = new Promise(resolve => { this.finishSession = resolve })
+  }
 
   get url(): string {
     if (this.port === 0) throw new Error('pairing stub is not listening')
@@ -84,10 +114,30 @@ export class PairingContractStub {
       value.includes(binding.token) || value.includes(binding.confirmationNonce))
   }
 
+  pairedBindingId(): string {
+    const binding = [...this.bindings.values()].find(candidate => candidate.state === 'confirmed')
+    if (!binding) throw new Error('pairing stub has no confirmed binding')
+    return binding.bindingId
+  }
+
+  queueSession(request: SessionStartMessage): void {
+    if (this.sessionRequest) throw new Error('pairing stub already has a queued session')
+    this.sessionRequest = request
+  }
+
+  waitForSessionStarted(): Promise<SessionLaunchServerMessage> {
+    return this.sessionStarted
+  }
+
+  waitForSessionFinished(): Promise<SessionLaunchServerMessage> {
+    return this.sessionFinished
+  }
+
   async start(): Promise<this> {
     this.server = createServer((request, response) => {
       void this.handle(request, response).catch(() => send(response, 500))
     })
+    this.server.on('upgrade', (request, socket, head) => this.upgrade(request, socket, head))
     await new Promise<void>((resolve, reject) => {
       this.server?.once('error', reject)
       this.server?.listen(0, '127.0.0.1', resolve)
@@ -101,6 +151,7 @@ export class PairingContractStub {
     this.server = null
     this.port = 0
     if (!server) return
+    for (const socket of this.sockets) socket.terminate()
     await new Promise<void>((resolve, reject) => {
       server.close(error => error ? reject(error) : resolve())
     })
@@ -135,7 +186,7 @@ export class PairingContractStub {
     if (outcome === 'invalid') return send(response, 400)
     if (outcome === 'expired') return send(response, 410)
     if (typeof outcome === 'object') return redirect(response, outcome.redirectTo)
-    const binding = this.createBinding()
+    const binding = this.createBinding(parsed.runner)
     this.bindings.set(binding.bindingId, binding)
     send(response, 200, {
       bindingId: binding.bindingId,
@@ -185,7 +236,89 @@ export class PairingContractStub {
     send(response, 204)
   }
 
-  private createBinding(): Binding {
+  private upgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    const path = new URL(request.url ?? '/', this.url).pathname
+    const token = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '')?.[1]
+    const binding = [...this.bindings.values()].find(candidate => candidate.token === token && candidate.state === 'confirmed')
+    if (path !== '/api/runner/v1/socket' || !binding) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      return
+    }
+    this.wss.handleUpgrade(request, socket, head, ws => this.accept(ws, binding))
+  }
+
+  private accept(ws: WebSocket, binding: Binding): void {
+    const state: SocketState = { binding, negotiated: null, channels: new Map() }
+    this.sockets.add(ws)
+    ws.on('close', () => this.sockets.delete(ws))
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) return ws.close(1002, 'text frames required')
+      this.receive(ws, state, String(data))
+    })
+  }
+
+  private receive(ws: WebSocket, state: SocketState, raw: string): void {
+    const frame = decodeFrame(raw)
+    if (!frame) return ws.close(1002, 'invalid frame')
+    if (frame.type === 'hello') return this.welcome(ws, state, frame)
+    if (state.negotiated === null) return ws.close(1002, 'hello required')
+    if (frame.type === 'ping') return this.send(ws, { type: 'pong', id: frame.id })
+    if (frame.type === 'open') return this.openChannel(ws, state, frame)
+    if (frame.type === 'data') return this.receiveData(state, frame)
+    if (frame.type === 'close') state.channels.delete(frame.channel)
+  }
+
+  private welcome(ws: WebSocket, state: SocketState, frame: Extract<Frame, { type: 'hello' }>): void {
+    if (state.negotiated !== null || !sameRunner(frame.runner, state.binding.runner)) {
+      ws.close(1002, 'runner identity mismatch')
+      return
+    }
+    if (frame.protocol.min > SESSION_LAUNCH_PROTOCOL_VERSION || frame.protocol.max < SESSION_LAUNCH_PROTOCOL_VERSION) {
+      this.send(ws, { type: 'reject', reason: 'unsupported protocol', supported: [1, SESSION_LAUNCH_PROTOCOL_VERSION] })
+      ws.close(1002, 'unsupported protocol')
+      return
+    }
+    state.negotiated = SESSION_LAUNCH_PROTOCOL_VERSION
+    this.send(ws, {
+      type: 'welcome',
+      protocol: SESSION_LAUNCH_PROTOCOL_VERSION,
+      heartbeat: { intervalMs: 200, timeoutMs: 1_000 },
+      channels: frame.channels.map(channel => ({ id: channel.id, status: 'expired' as const })),
+    })
+  }
+
+  private openChannel(ws: WebSocket, state: SocketState, frame: Extract<Frame, { type: 'open' }>): void {
+    state.channels.set(frame.channel, { kind: frame.kind, receivedSeq: 0, sentSeq: 0 })
+    if (frame.kind !== 'job-control' || !this.sessionRequest) return
+    const channel = state.channels.get(frame.channel)!
+    channel.sentSeq += 1
+    this.send(ws, {
+      type: 'data',
+      channel: frame.channel,
+      seq: channel.sentSeq,
+      payload: sessionLaunchPayload(this.sessionRequest),
+    })
+  }
+
+  private receiveData(state: SocketState, frame: Extract<Frame, { type: 'data' }>): void {
+    const channel = state.channels.get(frame.channel)
+    if (!channel || frame.seq !== channel.receivedSeq + 1) return
+    channel.receivedSeq = frame.seq
+    if (channel.kind !== 'job-control' || frame.payload.codec !== 'json') return
+    const message = parseSessionLaunchServerMessage(frame.payload.body, SESSION_LAUNCH_PROTOCOL_VERSION)
+    if (!message) return
+    this.sessionMessages.push(message)
+    if (message.type === 'SESSION_STARTED') this.startSession(message)
+    if (message.type === 'SESSION_FINISHED' || message.type === 'SESSION_FAILED' || message.type === 'SESSION_REFUSED') {
+      this.finishSession(message)
+    }
+  }
+
+  private send(ws: WebSocket, frame: Frame): void {
+    if (ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(frame))
+  }
+
+  private createBinding(runner: RunnerInfo): Binding {
     this.redemptionCount += 1
     const suffix = String(this.redemptionCount).padStart(12, '0')
     return {
@@ -193,6 +326,7 @@ export class PairingContractStub {
       runnerId: `blackbox-runner-${this.redemptionCount}`,
       token: fixtureSecret(0x40 + this.redemptionCount),
       confirmationNonce: fixtureSecret(0x60 + this.redemptionCount),
+      runner: { ...runner },
       state: 'pending',
     }
   }
@@ -224,6 +358,10 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   } catch {
     return null
   }
+}
+
+function sameRunner(left: RunnerInfo, right: RunnerInfo): boolean {
+  return left.name === right.name && left.version === right.version && left.os === right.os && left.arch === right.arch
 }
 
 function validProof(binding: Binding, actual: string, origin: string): boolean {

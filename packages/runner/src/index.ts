@@ -247,6 +247,7 @@ export {
   SESSION_TOMBSTONE_RETENTION_MS,
   WORKTREE_OWNERSHIP_PHASES,
   SessionLaunchNotImplementedError,
+  SessionReceiptBusyError,
   SessionReceiptLedgerNotImplementedError,
   SessionReceiptStorageUnavailableError,
   createUnimplementedSessionLauncher,
@@ -398,6 +399,7 @@ export {
   type RunnerRuntimeOptions,
   type RunnerRuntimePort,
   type RunnerShutdownResult,
+  type RunnerStopResult,
   type RunnerTopLevelCommand,
 } from './runnerApplication.js'
 export {

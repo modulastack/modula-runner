@@ -8,6 +8,7 @@ import {
   MAX_SESSION_LEDGER_JSON_NODES,
   MAX_SESSION_RECEIPT_JSON_NODES,
   MAX_SESSION_RECEIPT_RECORD_BYTES,
+  SessionReceiptBusyError,
   SessionReceiptStorageUnavailableError,
   createSessionReceiptLedger,
   type SessionReceipt,
@@ -608,6 +609,10 @@ describe('production session receipt ledger', () => {
     }))
     await expect(ledger.lookup({ bindingId: request().bindingId, requestId: request().requestId }))
       .rejects.toBeInstanceOf(SessionReceiptStorageUnavailableError)
+    // The ceiling is back-pressure: only the narrower class lets admission refuse the request
+    // instead of closing job control and stopping the runner with every session on it.
+    await expect(ledger.lookup({ bindingId: request().bindingId, requestId: request().requestId }))
+      .rejects.toBeInstanceOf(SessionReceiptBusyError)
     release()
     await expect(Promise.all(queued)).resolves.toHaveLength(MAX_PENDING_SESSION_LEDGER_OPERATIONS)
   })

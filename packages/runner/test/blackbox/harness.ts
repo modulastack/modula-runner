@@ -33,7 +33,9 @@ export interface RunOptions {
   home?: string
   cwd?: string
   endpointUrl?: string
+  extraPath?: string
   input?: string
+  stopWhen?: Promise<unknown>
   timeoutMs?: number
 }
 
@@ -126,7 +128,7 @@ async function prepareInstallWorkspace(workspace: string): Promise<void> {
 }
 
 function buildCandidate(output: string): void {
-  const built = spawnSync(process.execPath, [releaseScript, 'pack', '--output', output], {
+  const built = spawnSync(process.execPath, [releaseScript, 'build', '--output', output], {
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 10 * processOutputLimit,
@@ -159,10 +161,10 @@ function installEnvironment(workspace: string): NodeJS.ProcessEnv {
 
 function runnerEnvironment(
   workspace: string,
-  options: Pick<RunOptions, 'home' | 'endpointUrl'>,
+  options: Pick<RunOptions, 'home' | 'endpointUrl' | 'extraPath'>,
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
-    PATH: `${nodeBinDir}:/usr/bin:/bin`,
+    PATH: `${options.extraPath ? `${options.extraPath}:` : ''}${nodeBinDir}:/usr/bin:/bin`,
     HOME: workspace,
     TMPDIR: join(workspace, 'tmp'),
   }
@@ -183,6 +185,7 @@ async function spawnInstalled(
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   child.stdin.end(options.input ?? '')
+  void options.stopWhen?.then(() => child.kill('SIGTERM'))
   return await pipeResult(child, options.timeoutMs ?? commandTimeoutMs)
 }
 

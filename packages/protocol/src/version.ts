@@ -1,7 +1,5 @@
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 export const MIN_PROTOCOL_VERSION = 1
-// Published for interface-first tests only. The active range stays v1 until the runner can
-// answer every session-launch message and the matching counterpart is ready.
 export const SESSION_LAUNCH_PROTOCOL_VERSION = 2
 
 export type VersionRange = { min: number; max: number }

@@ -17,8 +17,8 @@ import {
 } from '../src/index.js'
 
 describe('audit lifecycle interface checkpoint', () => {
-  it('publishes the operator-ratified fixed bounds without activating protocol v2', () => {
-    expect(PROTOCOL_VERSION).toBe(1)
+  it('preserves the operator-ratified fixed bounds after protocol v2 activation', () => {
+    expect(PROTOCOL_VERSION).toBe(2)
     expect(AUDIT_RECORD_SCHEMA_VERSION).toBe(2)
     expect(MAX_AUDIT_RECORD_BYTES).toBe(16 * 1024)
     expect(MAX_AUDIT_SEGMENT_BYTES).toBe(8 * 1024 * 1024)

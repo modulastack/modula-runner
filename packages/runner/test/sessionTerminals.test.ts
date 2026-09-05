@@ -159,6 +159,20 @@ describe('production session terminal ports', () => {
     await expect(started.handle.finished).resolves.toEqual({ exitCode: null, signal: 15 })
   })
 
+  it('refuses a launch that lands after shutdown, unlike the kill switch', async () => {
+    const item = await rig()
+    const opened = await item.ports.channels.open('request-1', 'session-1', liveSignal())
+    if (opened.status !== 'opened') throw new Error('channel did not open')
+    await expect(item.ports.shutdown()).resolves.toEqual([])
+    const reopened = await item.ports.channels.open('request-2', 'session-2', liveSignal())
+    if (reopened.status !== 'opened') throw new Error('channel did not reopen')
+    const late = request(item.cwd, reopened.channelId, '223e4567-e89b-42d3-a456-426614174099')
+    // An invalid profile is rejected only after the host admits the launch, so a reopened host
+    // would fail with that message instead of the closed refusal.
+    late.terminalProfile = 'bad label'
+    await expect(item.ports.processes.start(late, liveSignal())).rejects.toThrow(/shutting down/)
+  })
+
   it('leaves an exposed handle unsettled when shutdown cannot confirm termination', async () => {
     const control = controllableTmux()
     const item = await rig(control.seam)

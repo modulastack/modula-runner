@@ -68,6 +68,7 @@ export class TerminalHost {
   private readonly earlyMessages = new Map<string, TerminalClientMessage[]>()
   private readonly inflight = new Set<Promise<unknown>>()
   private shuttingDown = false
+  private closed = false
   private shutdown: Promise<string[]> | undefined
   private readonly policy: SessionPolicy
   private readonly seam: SpawnSeam
@@ -109,9 +110,17 @@ export class TerminalHost {
   }
 
   // Starting a session while the host is killing them would race the shutdown
-  // it is supposed to be part of.
+  // it is supposed to be part of; a closed host stays refused for good.
   private assertOpen() {
-    if (this.shuttingDown) throw new Error('terminal host is shutting down')
+    if (this.closed || this.shuttingDown) throw new Error('terminal host is shutting down')
+  }
+
+  // Final shutdown differs from the kill switch (killAll): it also refuses every
+  // later launch, so a dispatch still preparing when the runner stops cannot open
+  // a fresh pane after cleanup has run.
+  close(): Promise<string[]> {
+    this.closed = true
+    return this.killAll()
   }
 
   // Sessions whose kill could not be confirmed stay bound and observed; their

@@ -23,6 +23,7 @@ import {
   SESSION_RECEIPT_RETENTION_MS,
   SESSION_RECEIPT_SCHEMA_VERSION,
   SESSION_TOMBSTONE_RETENTION_MS,
+  SessionReceiptBusyError,
   SessionReceiptStorageUnavailableError,
   type SessionReceipt,
   type SessionReceiptClaim,
@@ -195,7 +196,7 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
     if (this.pendingOperations >= MAX_PENDING_SESSION_LEDGER_OPERATIONS) {
-      return Promise.reject(new SessionReceiptStorageUnavailableError())
+      return Promise.reject(new SessionReceiptBusyError())
     }
     this.pendingOperations += 1
     const result = this.queue.then(operation, operation).then(

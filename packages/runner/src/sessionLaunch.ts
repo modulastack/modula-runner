@@ -219,9 +219,19 @@ export class SessionReceiptLedgerNotImplementedError extends Error {
 }
 
 export class SessionReceiptStorageUnavailableError extends Error {
-  constructor() {
-    super('the session receipt ledger is unavailable')
+  constructor(message = 'the session receipt ledger is unavailable') {
+    super(message)
     this.name = 'SessionReceiptStorageUnavailableError'
+  }
+}
+
+// Refusing an operation because too many are already pending is back-pressure, not storage that
+// cannot record: the peer can retry, and the runner must stay up. It remains a storage-unavailable
+// error so a caller that does not know the difference still fails closed.
+export class SessionReceiptBusyError extends SessionReceiptStorageUnavailableError {
+  constructor() {
+    super('the session receipt ledger is busy')
+    this.name = 'SessionReceiptBusyError'
   }
 }
 

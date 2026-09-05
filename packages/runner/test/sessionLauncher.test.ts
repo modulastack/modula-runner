@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   SecretEnv,
+  SessionReceiptBusyError,
   createSessionLauncher,
   createSessionReceiptLedger,
   type AuditRecord,
@@ -175,6 +176,27 @@ function recoveryReceipt(): SessionReceipt {
     sessionId: 'session-stable',
     channel: { generation: 1, lifecycle: 'lost', channelId: 'channel-old' },
     channelId: 'channel-old',
+  }
+}
+
+function acceptedReceipt(): SessionReceipt {
+  const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...base } = recoveryReceipt()
+  return {
+    ...base,
+    revision: 1,
+    state: 'accepted',
+    phaseTimestamps: { accepted: '2026-08-21T00:00:00Z' },
+    worktree: { phase: 'none' },
+  }
+}
+
+function startedOnLiveChannel(): SessionReceipt {
+  const base = recoveryReceipt()
+  return {
+    ...base,
+    state: 'started',
+    phaseTimestamps: { ...base.phaseTimestamps, started: '2026-08-21T00:00:03Z' },
+    channel: { generation: 1, lifecycle: 'live', channelId: 'channel-old', connectionEpoch: 'epoch-1' },
   }
 }
 
@@ -470,6 +492,38 @@ describe('production session launcher', () => {
     expect(subject.processStarts()).toBe(0)
   })
 
+  it('leaves a started session alone when its channel is still live on this connection', async () => {
+    const held = recoveryReceipts(startedOnLiveChannel())
+    const base = options()
+    const adopt = vi.fn(async () => { throw new Error('must not adopt') })
+    const subject = options({
+      receipts: held.value,
+      recoveryChannels: { ...base.value.recoveryChannels!, status: async () => 'live' },
+      processes: { ...base.value.processes, adopt },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([])
+    expect(adopt).not.toHaveBeenCalled()
+    expect(held.current()).toMatchObject({ state: 'started', revision: startedOnLiveChannel().revision })
+  })
+
+  it('recovers that same started session once its channel is reported lost', async () => {
+    const held = recoveryReceipts(startedOnLiveChannel())
+    const base = options()
+    const adopt = vi.fn(base.value.processes.adopt)
+    const subject = options({
+      receipts: held.value,
+      recoveryChannels: { ...base.value.recoveryChannels!, status: async () => 'lost' },
+      processes: { ...base.value.processes, adopt },
+    })
+    const actions = await collect(createSessionLauncher(subject.value).recover())
+    expect(actions[0]).toEqual({
+      kind: 'message', message: { type: 'SESSION_STARTED', requestId: request.requestId, channelId: 'channel-1', sessionId: 'session-stable' },
+    })
+    expect(actions.at(-1)).toMatchObject({ kind: 'message', message: { type: 'SESSION_FINISHED' } })
+    expect(adopt).toHaveBeenCalledOnce()
+    expect(held.current()).toMatchObject({ state: 'finished', channelId: 'channel-1' })
+  })
+
   it('adopts only an exact surviving session under its stable id and a new channel', async () => {
     const held = recoveryReceipts(recoveryReceipt())
     const adopt = vi.fn(async value => ({
@@ -730,6 +784,93 @@ describe('production session launcher', () => {
     expect(terminate).not.toHaveBeenCalled()
     expect(rollback).not.toHaveBeenCalled()
     expect(held.current().state).toBe('uncertain')
+  })
+
+  it('abandons a recovered receipt whose compare-and-set another writer won', async () => {
+    const conflicted = acceptedReceipt()
+    const replace = vi.fn(async () => ({ status: 'conflict' as const, current: { ...conflicted, revision: 4 } }))
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'receipt', receipt: conflicted }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        replace,
+        recover: async () => [conflicted],
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } },
+    ])
+    expect(replace).toHaveBeenCalled()
+  })
+
+  it('closes job control when a launch loses the compare-and-set on its own receipt', async () => {
+    const claimed = acceptedReceipt()
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'claimed', receipt: claimed }),
+        replace: async () => ({ status: 'conflict', current: { ...claimed, revision: 4 } }),
+        recover: async () => [],
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).handle(request))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } },
+      { kind: 'close-job-control', error: 'storage-unavailable' },
+    ])
+  })
+
+  it('holds recovery off a receipt its own launch drives and hands it back once that launch is abandoned', async () => {
+    const subject = options({ clock: nonExpiringClock })
+    const launcher = createSessionLauncher(subject.value)
+    const accepted = { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } }
+    let driven = 0
+    for await (const action of launcher.handle(request)) {
+      driven += 1
+      expect(action).toEqual(accepted)
+      await expect(collect(launcher.recover())).resolves.toEqual([])
+      break
+    }
+    expect(driven).toBe(1)
+    await expect(collect(launcher.recover())).resolves.toContainEqual(accepted)
+    expect(subject.processStarts()).toBe(1)
+  })
+
+  it('refuses at capacity instead of closing job control when the ledger is too busy to look up', async () => {
+    const replace = vi.fn(async () => ({ status: 'storage-unavailable' as const }))
+    const subject = options({
+      receipts: {
+        lookup: async () => { throw new SessionReceiptBusyError() },
+        claim: async () => ({ status: 'storage-unavailable' }),
+        replace,
+        recover: async () => [],
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).handle(request))).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_REFUSED', requestId: request.requestId, reason: 'at-capacity' },
+    }])
+    expect(replace).not.toHaveBeenCalled()
+    expect(subject.audit.map(record => record.kind === 'session-launch' ? record.state : record.kind)).toEqual(['refused'])
+  })
+
+  it('refuses at capacity when the ledger goes busy between lookup and claim', async () => {
+    const replace = vi.fn(async () => ({ status: 'storage-unavailable' as const }))
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => { throw new SessionReceiptBusyError() },
+        replace,
+        recover: async () => [],
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).handle(request))).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_REFUSED', requestId: request.requestId, reason: 'at-capacity' },
+    }])
+    expect(replace).not.toHaveBeenCalled()
+    expect(subject.processStarts()).toBe(0)
   })
 
   it('settles stale-binding recovery locally without disclosing its request id', async () => {

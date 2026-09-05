@@ -105,7 +105,7 @@ export function createSessionTerminalPorts(options: SessionTerminalPortsOptions)
         if (slot.state === 'pending') await closeChannel(host, slots, channelId, 'shutdown')
       }
       for (const key of channelProcesses.values()) forcedTerminationKeys.add(key)
-      const unconfirmed = await host.killAll()
+      const unconfirmed = await host.close()
       const uncertain = new Set(unconfirmed)
       for (const [channelId, key] of [...channelProcesses]) {
         if (uncertain.has(channelId)) continue

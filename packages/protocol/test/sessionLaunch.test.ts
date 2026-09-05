@@ -39,11 +39,13 @@ const start = {
 }
 
 describe('session-launch version-2 interface', () => {
-  it('publishes v2 without activating it', () => {
-    expect(PROTOCOL_VERSION).toBe(1)
-    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(2)
-    expect(parseSessionLaunchClientMessage(start, PROTOCOL_VERSION)).toBeNull()
-    expect(decodeSessionLaunchClientMessage(sessionLaunchPayload(start as SessionStartMessage), PROTOCOL_VERSION)).toBeNull()
+  it('activates the reviewed v2 interface without widening v1', () => {
+    expect(PROTOCOL_VERSION).toBe(2)
+    expect(SESSION_LAUNCH_PROTOCOL_VERSION).toBe(PROTOCOL_VERSION)
+    expect(parseSessionLaunchClientMessage(start, 1)).toBeNull()
+    expect(decodeSessionLaunchClientMessage(sessionLaunchPayload(start as SessionStartMessage), 1)).toBeNull()
+    expect(parseSessionLaunchClientMessage(start, PROTOCOL_VERSION)).not.toBeNull()
+    expect(decodeSessionLaunchClientMessage(sessionLaunchPayload(start as SessionStartMessage), PROTOCOL_VERSION)).not.toBeNull()
     expect(parseJobControlClientMessage(start)).toBeNull()
   })
 

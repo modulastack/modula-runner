@@ -123,7 +123,7 @@ describe('G2 runner CLI composition interface', () => {
     await expect(service.snapshot()).resolves.toEqual({ state: 'unpaired', record: null })
   })
 
-  it('exposes launch and negotiated job-control ports without activating protocol v2', async () => {
+  it('exposes launch and job-control ports while preserving v1 no-launch behavior', async () => {
     const launcher = createSessionLauncher(sessionOptions)
     await expect(next(launcher.recover())).resolves.toEqual({ value: undefined, done: true })
     const jobControl = createSessionJobControl({ launcher, audit: { append: async () => undefined }, clock })

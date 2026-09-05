@@ -47,8 +47,8 @@ async function collect(values: AsyncIterable<SessionJobControlEffect>) {
 }
 
 describe('session job-control dispatch', () => {
-  it('keeps active protocol v1 while exercising the inactive v2 composition with declared fields only', async () => {
-    expect(PROTOCOL_VERSION).toBe(1)
+  it('routes active protocol v2 through the composition with declared fields only', async () => {
+    expect(PROTOCOL_VERSION).toBe(2)
     const received: SessionStartMessage[] = []
     const audit = vi.fn(async (_record: AuditRecord) => undefined)
     const subject = createSessionJobControl({ launcher: launcher(value => received.push(value)), audit: { append: audit }, clock })

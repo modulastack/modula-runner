@@ -607,6 +607,25 @@ describe('pty host', () => {
     expect(rig.host.sessions()).toEqual([])
   })
 
+  it('stays permanently closed to launch and adopt after close', async () => {
+    const rig = await createRig()
+    const info = await openTerminal(rig)
+    expect(await rig.host.close()).toEqual([])
+    expect(rig.host.sessions()).toEqual([])
+    expect(() => rig.host.launch({ command: '/bin/cat', cwd: rig.cwd, socket: rig.socket })).toThrow(/shutting down/)
+    expect(() => rig.host.adopt(info.ref, { cwd: rig.cwd, command: '/bin/cat' })).toThrow(/shutting down/)
+  })
+
+  it('reopens after killAll but never after close', async () => {
+    const rig = await createRig()
+    await openTerminal(rig)
+    expect(await rig.host.killAll()).toEqual([])
+    const reopened = await openTerminal(rig)
+    expect(reopened.released).toBe(false)
+    expect(await rig.host.close()).toEqual([])
+    expect(() => rig.host.launch({ command: '/bin/cat', cwd: rig.cwd, socket: rig.socket })).toThrow(/shutting down/)
+  })
+
   it('does not report a session dead while one of its panes lives', async () => {
     const rig = await createRig({ host: { pollMs: 100 } })
     const info = await openTerminal(rig, { command: '/bin/sh', args: ['-c', 'exit 0'] })

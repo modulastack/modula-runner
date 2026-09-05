@@ -12,12 +12,14 @@ import {
 import type { LaunchPlan } from './accessProfiles.js'
 import {
   SESSION_RECEIPT_SCHEMA_VERSION,
+  SessionReceiptBusyError,
   type LocalProjectRecord,
   type SessionLaunchAction,
   type SessionLauncher,
   type SessionLauncherOptions,
   type SessionProcessHandle,
   type SessionReceipt,
+  type SessionReceiptKey,
   type SessionReceiptTombstone,
   type SessionTerminalResult,
   type SessionWorktreeRegisteredSnapshot,
@@ -29,9 +31,21 @@ const INITIAL_RESPONSE_MS = 5_000
 const LAUNCH_PROGRESS_MS = 180_000
 const REPLACEMENT_POLL_MS = 100
 const STORAGE_CLOSE: SessionLaunchAction = { kind: 'close-job-control', error: 'storage-unavailable' }
+const SUPERSEDED = 'superseded'
 
-type LauncherRuntime = { options: SessionLauncherOptions; lanes: LaneScheduler }
+type LauncherRuntime = { options: SessionLauncherOptions; lanes: LaneScheduler; owned: ReceiptOwnership }
 type LaneRelease = () => void
+
+// The ledger tells a lost compare-and-set apart from storage that cannot record, and only the
+// second is the runner's own fault. A superseded snapshot means another writer advanced the
+// receipt and answers for it, so the generator stops and lets its driver decide what that means.
+type ReceiptUpdate =
+  | { status: 'updated'; receipt: SessionReceipt }
+  | { status: typeof SUPERSEDED }
+  | { status: 'storage-unavailable' }
+
+type SettledAction = SessionLaunchAction | typeof SUPERSEDED
+type LaunchProgress = typeof SUPERSEDED | void
 
 class LaneScheduler {
   private readonly tails = new Map<string, Promise<void>>()
@@ -75,8 +89,38 @@ function laneKey(request: SessionStartMessage): string {
   return JSON.stringify([request.target.projectId, request.target.worktreeName])
 }
 
+// Which receipts a live launch is still driving. Recovery exists to take over work nobody is
+// driving; adopting a receipt whose launch is still running gives one request two drivers — a
+// second acceptance, worktree preparation against a worktree in use, and a compare-and-set one of
+// them has to lose. Claims are counted because two frames carrying the same request id under
+// different fingerprints are separate launches over one receipt.
+class ReceiptOwnership {
+  private readonly claims = new Map<string, number>()
+
+  claim(key: SessionReceiptKey): () => void {
+    const id = ownershipKey(key)
+    this.claims.set(id, (this.claims.get(id) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (this.claims.get(id) ?? 1) - 1
+      if (remaining > 0) this.claims.set(id, remaining)
+      else this.claims.delete(id)
+    }
+  }
+
+  has(key: SessionReceiptKey): boolean {
+    return this.claims.has(ownershipKey(key))
+  }
+}
+
+function ownershipKey(key: SessionReceiptKey): string {
+  return `${key.bindingId}\u0000${key.requestId}`
+}
+
 export function createSessionLauncher(options: SessionLauncherOptions): SessionLauncher {
-  const runtime: LauncherRuntime = { options, lanes: new LaneScheduler() }
+  const runtime: LauncherRuntime = { options, lanes: new LaneScheduler(), owned: new ReceiptOwnership() }
   return {
     handle(request) {
       const parsed = parseSessionLaunchClientMessage(request, SESSION_LAUNCH_PROTOCOL_VERSION)
@@ -137,9 +181,10 @@ async function* recoverReceipt(
   }
   if (binding.value !== receipt.key.bindingId) {
     const settled = await fail(options, receipt, 'recovery-uncertain')
-    if (settled.kind === 'close-job-control') yield settled
+    if (settled !== SUPERSEDED && settled.kind === 'close-job-control') yield settled
     return
   }
+  if (runtime.owned.has(receipt.key)) return
   const acquired = await safe(() => runtime.lanes.acquire(receipt.request, signal))
   if (!acquired.ok) {
     yield STORAGE_CLOSE
@@ -157,31 +202,27 @@ async function* recoverReceiptInLane(
   receipt: SessionReceipt,
   signal: AbortSignal,
   releaseLane: LaneRelease,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   const project = await safe(() => options.projects.get(receipt.request.target.projectId))
   if (signal.aborted) return
   if (!project.ok || !project.value || !sameProject(receipt.project, project.value)) {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   if (receipt.worktree.phase === 'none') {
     if (receipt.state !== 'accepted') {
-      yield await fail(options, receipt, 'recovery-uncertain')
-      return
+      return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
     }
     if (!(await audit(options, receipt))) {
       yield STORAGE_CLOSE
       return
     }
     yield message({ type: 'SESSION_ACCEPTED', requestId: receipt.request.requestId })
-    yield* continueLaunchInLane(options, receipt, project.value, signal, releaseLane)
-    return
+    return yield* continueLaunchInLane(options, receipt, project.value, signal, releaseLane)
   }
   const inspected = await safe(() => options.worktrees.inspect(receipt.worktree))
   if (signal.aborted) return
   if (!inspected.ok || inspected.value !== 'exact') {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   if (receipt.state === 'accepted') {
     if (!(await audit(options, receipt))) {
@@ -189,12 +230,10 @@ async function* recoverReceiptInLane(
       return
     }
     yield message({ type: 'SESSION_ACCEPTED', requestId: receipt.request.requestId })
-    yield* recoverProvisioning(options, receipt, project.value, signal, releaseLane)
-    return
+    return yield* recoverProvisioning(options, receipt, project.value, signal, releaseLane)
   }
   if (receipt.worktree.phase !== 'verified') {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   if (receipt.state === 'provisioned') {
     const registered: SessionWorktreeRegisteredSnapshot = { ...receipt.worktree, phase: 'worktree-registered' }
@@ -206,27 +245,20 @@ async function* recoverReceiptInLane(
     )
     if (!verified.ok) {
       if (verified.aborted) return
-      yield await fail(options, receipt, 'recovery-uncertain')
-      return
+      return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
     }
     if (verified.value.status === 'failed') {
-      yield await fail(options, receipt, verified.value.reason)
-      return
+      return yield* settle(await fail(options, receipt, verified.value.reason))
     }
     const reverified = await journal(options, receipt, verified.value.snapshot)
-    if (!reverified) {
-      yield STORAGE_CLOSE
-      return
-    }
-    yield* startProvisioned(options, reverified, verified.value.snapshot, signal, releaseLane)
-    return
+    if (reverified.status !== 'updated') return yield* halt(reverified)
+    return yield* startProvisioned(options, reverified.receipt, verified.value.snapshot, signal, releaseLane)
   }
   if (receipt.state === 'spawn-intent' || receipt.state === 'started') {
     releaseLane()
-    yield* recoverProcess(options, receipt, receipt.worktree, signal)
-    return
+    return yield* recoverProcess(options, receipt, receipt.worktree, signal)
   }
-  yield await fail(options, receipt, 'recovery-uncertain')
+  return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
 }
 
 async function* recoverProvisioning(
@@ -235,7 +267,7 @@ async function* recoverProvisioning(
   project: LocalProjectRecord,
   recoverySignal: AbortSignal,
   releaseLane: LaneRelease,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (recoverySignal.aborted) return
   let receipt = startingReceipt
   let snapshot = receipt.worktree
@@ -249,30 +281,23 @@ async function* recoverProvisioning(
     )
     if (!registered.ok) {
       if (registered.aborted) return
-      yield await failProvisioning(options, receipt, branch, registered.timeout ? 'launch-timeout' : 'provision-failed')
-      return
+      return yield* settle(await failProvisioning(options, receipt, branch, registered.timeout ? 'launch-timeout' : 'provision-failed'))
     }
     if (registered.value.status === 'failed') {
-      yield await failProvisioning(options, receipt, branch, registered.value.reason)
-      return
+      return yield* settle(await failProvisioning(options, receipt, branch, registered.value.reason))
     }
     snapshot = registered.value.snapshot
     const journaled = await journal(options, receipt, snapshot)
-    if (!journaled) {
-      yield STORAGE_CLOSE
-      return
-    }
-    receipt = journaled
+    if (journaled.status !== 'updated') return yield* halt(journaled)
+    receipt = journaled.receipt
   }
   if (snapshot.phase !== 'worktree-registered') {
-    if (snapshot.phase === 'verified') {
-      const provisioned = await transition(options, receipt, 'provisioned', { worktree: snapshot })
-      if (!provisioned) yield STORAGE_CLOSE
-      else yield* startProvisioned(options, provisioned, snapshot, recoverySignal, releaseLane)
-      return
+    if (snapshot.phase !== 'verified') {
+      return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
     }
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    const provisioned = await transition(options, receipt, 'provisioned', { worktree: snapshot })
+    if (provisioned.status !== 'updated') return yield* halt(provisioned)
+    return yield* startProvisioned(options, provisioned.receipt, snapshot, recoverySignal, releaseLane)
   }
   const registered = snapshot
   const verified = await timed(
@@ -283,19 +308,14 @@ async function* recoverProvisioning(
   )
   if (!verified.ok) {
     if (verified.aborted) return
-    yield await failProvisioning(options, receipt, registered, verified.timeout ? 'launch-timeout' : 'provision-failed')
-    return
+    return yield* settle(await failProvisioning(options, receipt, registered, verified.timeout ? 'launch-timeout' : 'provision-failed'))
   }
   if (verified.value.status === 'failed') {
-    yield await failProvisioning(options, receipt, registered, verified.value.reason)
-    return
+    return yield* settle(await failProvisioning(options, receipt, registered, verified.value.reason))
   }
   const provisioned = await transition(options, receipt, 'provisioned', { worktree: verified.value.snapshot })
-  if (!provisioned) {
-    yield STORAGE_CLOSE
-    return
-  }
-  yield* startProvisioned(options, provisioned, verified.value.snapshot, recoverySignal, releaseLane)
+  if (provisioned.status !== 'updated') return yield* halt(provisioned)
+  return yield* startProvisioned(options, provisioned.receipt, verified.value.snapshot, recoverySignal, releaseLane)
 }
 
 async function* recoverProcess(
@@ -303,23 +323,24 @@ async function* recoverProcess(
   startingReceipt: SessionReceipt,
   worktree: SessionWorktreeVerifiedSnapshot,
   recoverySignal: AbortSignal,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (recoverySignal.aborted) return
   const sessionId = startingReceipt.sessionId
   const prior = startingReceipt.channel
   if (!sessionId || !isSafeIdentifier(sessionId) || !prior || prior.lifecycle === 'replacement-intent' || !options.recoveryChannels) {
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const inspected = await safe(() => options.processes.inspect({ sessionId, cwd: worktree.resolvedCwdPath }))
   if (!inspected.ok || inspected.value !== 'exact' || recoverySignal.aborted) {
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const status = await safe(() => options.recoveryChannels!.status(prior.channelId, prior.generation, prior.connectionEpoch))
+  // A channel still reported live is on this connection, so the launch that opened it is still
+  // attached and owns the session: there is nothing to take over, and reporting it failed would
+  // contradict a process that keeps running. Losing the connection reports it lost and recovers.
+  if (status.ok && status.value === 'live') return
   if (!status.ok || (status.value !== 'closed' && status.value !== 'lost')) {
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const access = await timed(
     options,
@@ -329,17 +350,14 @@ async function* recoverProcess(
   )
   if (!access.ok) {
     if (access.aborted) return
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   if (access.value.status === 'refused') {
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const generation = prior.generation + 1
   if (!Number.isSafeInteger(generation)) {
-    yield await fail(options, startingReceipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const claimed = await claimReplacement(options, startingReceipt, generation)
   if (claimed.status === 'storage-unavailable') {
@@ -348,10 +366,14 @@ async function* recoverProcess(
   }
   if (claimed.status === 'contender') {
     const replay = await waitForReplacement(options, startingReceipt.key, claimed.current, generation)
-    yield replay ?? STORAGE_CLOSE
+    if (!replay) {
+      yield STORAGE_CLOSE
+      return
+    }
+    yield replay
     return
   }
-  yield* openReplacement(options, claimed.receipt, worktree, access.value.plan, sessionId, generation, recoverySignal)
+  return yield* openReplacement(options, claimed.receipt, worktree, access.value.plan, sessionId, generation, recoverySignal)
 }
 
 type ReplacementClaim =
@@ -416,22 +438,19 @@ async function* openReplacement(
   sessionId: string,
   generation: number,
   signal: AbortSignal,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   const opened = await timed(options, LAUNCH_PROGRESS_MS, operationSignal => options.channels.open(receipt.key.requestId, sessionId, operationSignal), signal)
   if (!opened.ok) {
     if (opened.aborted) return
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   if (opened.value.status === 'failed') {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   const channelId = opened.value.channelId
   const connectionEpoch = opened.value.connectionEpoch
   if (!isSafeIdentifier(channelId)) {
-    yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
-    return
+    return yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
   }
   const stopClosing = closeChannelOnAbort(options, channelId, signal, generation, connectionEpoch)
   try {
@@ -446,14 +465,12 @@ async function* openReplacement(
     }, operationSignal), signal)
     if (!adopted.ok) {
       if (adopted.aborted) return
-      yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
-      return
+      return yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
     }
     if (adopted.value.status === 'failed') {
-      yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
-      return
+      return yield* closeFailedReplacement(options, receipt, channelId, generation, connectionEpoch)
     }
-    yield* publishStarted(
+    return yield* publishStarted(
       options,
       receipt,
       worktree,
@@ -476,7 +493,7 @@ async function* closeFailedReplacement(
   channelId: string,
   generation: number,
   connectionEpoch?: string,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   const closed = await safe(() => options.recoveryChannels!.closeExact(
     channelId,
     generation,
@@ -487,7 +504,7 @@ async function* closeFailedReplacement(
     yield STORAGE_CLOSE
     return
   }
-  yield await fail(options, receipt, 'recovery-uncertain')
+  return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
 }
 
 async function* invalidRequest(
@@ -501,11 +518,29 @@ async function* invalidRequest(
   yield await refuse(options, request, '0'.repeat(64), 'invalid-request', false)
 }
 
+// Ownership is taken before the receipt exists and given back in a finally, so it ends with the
+// generator however that happens: returning, throwing, or being abandoned by its consumer.
+// A launch is then the only writer of the receipt it claims, so losing a compare-and-set means the
+// ledger and the launcher disagree about who owns the request; that is a fault the runner reports.
 async function* launch(
   runtime: LauncherRuntime,
   request: SessionStartMessage,
   fingerprint: string,
 ): AsyncGenerator<SessionLaunchAction> {
+  const release = runtime.owned.claim(keyOf(request))
+  try {
+    const progress = yield* admit(runtime, request, fingerprint)
+    if (progress === SUPERSEDED) yield STORAGE_CLOSE
+  } finally {
+    release()
+  }
+}
+
+async function* admit(
+  runtime: LauncherRuntime,
+  request: SessionStartMessage,
+  fingerprint: string,
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   const options = runtime.options
   const authenticated = safeSync(() => options.bindingId())
   if (!authenticated.ok) {
@@ -516,9 +551,9 @@ async function* launch(
     yield await refuse(options, request, fingerprint, 'binding-mismatch', false)
     return
   }
-  const known = await safe(() => options.receipts.lookup(keyOf(request)))
+  const known = await safeUnlessBusy(() => options.receipts.lookup(keyOf(request)))
   if (!known.ok) {
-    yield STORAGE_CLOSE
+    yield known.busy ? await refuse(options, request, fingerprint, 'at-capacity', false) : STORAGE_CLOSE
     return
   }
   if (known.value.status !== 'missing') {
@@ -557,9 +592,9 @@ async function* launch(
     yield await refuse(options, request, fingerprint, initialAccess.value.reason, true)
     return
   }
-  const claimed = await safe(() => options.receipts.claim(request, fingerprint, now.iso))
+  const claimed = await safeUnlessBusy(() => options.receipts.claim(request, fingerprint, now.iso))
   if (!claimed.ok) {
-    yield STORAGE_CLOSE
+    yield claimed.busy ? await refuse(options, request, fingerprint, 'at-capacity', false) : STORAGE_CLOSE
     return
   }
   if (claimed.value.status === 'storage-unavailable') {
@@ -581,32 +616,28 @@ async function* launch(
   let receipt = claimed.value.receipt
   if (!sameProject(receipt.project, projectResult.value)) {
     const updated = await persist(options, receipt, { project: projectResult.value })
-    if (!updated) {
-      yield STORAGE_CLOSE
-      return
-    }
-    receipt = updated
+    if (updated.status !== 'updated') return yield* halt(updated)
+    receipt = updated.receipt
   }
   if (!(await audit(options, receipt))) {
     yield STORAGE_CLOSE
     return
   }
   yield message({ type: 'SESSION_ACCEPTED', requestId: request.requestId })
-  yield* continueLaunch(runtime, receipt, projectResult.value)
+  return yield* continueLaunch(runtime, receipt, projectResult.value)
 }
 
 async function* continueLaunch(
   runtime: LauncherRuntime,
   receipt: SessionReceipt,
   project: LocalProjectRecord,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   const acquired = await acquireLane(runtime, receipt.request)
   if (!acquired.ok) {
-    yield await fail(runtime.options, receipt, acquired.timeout ? 'launch-timeout' : 'provision-failed')
-    return
+    return yield* settle(await fail(runtime.options, receipt, acquired.timeout ? 'launch-timeout' : 'provision-failed'))
   }
   try {
-    yield* continueLaunchInLane(runtime.options, receipt, project, undefined, acquired.value)
+    return yield* continueLaunchInLane(runtime.options, receipt, project, undefined, acquired.value)
   } finally {
     acquired.value()
   }
@@ -618,25 +649,20 @@ async function* continueLaunchInLane(
   project: LocalProjectRecord,
   parentSignal?: AbortSignal,
   releaseLane?: LaneRelease,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   let receipt = startingReceipt
   const prepared = await timed(options, LAUNCH_PROGRESS_MS, signal => options.worktrees.prepare(project, receipt.request.target, signal), parentSignal)
   if (!prepared.ok) {
     if (prepared.aborted) return
-    yield await fail(options, receipt, prepared.timeout ? 'launch-timeout' : 'provision-failed')
-    return
+    return yield* settle(await fail(options, receipt, prepared.timeout ? 'launch-timeout' : 'provision-failed'))
   }
   if (prepared.value.status === 'failed') {
-    yield await fail(options, receipt, prepared.value.reason)
-    return
+    return yield* settle(await fail(options, receipt, prepared.value.reason))
   }
   let snapshot: SessionWorktreeSnapshot = prepared.value.snapshot
   const preparedReceipt = await journal(options, receipt, snapshot)
-  if (!preparedReceipt) {
-    yield STORAGE_CLOSE
-    return
-  }
-  receipt = preparedReceipt
+  if (preparedReceipt.status !== 'updated') return yield* halt(preparedReceipt)
+  receipt = preparedReceipt.receipt
   if (snapshot.phase === 'branch-created') {
     const branch = snapshot
     const registered = await timed(
@@ -647,43 +673,32 @@ async function* continueLaunchInLane(
     )
     if (!registered.ok) {
       if (registered.aborted) return
-      yield await failProvisioning(options, receipt, branch, registered.timeout ? 'launch-timeout' : 'provision-failed')
-      return
+      return yield* settle(await failProvisioning(options, receipt, branch, registered.timeout ? 'launch-timeout' : 'provision-failed'))
     }
     if (registered.value.status === 'failed') {
-      yield await failProvisioning(options, receipt, branch, registered.value.reason)
-      return
+      return yield* settle(await failProvisioning(options, receipt, branch, registered.value.reason))
     }
     snapshot = registered.value.snapshot
     const journaled = await journal(options, receipt, snapshot)
-    if (!journaled) {
-      yield STORAGE_CLOSE
-      return
-    }
-    receipt = journaled
+    if (journaled.status !== 'updated') return yield* halt(journaled)
+    receipt = journaled.receipt
   }
   if (snapshot.phase !== 'worktree-registered') {
-    yield await fail(options, receipt, 'worktree-invalid')
-    return
+    return yield* settle(await fail(options, receipt, 'worktree-invalid'))
   }
   const registered = snapshot
   const verified = await timed(options, LAUNCH_PROGRESS_MS, signal => options.worktrees.verify(registered, receipt.request.target.relativeCwd, signal), parentSignal)
   if (!verified.ok) {
     if (verified.aborted) return
-    yield await failProvisioning(options, receipt, registered, verified.timeout ? 'launch-timeout' : 'provision-failed')
-    return
+    return yield* settle(await failProvisioning(options, receipt, registered, verified.timeout ? 'launch-timeout' : 'provision-failed'))
   }
   if (verified.value.status === 'failed') {
-    yield await failProvisioning(options, receipt, registered, verified.value.reason)
-    return
+    return yield* settle(await failProvisioning(options, receipt, registered, verified.value.reason))
   }
   const verifiedSnapshot = verified.value.snapshot
   const provisioned = await transition(options, receipt, 'provisioned', { worktree: verifiedSnapshot })
-  if (!provisioned) {
-    yield STORAGE_CLOSE
-    return
-  }
-  yield* startProvisioned(options, provisioned, verifiedSnapshot, parentSignal, releaseLane)
+  if (provisioned.status !== 'updated') return yield* halt(provisioned)
+  return yield* startProvisioned(options, provisioned.receipt, verifiedSnapshot, parentSignal, releaseLane)
 }
 
 async function* startProvisioned(
@@ -692,59 +707,52 @@ async function* startProvisioned(
   worktree: SessionWorktreeVerifiedSnapshot,
   parentSignal?: AbortSignal,
   releaseLane?: LaneRelease,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (parentSignal?.aborted) return
   let receipt = startingReceipt
   const freshAccess = await timed(options, LAUNCH_PROGRESS_MS, signal => options.access.resolve(receipt.request.modelProfileId, signal), parentSignal)
   if (!freshAccess.ok) {
     if (freshAccess.aborted) return
-    yield await failProvisioning(options, receipt, worktree, freshAccess.timeout ? 'launch-timeout' : 'runtime-unavailable')
-    return
+    return yield* settle(await failProvisioning(options, receipt, worktree, freshAccess.timeout ? 'launch-timeout' : 'runtime-unavailable'))
   }
   if (freshAccess.value.status === 'refused') {
-    yield await failProvisioning(options, receipt, worktree, freshAccess.value.reason)
-    return
+    return yield* settle(await failProvisioning(options, receipt, worktree, freshAccess.value.reason))
   }
   releaseLane?.()
   if (parentSignal?.aborted) return
   const generatedSessionId = safeSync(() => options.identifiers.nextSessionId())
   if (!generatedSessionId.ok || !isSafeIdentifier(generatedSessionId.value)) {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   const sessionId = generatedSessionId.value
   const intent = await transition(options, receipt, 'spawn-intent', { sessionId })
   if (parentSignal?.aborted) return
-  if (!intent) {
-    yield STORAGE_CLOSE
-    return
-  }
-  receipt = intent
+  if (intent.status !== 'updated') return yield* halt(intent)
+  receipt = intent.receipt
   const opened = await timed(options, LAUNCH_PROGRESS_MS, signal => options.channels.open(receipt.request.requestId, sessionId, signal), parentSignal)
   if (!opened.ok) {
     if (opened.aborted) return
-    yield await fail(options, receipt, opened.timeout ? 'launch-timeout' : 'channel-unavailable')
-    return
+    return yield* settle(await fail(options, receipt, opened.timeout ? 'launch-timeout' : 'channel-unavailable'))
   }
   if (opened.value.status === 'failed') {
-    yield await fail(options, receipt, opened.value.reason)
-    return
+    return yield* settle(await fail(options, receipt, opened.value.reason))
   }
   const channelId = opened.value.channelId
   if (!isSafeIdentifier(channelId)) {
     const closed = await closeExactOrLegacy(options, channelId, 'channel-unavailable', 1, opened.value.connectionEpoch)
-    yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, 'channel-unavailable')
-    return
+    if (closed === 'unknown') {
+      yield STORAGE_CLOSE
+      return
+    }
+    return yield* settle(await fail(options, receipt, 'channel-unavailable'))
   }
   const correlation = await correlateChannel(options, receipt, channelId, 1, opened.value.connectionEpoch, parentSignal)
   if (correlation.aborted) return
-  const correlated = correlation.receipt
-  if (!correlated) {
+  if (correlation.update.status !== 'updated') {
     await closeExactOrLegacy(options, channelId, 'storage-unavailable', 1, opened.value.connectionEpoch)
-    yield STORAGE_CLOSE
-    return
+    return yield* halt(correlation.update)
   }
-  receipt = correlated
+  receipt = correlation.update.receipt
   const plan: LaunchPlan = freshAccess.value.plan
   const processRequest = {
     requestId: receipt.request.requestId,
@@ -773,23 +781,27 @@ async function* startProvisioned(
         1,
         opened.value.connectionEpoch,
       )
-      yield compensation === 'storage-unavailable'
-        ? STORAGE_CLOSE
-        : await fail(options, receipt, compensation)
-      return
+      if (compensation === 'storage-unavailable') {
+        yield STORAGE_CLOSE
+        return
+      }
+      return yield* settle(await fail(options, receipt, compensation))
     }
     if (started.value.status === 'failed') {
       const reason = started.value.reason
       const closed = await closeExactOrLegacy(options, channelId, reason, 1, opened.value.connectionEpoch)
-      yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, reason)
-      return
+      if (closed === 'unknown') {
+        yield STORAGE_CLOSE
+        return
+      }
+      return yield* settle(await fail(options, receipt, reason))
     }
     stopTerminatingOnAbort = terminateProcessOnAbort(
       options,
       { sessionId: processRequest.sessionId, cwd: processRequest.cwd },
       parentSignal,
     )
-    yield* publishStarted(
+    return yield* publishStarted(
       options,
       receipt,
       worktree,
@@ -817,15 +829,18 @@ async function* publishStarted(
   onStarted?: () => void,
   generation = 1,
   connectionEpoch?: string,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (parentSignal?.aborted) return
   let receipt = startingReceipt
   if (handle.sessionId !== sessionId
     || (handle.channelId !== undefined && handle.channelId !== channelId)
     || (handle.channelGeneration !== undefined && handle.channelGeneration !== generation)) {
     const closed = await closeExactOrLegacy(options, channelId, 'recovery-uncertain', generation, connectionEpoch)
-    yield closed === 'unknown' ? STORAGE_CLOSE : await fail(options, receipt, 'recovery-uncertain')
-    return
+    if (closed === 'unknown') {
+      yield STORAGE_CLOSE
+      return
+    }
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   const live = await transition(options, receipt, 'started', {
     channelId,
@@ -838,20 +853,20 @@ async function* publishStarted(
     },
   })
   if (parentSignal?.aborted) return
-  if (!live || !(await audit(options, live))) {
+  if (live.status !== 'updated') return yield* halt(live)
+  if (!(await audit(options, live.receipt))) {
     yield STORAGE_CLOSE
     return
   }
   if (parentSignal?.aborted) return
-  receipt = live
+  receipt = live.receipt
   onStarted?.()
   yield message({ type: 'SESSION_STARTED', requestId: receipt.request.requestId, channelId, sessionId })
   const finished = await safe(() => handle.finished)
   if (parentSignal?.aborted) return
   const result = finished.ok ? finishedResult(receipt.request.requestId, finished.value) : null
   if (!result) {
-    yield await fail(options, receipt, 'recovery-uncertain')
-    return
+    return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
   }
   if (options.channelEvents) {
     const settled = await safe(() => options.channelEvents!.handle({
@@ -879,7 +894,8 @@ async function* publishStarted(
       ...(connectionEpoch === undefined ? {} : { connectionEpoch }),
     },
   })
-  if (!terminal || !(await audit(options, terminal))) {
+  if (terminal.status !== 'updated') return yield* halt(terminal)
+  if (!(await audit(options, terminal.receipt))) {
     yield STORAGE_CLOSE
     return
   }
@@ -945,11 +961,12 @@ async function fail(
   options: SessionLauncherOptions,
   receipt: SessionReceipt,
   reason: SessionFailureReason,
-): Promise<SessionLaunchAction> {
+): Promise<SettledAction> {
   const result = { type: 'SESSION_FAILED' as const, requestId: receipt.request.requestId, reason }
   const state = reason === 'recovery-uncertain' ? 'uncertain' : 'failed'
   const terminal = await transition(options, receipt, state, { result })
-  return terminal && await audit(options, terminal) ? message(result) : STORAGE_CLOSE
+  if (terminal.status === SUPERSEDED) return SUPERSEDED
+  return terminal.status === 'updated' && await audit(options, terminal.receipt) ? message(result) : STORAGE_CLOSE
 }
 
 async function failProvisioning(
@@ -957,7 +974,7 @@ async function failProvisioning(
   receipt: SessionReceipt,
   snapshot: SessionWorktreeSnapshot,
   reason: SessionFailureReason,
-): Promise<SessionLaunchAction> {
+): Promise<SettledAction> {
   if (reason === 'recovery-uncertain' || ('ownership' in snapshot && snapshot.ownership === 'reused')) {
     return await fail(options, receipt, reason)
   }
@@ -972,7 +989,7 @@ async function journal(
   options: SessionLauncherOptions,
   receipt: SessionReceipt,
   worktree: SessionWorktreeSnapshot,
-): Promise<SessionReceipt | null> {
+): Promise<ReceiptUpdate> {
   return await persist(options, receipt, { worktree })
 }
 
@@ -981,9 +998,9 @@ async function transition(
   receipt: SessionReceipt,
   state: SessionReceipt['state'],
   changes: Partial<SessionReceipt>,
-): Promise<SessionReceipt | null> {
+): Promise<ReceiptUpdate> {
   const now = clockTime(options)
-  if (!now) return null
+  if (!now) return { status: 'storage-unavailable' }
   return await persist(options, receipt, {
     ...changes,
     state,
@@ -995,9 +1012,28 @@ async function persist(
   options: SessionLauncherOptions,
   receipt: SessionReceipt,
   changes: Partial<SessionReceipt>,
-): Promise<SessionReceipt | null> {
+): Promise<ReceiptUpdate> {
   const result = await safe(() => options.receipts.replace(receipt.revision, { ...receipt, ...changes }))
-  return result.ok && result.value.status === 'updated' ? result.value.receipt : null
+  if (!result.ok) return { status: 'storage-unavailable' }
+  if (result.value.status === 'conflict') return { status: SUPERSEDED }
+  return result.value.status === 'updated'
+    ? { status: 'updated', receipt: result.value.receipt }
+    : { status: 'storage-unavailable' }
+}
+
+async function* halt(
+  outcome: Exclude<ReceiptUpdate, { status: 'updated' }>,
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
+  if (outcome.status === 'storage-unavailable') {
+    yield STORAGE_CLOSE
+    return
+  }
+  return SUPERSEDED
+}
+
+async function* settle(outcome: SettledAction): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
+  if (outcome === SUPERSEDED) return SUPERSEDED
+  yield outcome
 }
 
 async function correlateChannel(
@@ -1007,11 +1043,11 @@ async function correlateChannel(
   generation: number,
   connectionEpoch: string | undefined,
   signal?: AbortSignal,
-): Promise<{ receipt: SessionReceipt | null; aborted: boolean }> {
+): Promise<{ update: ReceiptUpdate; aborted: boolean }> {
   const stopClosingOnAbort = closeChannelOnAbort(options, channelId, signal, generation, connectionEpoch)
   if (signal?.aborted) {
     stopClosingOnAbort()
-    return { receipt: null, aborted: true }
+    return { update: { status: 'storage-unavailable' }, aborted: true }
   }
   try {
     const correlated = await persist(options, receipt, {
@@ -1023,7 +1059,7 @@ async function correlateChannel(
         ...(connectionEpoch === undefined ? {} : { connectionEpoch }),
       },
     })
-    return { receipt: correlated, aborted: signal?.aborted ?? false }
+    return { update: correlated, aborted: signal?.aborted ?? false }
   } finally {
     stopClosingOnAbort()
   }
@@ -1227,7 +1263,8 @@ async function timed<T>(
     value => ({ ok: true as const, value }),
     () => ({ ok: false as const, timeout: false, aborted: false }),
   ).finally(() => { settled = true })
-  const timeout = options.clock.sleep(milliseconds).then(async (): Promise<TimedResult<T>> => {
+  const timeoutController = new AbortController()
+  const timeout = options.clock.sleep(milliseconds, timeoutController.signal).then(async (): Promise<TimedResult<T>> => {
     await Promise.resolve()
     if (settled) return await operationResult
     controller.abort()
@@ -1236,6 +1273,7 @@ async function timed<T>(
   try {
     return await Promise.race([operationResult, timeout, parentAbort])
   } finally {
+    timeoutController.abort()
     if (abortFromParent) parentSignal?.removeEventListener('abort', abortFromParent)
   }
 }
@@ -1253,5 +1291,18 @@ async function safe<T>(operation: () => Promise<T>): Promise<{ ok: true; value: 
     return { ok: true, value: await operation() }
   } catch {
     return { ok: false }
+  }
+}
+
+// Admission is the one place a saturated ledger must not stop the runner: the request has no
+// durable record yet, so refusing it costs nothing and the peer can retry. The refusal itself
+// never touches the ledger, which is what lets it answer while the ledger is the thing refusing.
+async function safeUnlessBusy<T>(
+  operation: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; busy: boolean }> {
+  try {
+    return { ok: true, value: await operation() }
+  } catch (error) {
+    return { ok: false, busy: error instanceof SessionReceiptBusyError }
   }
 }
