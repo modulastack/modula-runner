@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -159,12 +160,26 @@ function installEnvironment(workspace: string): NodeJS.ProcessEnv {
   }
 }
 
+// The installed runner sees a scrubbed PATH: the checkout and inherited package bins are gone, so
+// only the candidate's own files answer. Its documented host prerequisites still have to resolve,
+// and on macOS two of them live outside /usr/bin:/bin — tmux under Homebrew and lsof under
+// /usr/sbin, which the Darwin pane-landing read-back uses — so the darwin lane carries exactly
+// those two directories. Linux keeps both prerequisites in /usr/bin and adds nothing.
+const prerequisiteDirs = process.platform === 'darwin' ? [dirname(hostExecutable('tmux')), '/usr/sbin'] : []
+
+function hostExecutable(name: string): string {
+  const found = spawnSync('/usr/bin/which', [name], { encoding: 'utf8', env: process.env })
+  const resolved = found.status === 0 ? found.stdout.trim() : ''
+  if (!resolved) throw new Error(`macOS prerequisite ${name} is not on the host PATH`)
+  return resolved
+}
+
 function runnerEnvironment(
   workspace: string,
   options: Pick<RunOptions, 'home' | 'endpointUrl' | 'extraPath'>,
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
-    PATH: `${options.extraPath ? `${options.extraPath}:` : ''}${nodeBinDir}:/usr/bin:/bin`,
+    PATH: [options.extraPath, nodeBinDir, '/usr/bin', '/bin', ...prerequisiteDirs].filter(Boolean).join(':'),
     HOME: workspace,
     TMPDIR: join(workspace, 'tmp'),
   }
@@ -218,12 +233,27 @@ function capture(stream: NodeJS.ReadableStream, overflow: () => void): { value()
   return { value: () => output }
 }
 
+// node-pty's Darwin prebuild ships its spawn-helper without an execute bit and npm preserves that,
+// so on a fresh checkout the harness's own hidden-prompt pty fails with posix_spawnp until the
+// helper can run. The runner prepares its installed copy the same way; this prepares the
+// workspace copy the test process uses — the exact platform helper, owner execute bit only.
+let workspacePtyHelperPrepared = false
+function prepareWorkspacePtyHelper(): void {
+  if (workspacePtyHelperPrepared || process.platform !== 'darwin') return
+  const require = createRequire(import.meta.url)
+  const helper = join(dirname(require.resolve('node-pty')), '..', 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper')
+  const mode = statSync(helper).mode & 0o777
+  if ((mode & 0o100) === 0) chmodSync(helper, mode | 0o100)
+  workspacePtyHelperPrepared = true
+}
+
 function spawnInstalledInPty(
   binary: string,
   args: string[],
   options: PtyRunOptions,
   workspace: string,
 ): Promise<PtyRunResult> {
+  prepareWorkspacePtyHelper()
   const terminal = pty.spawn(binary, args, {
     cwd: options.cwd ?? workspace,
     env: runnerEnvironment(workspace, options),
