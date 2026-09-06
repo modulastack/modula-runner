@@ -645,6 +645,76 @@ describe('production session receipt ledger', () => {
     await expect(Promise.all(queued)).resolves.toHaveLength(MAX_PENDING_SESSION_LEDGER_OPERATIONS)
   })
 
+  it('collapses concurrent recovery scans onto the one read already in flight', async () => {
+    let release!: () => void
+    const stalled = new Promise<void>(resolve => { release = resolve })
+    const inherited = {
+      ...receipt(3, 'started', '2026-08-21T00:00:00Z'),
+      project: { projectId: 'modulastack', repoPath: '/repos/modulastack', worktreesRoot: '/worktrees', revision: 1 },
+    }
+    const held = memoryStorage({ ...emptyImage(), receipts: [inherited] })
+    let loads = 0
+    const storage: SessionReceiptStorage = {
+      load: async () => {
+        loads += 1
+        await stalled
+        return await held.storage.load()
+      },
+      replace: (expectedRevision, next) => held.storage.replace(expectedRevision, next),
+    }
+    const ledger = createSessionReceiptLedger({ storage, clock })
+    const burst = Array.from({ length: MAX_PENDING_SESSION_LEDGER_OPERATIONS }, () => ledger.recover())
+    release()
+    await expect(Promise.all(burst)).resolves.toEqual(burst.map(() => [inherited]))
+    expect(loads).toBe(1)
+    await expect(ledger.recover()).resolves.toEqual([inherited])
+    expect(loads).toBe(2)
+  })
+
+  it('rejects every waiter on a shared scan that fails and leaves the next one free to read', async () => {
+    let release!: () => void
+    const stalled = new Promise<void>(resolve => { release = resolve })
+    const held = memoryStorage()
+    let loads = 0
+    const storage: SessionReceiptStorage = {
+      load: async () => {
+        loads += 1
+        await stalled
+        return loads === 1 ? { status: 'storage-unavailable' } : await held.storage.load()
+      },
+      replace: (expectedRevision, next) => held.storage.replace(expectedRevision, next),
+    }
+    const ledger = createSessionReceiptLedger({ storage, clock })
+    const burst = Array.from({ length: 8 }, () => ledger.recover())
+    release()
+    await expect(Promise.allSettled(burst)).resolves.toEqual(
+      burst.map(() => ({ status: 'rejected', reason: expect.any(SessionReceiptStorageUnavailableError) })),
+    )
+    expect(loads).toBe(1)
+    await expect(ledger.recover()).resolves.toEqual([])
+    expect(loads).toBe(2)
+  })
+
+  it('keeps an ordinary operation admissible under a burst of recovery scans', async () => {
+    let release!: () => void
+    const stalled = new Promise<void>(resolve => { release = resolve })
+    const held = memoryStorage()
+    const storage: SessionReceiptStorage = {
+      load: async () => {
+        await stalled
+        return await held.storage.load()
+      },
+      replace: (expectedRevision, next) => held.storage.replace(expectedRevision, next),
+    }
+    const ledger = createSessionReceiptLedger({ storage, clock })
+    const burst = Array.from({ length: MAX_PENDING_SESSION_LEDGER_OPERATIONS * 2 }, () => ledger.recover())
+    const admitted = ledger.lookup({ bindingId: request().bindingId, requestId: request().requestId })
+    const scanned = Promise.all(burst)
+    release()
+    await expect(admitted).resolves.toEqual({ status: 'missing' })
+    await expect(scanned).resolves.toHaveLength(MAX_PENDING_SESSION_LEDGER_OPERATIONS * 2)
+  })
+
   it('reserves the proved maximum nonterminal record before admission', async () => {
     const initial = emptyImage()
     const held: SessionReceipt[] = []

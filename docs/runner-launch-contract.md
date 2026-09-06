@@ -522,13 +522,20 @@ receipt, and an operation past admission stops without an answer, leaving its re
 crash at that point would for the next connection's recovery to re-drive.
 
 The recovery scan is exempt from that bound. It is the precondition a connection admits anything
-against rather than an operation competing with them for the same capacity, and at most one runs per
-connection, so the request burst the bound exists to absorb cannot arrive through it.
+against rather than an operation competing with them for the same capacity, and concurrent scans
+collapse onto the read already in flight, so the exemption costs one pending operation however many
+connections arrive at once and no burst can reach the bound through it. A connection that joins a
+read taken moments before its own arrival loses nothing: the scan answers with the receipts the
+ledger still owes recovery, and anything settled since is settled by the writer that settled it.
 
 A recovery pass that back-pressure ends before it adopts the session its receipt describes leaves
-that session running, so it keeps that worktree's provisioning lane instead of returning it. Other
-worktrees admit unaffected; that one serializes behind the lane as it always does. The lane returns
-when a later pass adopts or settles the receipt, or when a later scan no longer names it.
+that session running, so it keeps that worktree's provisioning lane instead of returning it. That
+covers a settlement the ledger deferred as much as a deferred replacement claim: neither wrote, so
+neither may free the worktree. A pass that has already handed the lane back — provisioning finished,
+no session left unaccounted for — keeps nothing, and a later pass over that receipt acquires the
+lane again. Other worktrees admit unaffected; the kept one serializes behind the lane as it always
+does. The lane returns when a later pass adopts or settles the receipt, or when a later scan no
+longer names it.
 
 Expired terminal receipts compact oldest-first into replay-capable tombstones. Tombstones delete
 oldest-first only after 30 days. Known exact duplicates consult full receipts/tombstones before the

@@ -192,6 +192,16 @@ function recoveryReceipt(): SessionReceipt {
   }
 }
 
+function provisionedReceipt(): SessionReceipt {
+  const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...base } = recoveryReceipt()
+  return {
+    ...base,
+    revision: 2,
+    state: 'provisioned',
+    phaseTimestamps: { accepted: '2026-08-20T23:59:58Z', provisioned: '2026-08-20T23:59:59Z' },
+  }
+}
+
 function acceptedReceipt(): SessionReceipt {
   const { sessionId: _sessionId, channelId: _channelId, channel: _channel, ...base } = recoveryReceipt()
   return {
@@ -1019,6 +1029,77 @@ describe('production session launcher', () => {
       { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: sameWorktree.requestId, exitCode: 0, signal: null } },
     ])
     expect(subject.processStarts()).toBe(1)
+  })
+
+  it('keeps the worktree of a receipt whose settlement the ledger deferred', async () => {
+    const subject = options({}, [recoveryReceipt()])
+    const saturated = busyLedger(subject.value.receipts, 0, REFUSALS_PAST_THE_LEDGER_WAIT)
+    const launcher = createSessionLauncher({
+      ...subject.value,
+      receipts: saturated.value,
+      // A channel host that cannot say whether the prior channel ended leaves the process it
+      // belonged to possibly live, which is the case a settlement nothing recorded must not free
+      // the worktree for.
+      recoveryChannels: { ...recoveryChannelPorts(subject.value.channels), status: async () => 'unknown' as const },
+    })
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    expect(saturated.rejections()).toBe(REFUSALS_PAST_THE_LEDGER_WAIT)
+    expect(subject.held.image().receipts).toEqual([recoveryReceipt()])
+    await expect(collect(launcher.handle(sameWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: sameWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_FAILED', requestId: sameWorktree.requestId, reason: 'launch-timeout' } },
+    ])
+    expect(subject.processStarts()).toBe(0)
+  })
+
+  it('acquires the lane afresh for a pass whose predecessor had already handed it back', async () => {
+    // The re-verify journal and the spawn-intent transition, after which provisioning is done and
+    // the lane is already back, so the deferral that follows has no hold left to keep.
+    const writesBeforeTheChannelOpens = 2
+    const subject = options({}, [provisionedReceipt()])
+    const saturated = busyLedger(subject.value.receipts, writesBeforeTheChannelOpens, REFUSALS_PAST_THE_LEDGER_WAIT)
+    let opens = 0
+    let inspections = 0
+    let admitTheSecondPass!: () => void
+    let announceTheSecondPass!: () => void
+    const secondPassInspecting = new Promise<void>(resolve => { announceTheSecondPass = resolve })
+    const secondPassResumes = new Promise<void>(resolve => { admitTheSecondPass = resolve })
+    const launcher = createSessionLauncher({
+      ...subject.value,
+      receipts: saturated.value,
+      channels: {
+        ...subject.value.channels,
+        open: async () => {
+          opens += 1
+          return opens === 1 ? { status: 'failed', reason: 'channel-unavailable' } : { status: 'opened', channelId: 'channel-1' }
+        },
+      },
+      worktrees: {
+        ...subject.value.worktrees,
+        inspect: async snapshot => {
+          inspections += 1
+          if (inspections === 2) {
+            announceTheSecondPass()
+            await secondPassResumes
+          }
+          return await subject.value.worktrees.inspect(snapshot)
+        },
+      },
+    })
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    expect(saturated.rejections()).toBe(REFUSALS_PAST_THE_LEDGER_WAIT)
+    expect(subject.held.image().receipts.map(stored => stored.state)).toEqual(['spawn-intent'])
+    const secondPass = collect(launcher.recover())
+    await secondPassInspecting
+    await expect(collect(launcher.handle(sameWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: sameWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_FAILED', requestId: sameWorktree.requestId, reason: 'launch-timeout' } },
+    ])
+    admitTheSecondPass()
+    await expect(secondPass).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_FAILED', requestId: request.requestId, reason: 'recovery-uncertain' } },
+    ])
+    expect(subject.processStarts()).toBe(0)
   })
 
   it('settles stale-binding recovery locally without disclosing its request id', async () => {

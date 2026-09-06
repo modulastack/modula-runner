@@ -244,13 +244,20 @@ async function* recoverReceipt(
     yield STORAGE_CLOSE
     return
   }
+  const hold = acquired.value
+  let handedBack = false
   let progress: LaunchProgress = undefined
   try {
-    progress = yield* recoverReceiptInLane(options, receipt, signal, acquired.value)
+    progress = yield* recoverReceiptInLane(options, receipt, signal, () => {
+      handedBack = true
+      hold()
+    })
     return progress
   } finally {
-    if (progress === DEFERRED) runtime.retained.retain(receipt.key, acquired.value)
-    else acquired.value()
+    // Only a lane this pass still holds is its to keep. A hold given back mid-launch is spent, and
+    // retaining it would hand the next pass a lane it does not hold and make it skip acquiring one.
+    if (progress === DEFERRED && !handedBack) runtime.retained.retain(receipt.key, hold)
+    else hold()
   }
 }
 
@@ -1140,7 +1147,7 @@ async function* halt(
 
 async function* settle(outcome: SettledAction): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (outcome === SUPERSEDED) return SUPERSEDED
-  if (outcome === DEFERRED) return
+  if (outcome === DEFERRED) return DEFERRED
   yield outcome
 }
 

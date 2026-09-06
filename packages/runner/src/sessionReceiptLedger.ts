@@ -66,6 +66,7 @@ export function decodeSessionReceiptLedgerImage(value: unknown): SessionReceiptL
 class DurableSessionReceiptLedger implements SessionReceiptLedger {
   private queue: Promise<unknown> = Promise.resolve()
   private pendingOperations = 0
+  private scan: Promise<readonly SessionReceipt[]> | null = null
 
   constructor(private readonly options: SessionReceiptLedgerOptions) {}
 
@@ -158,14 +159,21 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
 
   // The scan is exempt from the pending ceiling because it is the precondition every other
   // operation is admitted against, not an operation competing with them: a connection may not
-  // safely admit anything until it knows what the last process left behind. Its concurrency is
-  // bounded by connection count rather than by request volume, so the burst the ceiling exists to
-  // bound cannot arrive through here.
+  // safely admit anything until it knows what the last process left behind. Concurrent scans
+  // collapse onto the read already in flight, so the exemption costs one pending operation however
+  // many connections arrive at once and no burst can reach the ceiling through here. A caller that
+  // joins a read taken moments before its own arrival loses nothing: the scan answers with the
+  // receipts the ledger still owes recovery, and anything settled since is settled by its writer.
   recover(): Promise<readonly SessionReceipt[]> {
-    return this.enqueue(async () => {
-      const image = await this.loadOrThrow()
-      return image.receipts.filter(receipt => !isTerminal(receipt)).map(jsonClone)
+    this.scan ??= this.enqueue(async () => {
+      try {
+        const image = await this.loadOrThrow()
+        return image.receipts.filter(receipt => !isTerminal(receipt)).map(jsonClone)
+      } finally {
+        this.scan = null
+      }
     })
+    return this.scan
   }
 
   compact(now: string): Promise<void> {
