@@ -1,13 +1,13 @@
 import type { SessionFinishedMessage } from '@modulastack/runner-protocol'
-import type {
-  SessionChannelEvent,
-  SessionChannelEventCoordinator,
-  SessionChannelEventCoordinatorOptions,
-  SessionChannelEventResult,
-  SessionLaunchAction,
-  SessionReceipt,
-  SessionReceiptLookup,
-  SessionReceiptReplace,
+import {
+  waitOutLedgerCapacity,
+  type SessionChannelEvent,
+  type SessionChannelEventCoordinator,
+  type SessionChannelEventCoordinatorOptions,
+  type SessionChannelEventResult,
+  type SessionLaunchAction,
+  type SessionReceipt,
+  type SessionReceiptReplace,
 } from './sessionLaunch.js'
 
 export function createSessionChannelEventCoordinator(
@@ -20,12 +20,9 @@ async function handleChannelEvent(
   options: SessionChannelEventCoordinatorOptions,
   event: SessionChannelEvent,
 ): Promise<SessionChannelEventResult> {
-  let found: SessionReceiptLookup
-  try {
-    found = await options.receipts.lookup(event.key)
-  } catch {
-    return { status: 'storage-unavailable' }
-  }
+  const looked = await waitOutLedgerCapacity(options.clock, () => options.receipts.lookup(event.key))
+  if (!looked.ok) return { status: looked.busy ? 'busy' : 'storage-unavailable' }
+  const found = looked.value
   if (found.status === 'missing') return { status: 'unknown' }
   if (found.status === 'tombstone') return { status: 'retired' }
   const current = found.receipt
@@ -41,6 +38,7 @@ async function handleChannelEvent(
     return { status: 'storage-unavailable' }
   }
   const replaced = await replaceReceipt(options, current.revision, next)
+  if (replaced.status === 'busy') return replaced
   if (replaced.status !== 'updated') return replacementFailure(replaced, event.generation)
   if (event.kind !== 'terminal' && !(await auditChannelEvent(options, replaced.receipt))) {
     return { status: 'storage-unavailable' }
@@ -52,12 +50,10 @@ async function replaceReceipt(
   options: SessionChannelEventCoordinatorOptions,
   revision: number,
   receipt: SessionReceipt,
-): Promise<SessionReceiptReplace> {
-  try {
-    return await options.receipts.replace(revision, receipt)
-  } catch {
-    return { status: 'storage-unavailable' }
-  }
+): Promise<SessionReceiptReplace | { status: 'busy' }> {
+  const replaced = await waitOutLedgerCapacity(options.clock, () => options.receipts.replace(revision, receipt))
+  if (replaced.ok) return replaced.value
+  return { status: replaced.busy ? 'busy' : 'storage-unavailable' }
 }
 
 function replacementFailure(

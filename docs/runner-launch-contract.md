@@ -514,6 +514,13 @@ fabricating a correlated result it cannot remember. A partially written capacity
 fail-closed after recovery. This required-persistence-failure path is not `SESSION_REFUSED` or
 `SESSION_FAILED`.
 
+The ledger separately bounds how many of its operations may be pending at once. That bound is
+concurrency control rather than storage failure — nothing was attempted and no result was claimed —
+so it is never the required-persistence-failure path above and never closes job control. A caller
+waits briefly for capacity. If that wait runs out, admission answers `at-capacity` without a
+receipt, and an operation past admission stops without an answer, leaving its receipt exactly as a
+crash at that point would for the next connection's recovery to re-drive.
+
 Expired terminal receipts compact oldest-first into replay-capable tombstones. Tombstones delete
 oldest-first only after 30 days. Known exact duplicates consult full receipts/tombstones before the
 capacity block and replay their known outcome.

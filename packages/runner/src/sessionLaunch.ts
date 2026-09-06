@@ -235,6 +235,35 @@ export class SessionReceiptBusyError extends SessionReceiptStorageUnavailableErr
   }
 }
 
+const LEDGER_BUSY_WAIT_MS = 25
+const LEDGER_BUSY_WAITS = 40
+
+// The pending ceiling is other callers' work in flight — one load and one replace each — so it
+// clears on its own, and waiting turns nearly every saturated moment into a completed operation.
+// The wait is bounded because a caller must not park on it forever, and it is done here rather
+// than inside the ledger because only the call site knows what to answer when the wait runs out.
+// What no call site may answer is a storage fault: back-pressure that closed the connection every
+// session shares would let ordinary request volume stop the runner.
+export async function waitOutLedgerCapacity<T>(
+  clock: RunnerClock,
+  operation: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; busy: boolean }> {
+  for (let remaining = LEDGER_BUSY_WAITS; ; remaining -= 1) {
+    try {
+      return { ok: true, value: await operation() }
+    } catch (error) {
+      if (!(error instanceof SessionReceiptBusyError)) return { ok: false, busy: false }
+      if (remaining === 0) return { ok: false, busy: true }
+    }
+    try {
+      await clock.sleep(LEDGER_BUSY_WAIT_MS)
+    } catch {
+      // A clock that cannot wait leaves nothing to wait on; the ledger is still busy either way.
+      return { ok: false, busy: true }
+    }
+  }
+}
+
 export type SessionWorktreeFailure = Extract<
   SessionFailureReason,
   'path-not-granted' | 'worktree-invalid' | 'worktree-conflict' | 'provision-failed' | 'recovery-uncertain'
@@ -304,9 +333,12 @@ export type SessionChannelEvent = {
   | { kind: 'terminal'; exitCode: number | null; signal: number | null }
 )
 
+// `busy` is separate from `storage-unavailable` because its caller answers it differently: a
+// saturated ledger is work in flight, and reporting it as storage that cannot record would close
+// job control over the volume of ordinary traffic.
 export type SessionChannelEventResult =
   | { status: 'applied'; receipt: SessionReceipt; action: SessionLaunchAction | null }
-  | { status: 'retired' | 'unknown' | 'storage-unavailable' }
+  | { status: 'retired' | 'unknown' | 'busy' | 'storage-unavailable' }
 
 export interface SessionChannelEventCoordinator {
   handle(event: SessionChannelEvent): Promise<SessionChannelEventResult>

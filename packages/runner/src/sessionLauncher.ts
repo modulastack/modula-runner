@@ -13,6 +13,7 @@ import type { LaunchPlan } from './accessProfiles.js'
 import {
   SESSION_RECEIPT_SCHEMA_VERSION,
   SessionReceiptBusyError,
+  waitOutLedgerCapacity,
   type LocalProjectRecord,
   type SessionLaunchAction,
   type SessionLauncher,
@@ -32,6 +33,11 @@ const LAUNCH_PROGRESS_MS = 180_000
 const REPLACEMENT_POLL_MS = 100
 const STORAGE_CLOSE: SessionLaunchAction = { kind: 'close-job-control', error: 'storage-unavailable' }
 const SUPERSEDED = 'superseded'
+// A launch that met a ledger still saturated after the bounded wait. It recorded nothing and
+// answered nothing, so it leaves its receipt exactly as a crash at the same point would and the
+// next connection's recovery re-drives it. That is a late answer; closing the channel over
+// back-pressure would be every live session killed.
+const DEFERRED = 'deferred'
 
 type LauncherRuntime = { options: SessionLauncherOptions; lanes: LaneScheduler; owned: ReceiptOwnership }
 type LaneRelease = () => void
@@ -42,9 +48,10 @@ type LaneRelease = () => void
 type ReceiptUpdate =
   | { status: 'updated'; receipt: SessionReceipt }
   | { status: typeof SUPERSEDED }
+  | { status: 'busy' }
   | { status: 'storage-unavailable' }
 
-type SettledAction = SessionLaunchAction | typeof SUPERSEDED
+type SettledAction = SessionLaunchAction | typeof SUPERSEDED | typeof DEFERRED
 type LaunchProgress = typeof SUPERSEDED | void
 
 class LaneScheduler {
@@ -135,9 +142,11 @@ async function* recoverSessions(
   runtime: LauncherRuntime,
   authenticatedBindingId?: string,
 ): AsyncGenerator<SessionLaunchAction> {
-  const recovered = await safe(() => runtime.options.receipts.recover())
+  const recovered = await waitOutLedgerCapacity(runtime.options.clock, () => runtime.options.receipts.recover())
   if (!recovered.ok) {
-    yield STORAGE_CLOSE
+    // The scan reads; a ledger too busy to be read has lost nothing. This connection replays
+    // nothing and the next one scans again, which costs a late replay rather than every session.
+    if (!recovered.busy) yield STORAGE_CLOSE
     return
   }
   yield* mergeRecovery(runtime, recovered.value, authenticatedBindingId)
@@ -181,7 +190,7 @@ async function* recoverReceipt(
   }
   if (binding.value !== receipt.key.bindingId) {
     const settled = await fail(options, receipt, 'recovery-uncertain')
-    if (settled !== SUPERSEDED && settled.kind === 'close-job-control') yield settled
+    if (settled !== SUPERSEDED && settled !== DEFERRED && settled.kind === 'close-job-control') yield settled
     return
   }
   if (runtime.owned.has(receipt.key)) return
@@ -360,12 +369,17 @@ async function* recoverProcess(
     return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
   }
   const claimed = await claimReplacement(options, startingReceipt, generation)
+  // The claim is the replacement's first write, so a ledger too busy to take it leaves the receipt
+  // and the session it describes exactly as recovery found them: this pass declines the takeover
+  // and the next reconnect claims again.
+  if (claimed.status === 'busy') return
   if (claimed.status === 'storage-unavailable') {
     yield STORAGE_CLOSE
     return
   }
   if (claimed.status === 'contender') {
     const replay = await waitForReplacement(options, startingReceipt.key, claimed.current, generation)
+    if (replay === DEFERRED) return
     if (!replay) {
       yield STORAGE_CLOSE
       return
@@ -379,6 +393,7 @@ async function* recoverProcess(
 type ReplacementClaim =
   | { status: 'winner'; receipt: SessionReceipt }
   | { status: 'contender'; current: SessionReceipt | null }
+  | { status: 'busy' }
   | { status: 'storage-unavailable' }
 
 async function claimReplacement(
@@ -390,8 +405,9 @@ async function claimReplacement(
     ...receipt,
     channel: { generation, lifecycle: 'replacement-intent', channelId: null },
   }
-  const result = await safe(() => options.receipts.replace(receipt.revision, intent))
-  if (!result.ok || result.value.status === 'storage-unavailable') return { status: 'storage-unavailable' }
+  const result = await waitOutLedgerCapacity(options.clock, () => options.receipts.replace(receipt.revision, intent))
+  if (!result.ok) return { status: result.busy ? 'busy' : 'storage-unavailable' }
+  if (result.value.status === 'storage-unavailable') return { status: 'storage-unavailable' }
   return result.value.status === 'updated'
     ? { status: 'winner', receipt: result.value.receipt }
     : { status: 'contender', current: result.value.current }
@@ -402,7 +418,7 @@ async function waitForReplacement(
   key: SessionReceipt['key'],
   initial: SessionReceipt | null,
   generation: number,
-): Promise<SessionLaunchAction | null> {
+): Promise<SessionLaunchAction | typeof DEFERRED | null> {
   let current = initial
   const attempts = Math.ceil(LAUNCH_PROGRESS_MS / REPLACEMENT_POLL_MS)
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -410,8 +426,9 @@ async function waitForReplacement(
     if (action) return action
     const slept = await safe(() => options.clock.sleep(REPLACEMENT_POLL_MS))
     if (!slept.ok) return null
-    const found = await safe(() => options.receipts.lookup(key))
-    if (!found.ok || found.value.status !== 'receipt') return null
+    const found = await waitOutLedgerCapacity(options.clock, () => options.receipts.lookup(key))
+    if (!found.ok) return found.busy ? DEFERRED : null
+    if (found.value.status !== 'receipt') return null
     current = found.value.receipt
   }
   return null
@@ -878,6 +895,9 @@ async function* publishStarted(
       exitCode: result.exitCode,
       signal: result.signal,
     }))
+    // The process has already exited; a ledger too busy to record that leaves the receipt started,
+    // which recovery settles on the next connection.
+    if (settled.ok && settled.value.status === 'busy') return
     if (!settled.ok || settled.value.status === 'unknown' || settled.value.status === 'storage-unavailable') {
       yield STORAGE_CLOSE
       return
@@ -950,7 +970,11 @@ async function refuse(
   if (!now) return STORAGE_CLOSE
   let receipt = terminalReceipt(request, fingerprint, 'refused', result, now.iso)
   if (persistReceipt) {
-    const stored = await safe(() => options.receipts.replace(1, receipt))
+    const stored = await waitOutLedgerCapacity(options.clock, () => options.receipts.replace(1, receipt))
+    // The request has no durable record yet, so a ledger too busy to take one answers the way
+    // admission's own lookup and claim do: the peer is told to retry rather than handed a verdict
+    // nothing will remember.
+    if (!stored.ok && stored.busy) return await refuse(options, request, fingerprint, 'at-capacity', false)
     if (!stored.ok || stored.value.status !== 'updated') return STORAGE_CLOSE
     receipt = stored.value.receipt
   }
@@ -966,6 +990,7 @@ async function fail(
   const state = reason === 'recovery-uncertain' ? 'uncertain' : 'failed'
   const terminal = await transition(options, receipt, state, { result })
   if (terminal.status === SUPERSEDED) return SUPERSEDED
+  if (terminal.status === 'busy') return DEFERRED
   return terminal.status === 'updated' && await audit(options, terminal.receipt) ? message(result) : STORAGE_CLOSE
 }
 
@@ -1013,8 +1038,8 @@ async function persist(
   receipt: SessionReceipt,
   changes: Partial<SessionReceipt>,
 ): Promise<ReceiptUpdate> {
-  const result = await safe(() => options.receipts.replace(receipt.revision, { ...receipt, ...changes }))
-  if (!result.ok) return { status: 'storage-unavailable' }
+  const result = await waitOutLedgerCapacity(options.clock, () => options.receipts.replace(receipt.revision, { ...receipt, ...changes }))
+  if (!result.ok) return { status: result.busy ? 'busy' : 'storage-unavailable' }
   if (result.value.status === 'conflict') return { status: SUPERSEDED }
   return result.value.status === 'updated'
     ? { status: 'updated', receipt: result.value.receipt }
@@ -1028,11 +1053,13 @@ async function* halt(
     yield STORAGE_CLOSE
     return
   }
+  if (outcome.status === 'busy') return
   return SUPERSEDED
 }
 
 async function* settle(outcome: SettledAction): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (outcome === SUPERSEDED) return SUPERSEDED
+  if (outcome === DEFERRED) return
   yield outcome
 }
 

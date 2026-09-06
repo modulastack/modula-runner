@@ -230,6 +230,31 @@ function recoveryReceipts(receipt: SessionReceipt) {
   }
 }
 
+// A ledger that takes `allowed` receipt writes and then refuses `rejections` of them the way a
+// saturated one does, so a case can place the back-pressure at a chosen point in a launch and
+// watch it either waited out or run past the bounded wait.
+function busyLedger(receipts: SessionLauncherOptions['receipts'], allowed: number, rejections: number) {
+  let permitted = allowed
+  let remaining = rejections
+  let refused = 0
+  const value: SessionLauncherOptions['receipts'] = {
+    lookup: key => receipts.lookup(key),
+    claim: (start, fingerprint, now) => receipts.claim(start, fingerprint, now),
+    replace: async (revision, receipt) => {
+      if (permitted > 0) permitted -= 1
+      else if (remaining > 0) {
+        remaining -= 1
+        refused += 1
+        throw new SessionReceiptBusyError()
+      }
+      return await receipts.replace(revision, receipt)
+    },
+    recover: () => receipts.recover(),
+    compact: now => receipts.compact(now),
+  }
+  return { value, rejections: () => refused }
+}
+
 async function collect(values: AsyncIterable<SessionLaunchAction>) {
   const actions: SessionLaunchAction[] = []
   for await (const action of values) actions.push(action)
@@ -870,6 +895,63 @@ describe('production session launcher', () => {
       kind: 'message', message: { type: 'SESSION_REFUSED', requestId: request.requestId, reason: 'at-capacity' },
     }])
     expect(replace).not.toHaveBeenCalled()
+    expect(subject.processStarts()).toBe(0)
+  })
+
+  it('waits out a ledger that goes busy after admission and finishes the launch', async () => {
+    const subject = options()
+    const saturated = busyLedger(subject.value.receipts, 0, 3)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    await expect(collect(launcher.handle(request))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } },
+      { kind: 'message', message: { type: 'SESSION_STARTED', requestId: request.requestId, channelId: 'channel-1', sessionId: 'session-1' } },
+      { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: request.requestId, exitCode: 0, signal: null } },
+    ])
+    expect(saturated.rejections()).toBe(3)
+    expect(subject.processStarts()).toBe(1)
+  })
+
+  it('leaves a launch it cannot record to recovery instead of closing job control', async () => {
+    const subject = options()
+    const saturated = busyLedger(subject.value.receipts, 1, Number.POSITIVE_INFINITY)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    await expect(collect(launcher.handle(request))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: request.requestId } },
+    ])
+    expect(subject.held.image().receipts.map(stored => stored.state)).toEqual(['accepted'])
+    expect(subject.processStarts()).toBe(0)
+  })
+
+  it('refuses at capacity when the ledger cannot take the refusal receipt', async () => {
+    const subject = options()
+    const saturated = busyLedger(subject.value.receipts, 0, Number.POSITIVE_INFINITY)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    const expired = { ...request, expiresAt: '2026-08-20T23:59:00Z' }
+    await expect(collect(launcher.handle(expired))).resolves.toEqual([{
+      kind: 'message', message: { type: 'SESSION_REFUSED', requestId: request.requestId, reason: 'at-capacity' },
+    }])
+    expect(subject.held.image().receipts).toEqual([])
+  })
+
+  it('replays nothing rather than closing job control when the recovery scan finds the ledger busy', async () => {
+    const subject = options({
+      receipts: {
+        lookup: async () => ({ status: 'missing' }),
+        claim: async () => ({ status: 'storage-unavailable' }),
+        replace: async () => ({ status: 'storage-unavailable' }),
+        recover: async () => { throw new SessionReceiptBusyError() },
+        compact: async () => undefined,
+      },
+    })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([])
+  })
+
+  it('declines a replacement claim the ledger is too busy to take, leaving the receipt untouched', async () => {
+    const held = recoveryReceipts(recoveryReceipt())
+    const saturated = busyLedger(held.value, 0, Number.POSITIVE_INFINITY)
+    const subject = options({ receipts: saturated.value })
+    await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([])
+    expect(held.current()).toEqual(recoveryReceipt())
     expect(subject.processStarts()).toBe(0)
   })
 
