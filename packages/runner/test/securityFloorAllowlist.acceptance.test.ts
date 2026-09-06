@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { appendFile, mkdtemp, open as openFile, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,6 +26,7 @@ import {
   type VettedSpawn,
 } from '../src/index.js'
 import { openAuditLogFixture } from './appendOnlyAuditFixture.js'
+import { until } from './helpers.js'
 import { permissiveConsent } from './spawnSeamSupport.js'
 
 // The seam resolves a caller-named path inside one synchronous tick, so no real filesystem race
@@ -499,6 +500,49 @@ describe('CP-5 IC-1 security-floor acceptance', () => {
     expect(await auditRecords(auditPath)).toEqual([
       expect.objectContaining({ kind: 'spawn-admitted', spawnKind: 'probe', executable: approved }),
     ])
+  })
+
+  it('AS-06 runs in the pane the file its admission audited when the symlink moves under it', async () => {
+    const root = await realpath(await temporaryDirectory())
+    const path = join(root, 'allowlist.json')
+    const auditPath = join(root, 'audit.ndjson')
+    const identity = signingIdentity('relinked-pane-policy')
+    const executed = join(root, 'executed')
+    const approved = join(root, 'approved-tool')
+    const substituted = join(root, 'substituted-tool')
+    const named = join(root, 'named-tool')
+    for (const tool of [approved, substituted]) {
+      await writeFile(tool, `#!/bin/sh\nprintf %s ${JSON.stringify(tool)} > ${JSON.stringify(executed)}\n`, { mode: 0o755 })
+    }
+    await symlink(approved, named)
+    await writeEnvelope(path, signAllowlist(allowlist([named, 'tmux']), identity.key))
+    const policy = await loadPolicy(path, [identity.anchor])
+    const seam = createSpawnSeam({
+      policy,
+      audit: openAuditLogFixture({ path: auditPath }),
+      now: () => 1_700_000_000_000,
+      consent: permissiveConsent([root]),
+    })
+    pathResolutions.relinkAfterFirstResolution = { path: named, target: substituted }
+    let session: TerminalSession | undefined
+
+    try {
+      session = await TerminalSession.launch(
+        { command: named, cwd: root, profile: 'shell' },
+        { flow: DEFAULT_FLOW, replayLines: DEFAULT_REPLAY_LINES, pollMs: 50 },
+        { send: () => undefined, onExited: () => undefined },
+        seam,
+      )
+      // The wrapper truncates the marker before it writes, so an existence check alone can read
+      // an empty file and fail a passing run.
+      await until(() => existsSync(executed) && readFileSync(executed, 'utf8').length > 0)
+    } finally {
+      if (session) await session.dispose(true)
+    }
+
+    const admitted = (await auditRecords(auditPath)).find(record => record.kind === 'spawn-admitted' && record.spawnKind === 'pane')
+    expect(admitted).toMatchObject({ executable: approved })
+    expect(await readFile(executed, 'utf8')).toBe(admitted?.kind === 'spawn-admitted' ? admitted.executable : null)
   })
 
   it('AS-06 resolves an admitted absolute executable exactly once and a bare one not at all', async () => {
