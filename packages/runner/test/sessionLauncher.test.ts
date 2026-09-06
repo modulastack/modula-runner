@@ -25,9 +25,20 @@ const request: SessionStartMessage = {
   target: { projectId: 'modulastack', worktreeName: 'lane-01', branch: 'feat/lane-01', baseBranch: 'main', relativeCwd: '.' },
 }
 const project = { projectId: 'modulastack', repoPath: '/repos/modulastack', worktreesRoot: '/worktrees', revision: 1 }
+const sameWorktree: SessionStartMessage = { ...request, requestId: '423e4567-e89b-42d3-a456-426614174003' }
+const otherWorktree: SessionStartMessage = {
+  ...request,
+  requestId: '523e4567-e89b-42d3-a456-426614174004',
+  target: { ...request.target, worktreeName: 'lane-02', branch: 'feat/lane-02' },
+}
+// One more than the bounded wait a caller gives a saturated ledger, so a case can run that wait out
+// at a chosen write and let every later one through.
+const REFUSALS_PAST_THE_LEDGER_WAIT = 41
 
-function receiptStorage() {
-  let image: SessionReceiptLedgerImage = { schemaVersion: 1, revision: 0, capacityBlockedUntil: null, receipts: [], tombstones: [] }
+function receiptStorage(inherited: readonly SessionReceipt[] = []) {
+  let image: SessionReceiptLedgerImage = {
+    schemaVersion: 1, revision: 0, capacityBlockedUntil: null, receipts: structuredClone(inherited) as SessionReceipt[], tombstones: [],
+  }
   const storage: SessionReceiptStorage = {
     load: async () => ({ status: 'loaded', image: structuredClone(image) }),
     replace: async (expectedRevision, next) => {
@@ -39,8 +50,8 @@ function receiptStorage() {
   return { storage, image: () => structuredClone(image) }
 }
 
-function options(overrides: Partial<SessionLauncherOptions> = {}) {
-  const held = receiptStorage()
+function options(overrides: Partial<SessionLauncherOptions> = {}, inherited: readonly SessionReceipt[] = []) {
+  const held = receiptStorage(inherited)
   const clock = { now: () => now, sleep: async () => undefined }
   const audit: AuditRecord[] = []
   let processStarts = 0
@@ -160,10 +171,12 @@ function recoveryReceipt(): SessionReceipt {
     fingerprint: sessionStartFingerprint(request),
     request,
     state: 'spawn-intent',
+    // Inherited phases precede the fixture clock, so a real ledger accepts the phase a recovery
+    // pass stamps next instead of reading it as history rewritten.
     phaseTimestamps: {
-      accepted: '2026-08-21T00:00:00Z',
-      provisioned: '2026-08-21T00:00:01Z',
-      'spawn-intent': '2026-08-21T00:00:02Z',
+      accepted: '2026-08-20T23:59:58Z',
+      provisioned: '2026-08-20T23:59:59Z',
+      'spawn-intent': '2026-08-21T00:00:00Z',
     },
     project,
     worktree: {
@@ -953,6 +966,59 @@ describe('production session launcher', () => {
     await expect(collect(createSessionLauncher(subject.value).recover())).resolves.toEqual([])
     expect(held.current()).toEqual(recoveryReceipt())
     expect(subject.processStarts()).toBe(0)
+  })
+
+  it('keeps the worktree of a receipt back-pressure left unadopted, admitting every other worktree', async () => {
+    const subject = options({}, [recoveryReceipt()])
+    const saturated = busyLedger(subject.value.receipts, 0, REFUSALS_PAST_THE_LEDGER_WAIT)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    expect(saturated.rejections()).toBe(REFUSALS_PAST_THE_LEDGER_WAIT)
+    expect(subject.held.image().receipts).toEqual([recoveryReceipt()])
+    await expect(collect(launcher.handle(sameWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: sameWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_FAILED', requestId: sameWorktree.requestId, reason: 'launch-timeout' } },
+    ])
+    expect(subject.processStarts()).toBe(0)
+    await expect(collect(launcher.handle(otherWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: otherWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_STARTED', requestId: otherWorktree.requestId, channelId: 'channel-1', sessionId: 'session-1' } },
+      { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: otherWorktree.requestId, exitCode: 0, signal: null } },
+    ])
+    expect(subject.processStarts()).toBe(1)
+  })
+
+  it('admits the worktree again once a later pass adopts the receipt that kept it', async () => {
+    const subject = options({}, [recoveryReceipt()])
+    const saturated = busyLedger(subject.value.receipts, 0, REFUSALS_PAST_THE_LEDGER_WAIT)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    await expect(collect(launcher.recover())).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_STARTED', requestId: request.requestId, channelId: 'channel-1', sessionId: 'session-stable' } },
+      { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: request.requestId, exitCode: 0, signal: null } },
+    ])
+    await expect(collect(launcher.handle(sameWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: sameWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_STARTED', requestId: sameWorktree.requestId, channelId: 'channel-1', sessionId: 'session-1' } },
+      { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: sameWorktree.requestId, exitCode: 0, signal: null } },
+    ])
+    expect(subject.processStarts()).toBe(1)
+  })
+
+  it('gives the worktree back when a later scan no longer names the receipt that kept it', async () => {
+    const subject = options({}, [recoveryReceipt()])
+    const saturated = busyLedger(subject.value.receipts, 0, REFUSALS_PAST_THE_LEDGER_WAIT)
+    const launcher = createSessionLauncher({ ...subject.value, receipts: saturated.value })
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    await expect(collect(launcher.recover('323e4567-e89b-42d3-a456-426614174002'))).resolves.toEqual([])
+    expect(subject.held.image().receipts.map(stored => stored.state)).toEqual(['uncertain'])
+    await expect(collect(launcher.recover())).resolves.toEqual([])
+    await expect(collect(launcher.handle(sameWorktree))).resolves.toEqual([
+      { kind: 'message', message: { type: 'SESSION_ACCEPTED', requestId: sameWorktree.requestId } },
+      { kind: 'message', message: { type: 'SESSION_STARTED', requestId: sameWorktree.requestId, channelId: 'channel-1', sessionId: 'session-1' } },
+      { kind: 'message', message: { type: 'SESSION_FINISHED', requestId: sameWorktree.requestId, exitCode: 0, signal: null } },
+    ])
+    expect(subject.processStarts()).toBe(1)
   })
 
   it('settles stale-binding recovery locally without disclosing its request id', async () => {

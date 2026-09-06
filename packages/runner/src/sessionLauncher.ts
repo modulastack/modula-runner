@@ -39,7 +39,12 @@ const SUPERSEDED = 'superseded'
 // back-pressure would be every live session killed.
 const DEFERRED = 'deferred'
 
-type LauncherRuntime = { options: SessionLauncherOptions; lanes: LaneScheduler; owned: ReceiptOwnership }
+type LauncherRuntime = {
+  options: SessionLauncherOptions
+  lanes: LaneScheduler
+  owned: ReceiptOwnership
+  retained: RetainedLanes
+}
 type LaneRelease = () => void
 
 // The ledger tells a lost compare-and-set apart from storage that cannot record, and only the
@@ -52,7 +57,10 @@ type ReceiptUpdate =
   | { status: 'storage-unavailable' }
 
 type SettledAction = SessionLaunchAction | typeof SUPERSEDED | typeof DEFERRED
-type LaunchProgress = typeof SUPERSEDED | void
+// DEFERRED here is a recovery pass telling its own driver that back-pressure ended it before it
+// could adopt the session its receipt describes. It is a generator return, never an action, so no
+// value of this type is ever written to the wire.
+type LaunchProgress = typeof SUPERSEDED | typeof DEFERRED | void
 
 class LaneScheduler {
   private readonly tails = new Map<string, Promise<void>>()
@@ -126,8 +134,43 @@ function ownershipKey(key: SessionReceiptKey): string {
   return `${key.bindingId}\u0000${key.requestId}`
 }
 
+// Lanes a recovery pass kept rather than gave back. A pass back-pressure ended before it adopted
+// the session its receipt describes leaves that session running with nothing in the lane table
+// saying so, and the lane table is what keeps a second pane off one worktree. The hold outlives the
+// pass, so the next pass over that receipt takes it instead of queueing behind its own predecessor.
+class RetainedLanes {
+  private readonly holds = new Map<string, LaneRelease>()
+
+  reclaim(key: SessionReceiptKey): LaneRelease | null {
+    const id = ownershipKey(key)
+    const hold = this.holds.get(id)
+    this.holds.delete(id)
+    return hold ?? null
+  }
+
+  retain(key: SessionReceiptKey, hold: LaneRelease): void {
+    this.holds.set(ownershipKey(key), hold)
+  }
+
+  // A scan is the whole of what the ledger still owes recovery, so a hold it does not name belongs
+  // to a receipt no later pass can adopt, and holding its worktree shut proves nothing.
+  releaseUnscanned(scanned: readonly SessionReceipt[]): void {
+    const outstanding = new Set(scanned.map(receipt => ownershipKey(receipt.key)))
+    for (const [id, hold] of [...this.holds]) {
+      if (outstanding.has(id)) continue
+      this.holds.delete(id)
+      hold()
+    }
+  }
+}
+
 export function createSessionLauncher(options: SessionLauncherOptions): SessionLauncher {
-  const runtime: LauncherRuntime = { options, lanes: new LaneScheduler(), owned: new ReceiptOwnership() }
+  const runtime: LauncherRuntime = {
+    options,
+    lanes: new LaneScheduler(),
+    owned: new ReceiptOwnership(),
+    retained: new RetainedLanes(),
+  }
   return {
     handle(request) {
       const parsed = parseSessionLaunchClientMessage(request, SESSION_LAUNCH_PROTOCOL_VERSION)
@@ -149,6 +192,7 @@ async function* recoverSessions(
     if (!recovered.busy) yield STORAGE_CLOSE
     return
   }
+  runtime.retained.releaseUnscanned(recovered.value)
   yield* mergeRecovery(runtime, recovered.value, authenticatedBindingId)
 }
 
@@ -180,7 +224,7 @@ async function* recoverReceipt(
   receipt: SessionReceipt,
   signal: AbortSignal,
   authenticatedBindingId?: string,
-): AsyncGenerator<SessionLaunchAction> {
+): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
   if (signal.aborted) return
   const options = runtime.options
   const binding = authenticatedBindingId === undefined ? safeSync(() => options.bindingId()) : { ok: true as const, value: authenticatedBindingId }
@@ -194,15 +238,19 @@ async function* recoverReceipt(
     return
   }
   if (runtime.owned.has(receipt.key)) return
-  const acquired = await safe(() => runtime.lanes.acquire(receipt.request, signal))
+  const kept = runtime.retained.reclaim(receipt.key)
+  const acquired = kept ? { ok: true as const, value: kept } : await safe(() => runtime.lanes.acquire(receipt.request, signal))
   if (!acquired.ok) {
     yield STORAGE_CLOSE
     return
   }
+  let progress: LaunchProgress = undefined
   try {
-    yield* recoverReceiptInLane(options, receipt, signal, acquired.value)
+    progress = yield* recoverReceiptInLane(options, receipt, signal, acquired.value)
+    return progress
   } finally {
-    acquired.value()
+    if (progress === DEFERRED) runtime.retained.retain(receipt.key, acquired.value)
+    else acquired.value()
   }
 }
 
@@ -264,8 +312,7 @@ async function* recoverReceiptInLane(
     return yield* startProvisioned(options, reverified.receipt, verified.value.snapshot, signal, releaseLane)
   }
   if (receipt.state === 'spawn-intent' || receipt.state === 'started') {
-    releaseLane()
-    return yield* recoverProcess(options, receipt, receipt.worktree, signal)
+    return yield* recoverProcess(options, receipt, receipt.worktree, signal, releaseLane)
   }
   return yield* settle(await fail(options, receipt, 'recovery-uncertain'))
 }
@@ -327,29 +374,63 @@ async function* recoverProvisioning(
   return yield* startProvisioned(options, provisioned.receipt, verified.value.snapshot, recoverySignal, releaseLane)
 }
 
+// The lane is the worktree's, not the receipt's, so it goes back the moment this pass knows it is
+// not leaving a session on that worktree unaccounted for — before the takeover, which lasts as long
+// as the session does. Back-pressure is the one outcome that does leave one unaccounted for, and it
+// keeps the lane so nothing else is admitted there until a later pass adopts the receipt.
 async function* recoverProcess(
   options: SessionLauncherOptions,
   startingReceipt: SessionReceipt,
   worktree: SessionWorktreeVerifiedSnapshot,
   recoverySignal: AbortSignal,
+  releaseLane: LaneRelease,
 ): AsyncGenerator<SessionLaunchAction, LaunchProgress> {
-  if (recoverySignal.aborted) return
+  let takeover: Takeover = { status: 'settled', progress: undefined }
+  try {
+    takeover = yield* claimTakeover(options, startingReceipt, worktree, recoverySignal)
+  } finally {
+    if (takeover.status === 'claimed' || takeover.progress !== DEFERRED) releaseLane()
+  }
+  if (takeover.status !== 'claimed') return takeover.progress
+  return yield* openReplacement(
+    options,
+    takeover.receipt,
+    worktree,
+    takeover.plan,
+    takeover.sessionId,
+    takeover.generation,
+    recoverySignal,
+  )
+}
+
+type Takeover =
+  | { status: 'claimed'; receipt: SessionReceipt; plan: LaunchPlan; sessionId: string; generation: number }
+  | { status: 'settled'; progress: LaunchProgress }
+
+async function* claimTakeover(
+  options: SessionLauncherOptions,
+  startingReceipt: SessionReceipt,
+  worktree: SessionWorktreeVerifiedSnapshot,
+  recoverySignal: AbortSignal,
+): AsyncGenerator<SessionLaunchAction, Takeover> {
+  const answered = (progress: LaunchProgress): Takeover => ({ status: 'settled', progress })
+  if (recoverySignal.aborted) return answered(undefined)
   const sessionId = startingReceipt.sessionId
   const prior = startingReceipt.channel
   if (!sessionId || !isSafeIdentifier(sessionId) || !prior || prior.lifecycle === 'replacement-intent' || !options.recoveryChannels) {
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   const inspected = await safe(() => options.processes.inspect({ sessionId, cwd: worktree.resolvedCwdPath }))
   if (!inspected.ok || inspected.value !== 'exact' || recoverySignal.aborted) {
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   const status = await safe(() => options.recoveryChannels!.status(prior.channelId, prior.generation, prior.connectionEpoch))
   // A channel still reported live is on this connection, so the launch that opened it is still
   // attached and owns the session: there is nothing to take over, and reporting it failed would
   // contradict a process that keeps running. Losing the connection reports it lost and recovers.
-  if (status.ok && status.value === 'live') return
+  if (status.ok && status.value === 'live') return answered(undefined)
   if (!status.ok || (status.value !== 'closed' && status.value !== 'lost')) {
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   const access = await timed(
     options,
@@ -358,36 +439,36 @@ async function* recoverProcess(
     recoverySignal,
   )
   if (!access.ok) {
-    if (access.aborted) return
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    if (access.aborted) return answered(undefined)
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   if (access.value.status === 'refused') {
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   const generation = prior.generation + 1
   if (!Number.isSafeInteger(generation)) {
-    return yield* settle(await fail(options, startingReceipt, 'recovery-uncertain'))
+    return answered(yield* settle(await fail(options, startingReceipt, 'recovery-uncertain')))
   }
   const claimed = await claimReplacement(options, startingReceipt, generation)
   // The claim is the replacement's first write, so a ledger too busy to take it leaves the receipt
   // and the session it describes exactly as recovery found them: this pass declines the takeover
-  // and the next reconnect claims again.
-  if (claimed.status === 'busy') return
+  // and reports that it left the session for a later one to adopt.
+  if (claimed.status === 'busy') return answered(DEFERRED)
   if (claimed.status === 'storage-unavailable') {
     yield STORAGE_CLOSE
-    return
+    return answered(undefined)
   }
   if (claimed.status === 'contender') {
     const replay = await waitForReplacement(options, startingReceipt.key, claimed.current, generation)
-    if (replay === DEFERRED) return
+    if (replay === DEFERRED) return answered(DEFERRED)
     if (!replay) {
       yield STORAGE_CLOSE
-      return
+      return answered(undefined)
     }
     yield replay
-    return
+    return answered(undefined)
   }
-  return yield* openReplacement(options, claimed.receipt, worktree, access.value.plan, sessionId, generation, recoverySignal)
+  return { status: 'claimed', receipt: claimed.receipt, plan: access.value.plan, sessionId, generation }
 }
 
 type ReplacementClaim =

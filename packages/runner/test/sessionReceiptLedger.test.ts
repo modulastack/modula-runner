@@ -617,6 +617,34 @@ describe('production session receipt ledger', () => {
     await expect(Promise.all(queued)).resolves.toHaveLength(MAX_PENDING_SESSION_LEDGER_OPERATIONS)
   })
 
+  it('serves the recovery scan at the queue ceiling that refuses every other operation', async () => {
+    let release!: () => void
+    const stalled = new Promise<void>(resolve => { release = resolve })
+    const inherited = {
+      ...receipt(3, 'started', '2026-08-21T00:00:00Z'),
+      project: { projectId: 'modulastack', repoPath: '/repos/modulastack', worktreesRoot: '/worktrees', revision: 1 },
+    }
+    const held = memoryStorage({ ...emptyImage(), receipts: [inherited] })
+    const storage: SessionReceiptStorage = {
+      load: async () => {
+        await stalled
+        return await held.storage.load()
+      },
+      replace: (expectedRevision, next) => held.storage.replace(expectedRevision, next),
+    }
+    const ledger = createSessionReceiptLedger({ storage, clock })
+    const queued = Array.from({ length: MAX_PENDING_SESSION_LEDGER_OPERATIONS }, () => ledger.lookup({
+      bindingId: request().bindingId,
+      requestId: request().requestId,
+    }))
+    const scan = ledger.recover()
+    await expect(ledger.lookup({ bindingId: request().bindingId, requestId: request().requestId }))
+      .rejects.toBeInstanceOf(SessionReceiptBusyError)
+    release()
+    await expect(scan).resolves.toEqual([inherited])
+    await expect(Promise.all(queued)).resolves.toHaveLength(MAX_PENDING_SESSION_LEDGER_OPERATIONS)
+  })
+
   it('reserves the proved maximum nonterminal record before admission', async () => {
     const initial = emptyImage()
     const held: SessionReceipt[] = []

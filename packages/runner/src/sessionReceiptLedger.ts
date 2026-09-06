@@ -156,8 +156,13 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
     })
   }
 
+  // The scan is exempt from the pending ceiling because it is the precondition every other
+  // operation is admitted against, not an operation competing with them: a connection may not
+  // safely admit anything until it knows what the last process left behind. Its concurrency is
+  // bounded by connection count rather than by request volume, so the burst the ceiling exists to
+  // bound cannot arrive through here.
   recover(): Promise<readonly SessionReceipt[]> {
-    return this.serialize(async () => {
+    return this.enqueue(async () => {
       const image = await this.loadOrThrow()
       return image.receipts.filter(receipt => !isTerminal(receipt)).map(jsonClone)
     })
@@ -198,6 +203,10 @@ class DurableSessionReceiptLedger implements SessionReceiptLedger {
     if (this.pendingOperations >= MAX_PENDING_SESSION_LEDGER_OPERATIONS) {
       return Promise.reject(new SessionReceiptBusyError())
     }
+    return this.enqueue(operation)
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     this.pendingOperations += 1
     const result = this.queue.then(operation, operation).then(
       value => {

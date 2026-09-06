@@ -521,6 +521,15 @@ waits briefly for capacity. If that wait runs out, admission answers `at-capacit
 receipt, and an operation past admission stops without an answer, leaving its receipt exactly as a
 crash at that point would for the next connection's recovery to re-drive.
 
+The recovery scan is exempt from that bound. It is the precondition a connection admits anything
+against rather than an operation competing with them for the same capacity, and at most one runs per
+connection, so the request burst the bound exists to absorb cannot arrive through it.
+
+A recovery pass that back-pressure ends before it adopts the session its receipt describes leaves
+that session running, so it keeps that worktree's provisioning lane instead of returning it. Other
+worktrees admit unaffected; that one serializes behind the lane as it always does. The lane returns
+when a later pass adopts or settles the receipt, or when a later scan no longer names it.
+
 Expired terminal receipts compact oldest-first into replay-capable tombstones. Tombstones delete
 oldest-first only after 30 days. Known exact duplicates consult full receipts/tombstones before the
 capacity block and replay their known outcome.
