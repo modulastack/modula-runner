@@ -10,6 +10,7 @@ import {
   createRunnerApplication,
   createRunnerRuntime,
   type ContractPairingRecord,
+  type ContractPairingSnapshot,
   type LocalProjectRecord,
   type PairingContractService,
   type RunnerApplicationOptions,
@@ -639,6 +640,31 @@ describe('core runner application commands', () => {
       containmentDetail: 'test containment',
     })
     expect(call.stdout.join('')).not.toContain(token)
+  })
+
+  // docs/json-output.md names status as the one command a consumer cannot treat as read-only:
+  // reading a pending binding drives the confirmation it is reading about. See issue #99.
+  it('resumes an interrupted confirmation before reporting a pending status', async () => {
+    const resumeConfirmation = vi.fn(async () => null)
+    const states: ContractPairingSnapshot[] = [
+      { state: 'pending', record: pairedRecord },
+      { state: 'paired', record: pairedRecord },
+    ]
+    const app = application(pairing({ snapshot: async () => states.shift() ?? { state: 'paired', record: pairedRecord }, resumeConfirmation }))
+    const call = invocation(['status', '--json'])
+
+    await expect(app.value.execute(call.value)).resolves.toBe(0)
+    expect(resumeConfirmation).toHaveBeenCalledOnce()
+    expect(JSON.parse(call.stdout.join(''))).toMatchObject({ state: 'paired' })
+  })
+
+  it('leaves a settled binding untouched when reporting status', async () => {
+    const resumeConfirmation = vi.fn(async () => null)
+    const app = application(pairing({ snapshot: async () => ({ state: 'paired', record: pairedRecord }), resumeConfirmation }))
+    const call = invocation(['status', '--json'])
+
+    await expect(app.value.execute(call.value)).resolves.toBe(0)
+    expect(resumeConfirmation).not.toHaveBeenCalled()
   })
 
   it('keeps runtime status failures in the JSON error vocabulary', async () => {

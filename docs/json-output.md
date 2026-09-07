@@ -1,12 +1,37 @@
 # JSON output contract
 
 `--json` exists so a co-resident reader — today the desktop shell — can read runner state without
-parsing human prose and without a second way into the runner home. Every command named here is
-**read-only**. `--json` never creates, mutates, or deletes anything, and adds no surface that the
-human commands do not already have.
+parsing human prose and without a second way into the runner home. `--json` is a rendering: it adds
+no surface the human commands do not already have, and a command does the same work with the flag
+as without it.
 
 The CLI remains the only reader of the runner home. A consumer that wants runner state runs the
 CLI; it does not open the home itself.
+
+## Side effects a consumer inherits
+
+`--json` adds none of its own. It hides none either, so what the human command does, the JSON
+rendering does too. Two things it does are worth naming, because a consumer that polls will meet
+both.
+
+**Opening the runner home creates it.** Every command opens the home before it answers, and a home
+that is absent is created — the root and any missing ancestor, at mode `0700`, fsynced. A consumer
+probing a machine that has never run the runner leaves a runner home behind by asking.
+
+**`status` finishes an interrupted pairing confirmation.** When the stored binding is `pending` —
+a confirmation that a restart or a network failure left unfinished — `status` resumes it before
+answering. That sends a request to the control plane, and every outcome of the exchange writes the
+binding record: a confirmation settles it, a refusal or an expired code revokes it, an unreachable
+plane marks the confirmation unknown. No other pairing state contacts anything or writes anything.
+
+The consequence for a polling consumer: while a binding stays `pending` because the plane is
+unreachable, *every* `status` call retries the confirmation, so the poll interval becomes the retry
+interval. Whether an observational consumer should be able to read pairing state without driving
+the confirmation is open — see issue #99. Until it is settled, a consumer polling `status` chooses
+that interval knowing it is a retry interval.
+
+Every other command named here reads and answers, and writes nothing beyond the home creation
+above.
 
 ## Envelope
 
