@@ -553,6 +553,7 @@ function commandFailure(command: string, args: readonly string[], code: string, 
 }
 
 function homeFailure(code: RunnerHomeFailure): CommandOutcome {
+  if (code === 'state-busy') return { exitCode: 1, stderr: 'state-busy: the runner home is held by a running runner' }
   return { exitCode: 1, stderr: `${code}: runner home preflight failed` }
 }
 

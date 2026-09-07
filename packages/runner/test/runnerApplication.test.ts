@@ -773,4 +773,22 @@ describe('core runner application commands', () => {
     expect(closeFailure.stdout).toEqual([])
     expect(closeFailure.stderr).toEqual(['state-io-failed: the runner home could not close cleanly\n'])
   })
+
+  it('explains that a busy runner home is held by a running runner', async () => {
+    const app = application()
+    app.open.mockResolvedValueOnce({ status: 'failed', code: 'state-busy' })
+    const call = invocation(['status'])
+    await expect(app.value.execute(call.value)).resolves.toBe(1)
+    expect(call.stdout).toEqual([])
+    expect(call.stderr).toEqual(['state-busy: the runner home is held by a running runner\n'])
+  })
+
+  it('reports a busy runner home through status JSON', async () => {
+    const app = application()
+    app.open.mockResolvedValueOnce({ status: 'failed', code: 'state-busy' })
+    const call = invocation(['status', '--json'])
+    await expect(app.value.execute(call.value)).resolves.toBe(1)
+    expect(JSON.parse(call.stdout.join(''))).toEqual({ error: { code: 'state-busy' } })
+    expect(call.stderr).toEqual([])
+  })
 })

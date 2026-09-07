@@ -106,7 +106,7 @@ describe('production runner home', () => {
       keys: createMemoryApiKeyStore(),
       openAuditLifecycle,
     })
-    await expect(competing.open({})).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
+    await expect(competing.open({})).resolves.toEqual({ status: 'failed', code: 'state-busy' })
 
     await storage.release!()
     const nextStorage = createFileRunnerHomeStorage({ defaultRoot: root })
@@ -175,6 +175,48 @@ describe('production runner home', () => {
       expect(acquire).not.toHaveBeenCalled()
     }
   })
+
+  it('reports its held lease as busy when opened again', async () => {
+    const { storage } = await fileHome()
+    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
+    await expect(home.open({})).resolves.toMatchObject({ status: 'ready' })
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'state-busy' })
+  })
+
+  it('reports its held lease as busy during policy initialization', async () => {
+    const { storage } = await fileHome()
+    const home = createRunnerHome({ storage, clock, pairing: pairingStore(), keys: createMemoryApiKeyStore(), openAuditLifecycle })
+    await expect(home.open({})).resolves.toMatchObject({ status: 'ready' })
+    await expect(home.initializePolicy?.({}, '/operator.pem', policy())).resolves.toEqual({ status: 'failed', code: 'state-busy' })
+  })
+})
+
+describe('runner home lease acquisition failures', () => {
+  it.each([
+    ['busy', 'state-busy'],
+    ['storage-unavailable', 'state-io-failed'],
+  ] as const)('maps the %s open result to %s', async (result, code) => {
+    const home = createRunnerHome({ storage: leaseStorage(async () => result), clock })
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code })
+  })
+
+  it('maps a thrown open acquisition to state-io-failed', async () => {
+    const home = createRunnerHome({ storage: leaseStorage(async () => { throw new Error('acquire failed') }), clock })
+    await expect(home.open({})).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
+  })
+
+  it.each([
+    ['busy', 'state-busy'],
+    ['storage-unavailable', 'state-io-failed'],
+  ] as const)('maps the %s policy initialization result to %s', async (result, code) => {
+    const home = createRunnerHome({ storage: leaseStorage(async () => result), clock })
+    await expect(home.initializePolicy?.({}, '/operator.pem', policy())).resolves.toEqual({ status: 'failed', code })
+  })
+
+  it('maps a thrown policy initialization acquisition to state-io-failed', async () => {
+    const home = createRunnerHome({ storage: leaseStorage(async () => { throw new Error('acquire failed') }), clock })
+    await expect(home.initializePolicy?.({}, '/operator.pem', policy())).resolves.toEqual({ status: 'failed', code: 'state-io-failed' })
+  })
 })
 
 function inspection(overrides: Partial<RunnerHomeInspection>): RunnerHomeInspection {
@@ -184,5 +226,15 @@ function inspection(overrides: Partial<RunnerHomeInspection>): RunnerHomeInspect
     rootMode: 0o700,
     entries: [],
     ...overrides,
+  }
+}
+
+function leaseStorage(acquire: NonNullable<RunnerHomeStorage['acquire']>): RunnerHomeStorage {
+  return {
+    inspect: async () => inspection({}),
+    acquire,
+    release: async () => undefined,
+    read: async () => ({ status: 'missing' }),
+    replace: async () => ({ status: 'storage-unavailable' }),
   }
 }

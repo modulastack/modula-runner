@@ -158,10 +158,10 @@ create or edit them.
 Startup/policy failures use one stable CLI vocabulary. Lower-level allowlist reasons map to
 `policy-missing`, `policy-malformed`, `policy-unknown-key`, and `policy-bad-signature`; filesystem
 checks use `state-wrong-owner`, `state-insecure-mode`, `state-not-regular`, `state-linked`, and
-`state-io-failed`; invalid or duplicate local configuration uses `config-invalid` or
-`config-duplicate`; and an unusable audit sink is `audit-unavailable`. Human stderr begins with the
-code and bounded guidance. `status --json` returns the same code under `error.code`, never a second
-vocabulary.
+`state-io-failed`; a home already held by a running runner is `state-busy`; invalid or duplicate
+local configuration uses `config-invalid` or `config-duplicate`; and an unusable audit sink is
+`audit-unavailable`. Human stderr begins with the code and bounded guidance. `status --json`
+returns the same code under `error.code`, never a second vocabulary.
 
 `run` performs all preflight checks before connecting. Any failure above prevents connection and
 spawning. On the first SIGINT/SIGTERM it stops the client synchronously, gives terminal/preview

@@ -22,6 +22,7 @@ export const RUNNER_HOME_FAILURES = [
   'state-not-regular',
   'state-linked',
   'state-io-failed',
+  'state-busy',
   'config-invalid',
   'config-duplicate',
   'audit-unavailable',
@@ -193,12 +194,13 @@ async function openHome(
   lease: HomeLease,
   selection: RunnerHomeSelection,
 ): Promise<RunnerHomeOpen> {
-  if (lease.held) return { status: 'failed', code: 'state-io-failed' }
+  if (lease.held) return { status: 'failed', code: 'state-busy' }
   const inspection = await inspectHome(options.storage, selection)
   if ('failure' in inspection) return await failedBeforeLease(options.storage, inspection.failure)
   if (!options.storage.acquire || !options.storage.release) return await failedBeforeLease(options.storage, 'state-io-failed')
   try {
-    if (await options.storage.acquire() !== 'acquired') return await failedBeforeLease(options.storage, 'state-io-failed')
+    const acquisition = await options.storage.acquire()
+    if (acquisition !== 'acquired') return await failedBeforeLease(options.storage, acquisition === 'busy' ? 'state-busy' : 'state-io-failed')
   } catch {
     return await failedBeforeLease(options.storage, 'state-io-failed')
   }
@@ -230,12 +232,13 @@ async function initializeHomePolicy(
   selection: RunnerHomeSelection,
   policy: RunnerPolicySnapshot,
 ): Promise<RunnerPolicyInitialization> {
-  if (lease.held) return { status: 'failed', code: 'state-io-failed' }
+  if (lease.held) return { status: 'failed', code: 'state-busy' }
   const inspection = await inspectHome(options.storage, selection)
   if ('failure' in inspection) return await failedInitializationBeforeLease(options.storage, inspection.failure)
   if (!options.storage.acquire || !options.storage.release) return await failedInitializationBeforeLease(options.storage, 'state-io-failed')
   try {
-    if (await options.storage.acquire() !== 'acquired') return await failedInitializationBeforeLease(options.storage, 'state-io-failed')
+    const acquisition = await options.storage.acquire()
+    if (acquisition !== 'acquired') return await failedInitializationBeforeLease(options.storage, acquisition === 'busy' ? 'state-busy' : 'state-io-failed')
     lease.held = true
     const result = await initializeRunnerPolicyRecord(options.storage, policy)
     return (await releaseAndClose(options.storage, lease))
