@@ -11,7 +11,7 @@ import {
   runKeyRemoveCommand,
   type CommandResult,
 } from './cli.js'
-import { PairingContractError, type PairingContractService } from './pairingContract.js'
+import { PairingContractError, type PairingContractFailure, type PairingContractService } from './pairingContract.js'
 import {
   allowlistCommandSyntax,
   runAllowlistCommand,
@@ -302,7 +302,7 @@ async function pairCommand(
     })
     return { exitCode: 0, stdout: `paired as runner ${identity.runnerId}` }
   } catch (error) {
-    const reason = error instanceof PairingContractError ? error.failure : 'unreachable'
+    const reason = error instanceof PairingContractError ? error.failure : 'pairing-unreachable'
     return { exitCode: 1, stderr: `pairing failed: ${reason}` }
   }
 }
@@ -366,13 +366,13 @@ async function statusCommand(
   json: boolean,
 ): Promise<CommandOutcome> {
   let snapshot = await pairing.snapshot()
-  let pairingError: string | null = null
+  let pairingError: PairingContractFailure | null = null
   if (snapshot.state === 'pending') {
     try {
       await pairing.resumeConfirmation()
       snapshot = await pairing.snapshot()
     } catch (error) {
-      pairingError = error instanceof PairingContractError ? error.failure : 'unreachable'
+      pairingError = error instanceof PairingContractError ? error.failure : 'pairing-unreachable'
       snapshot = await pairing.snapshot()
     }
   }
@@ -385,7 +385,7 @@ async function statusCommand(
 
 function statusValue(
   snapshot: Awaited<ReturnType<PairingContractService['snapshot']>>,
-  error: string | null,
+  error: PairingContractFailure | null,
   containment: RunnerContainmentStatus,
 ) {
   const record = snapshot.state === 'pending' || snapshot.state === 'paired' || snapshot.state === 'revoked'

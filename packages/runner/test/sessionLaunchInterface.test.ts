@@ -60,8 +60,8 @@ describe('session-launch interface checkpoint', () => {
 
   it('publishes the adopted pairing port without activating the legacy runtime', async () => {
     expect(PAIRING_CONTRACT_FAILURES).toContain('pairing-in-progress')
-    expect(PAIRING_CONTRACT_FAILURES).toContain('confirmation-uncertain')
-    expect(new PairingContractError('confirmation-uncertain', 'unknown result').failure).toBe('confirmation-uncertain')
+    expect(PAIRING_CONTRACT_FAILURES).toContain('pairing-confirmation-uncertain')
+    expect(new PairingContractError('pairing-confirmation-uncertain', 'unknown result').failure).toBe('pairing-confirmation-uncertain')
     const pairing = createUnimplementedPairingContractService()
     await expect(pairing.snapshot()).rejects.toBeInstanceOf(PairingContractNotImplementedError)
     await expect(pairing.resumeConfirmation()).rejects.toBeInstanceOf(PairingContractNotImplementedError)

@@ -91,9 +91,9 @@ add('G1-P02', 'pairing', 'redeem-success', 'pairing:success', ['transport.redeem
 add('G1-P03', 'pairing', 'redeem-success', 'pairing:success', ['transport.redeem:/api/runner/v1/pair', 'transport.confirm:/api/runner/v1/pair/confirm', 'transport.media:application/json'])
 add('G1-P04', 'pairing', 'redeem-success', 'pairing:success', ['transport.body:code+runner'], ['transport.body:token', 'transport.body:workload-secret'])
 add('G1-P05', 'pairing', 'redeem-extra-fields', 'pairing:success', ['store.commitPending:declared-envelope', 'clock.pendingSince'], ['store.commitPending:unknown-field'])
-add('G1-P08', 'pairing', 'redeem-wrong-media', 'pairing:error:malformed-response', ['transport.media:other'], ['store.commitPending', 'transport.confirm'])
+add('G1-P08', 'pairing', 'redeem-wrong-media', 'pairing:error:pairing-malformed-response', ['transport.media:other'], ['store.commitPending', 'transport.confirm'])
 add('G1-P09', 'pairing', 'redeem-success', 'pairing:success', ['store.commitPending', 'transport.confirm'], [], [['store.commitPending', 'transport.confirm']])
-add('G1-P10', 'pairing', 'pending-store-failure', 'pairing:error:store-failed', ['store.commitPending:storage-unavailable'], ['transport.confirm', 'store.settle'])
+add('G1-P10', 'pairing', 'pending-store-failure', 'pairing:error:pairing-store-failed', ['store.commitPending:storage-unavailable'], ['transport.confirm', 'store.settle'])
 add('G1-P11', 'pairing', 'proof-vector', 'pairing:success', ['transport.confirm:proof-bound', 'transport.confirm:nonce-bound'], ['transport.confirm:bearer-token'])
 add(
   'G1-P12',
@@ -106,23 +106,23 @@ add(
   pairingSecrecySinks.map(pairingSecrecySinkMarker),
   [pairingFixtureBearer],
 )
-add('G1-P15', 'pairing', 'confirm-network-loss', 'pairing:error:unreachable', ['store.markConfirmationUnknown', 'store.snapshot:pending'], ['store.release', 'store.settle'])
+add('G1-P15', 'pairing', 'confirm-network-loss', 'pairing:error:pairing-unreachable', ['store.markConfirmationUnknown', 'store.snapshot:pending'], ['store.release', 'store.settle'])
 add('G1-P16', 'pairing', 'resume-pending', 'pairing:resume:success', ['store.snapshot:pending', 'transport.confirm:repeat', 'store.settle'])
 add(
   'G1-P18',
   'pairing',
   'confirmation-deadline-uncertain',
-  'pairing:error:confirmation-uncertain',
+  'pairing:error:pairing-confirmation-uncertain',
   ['clock.deadline:600000', 'transport.confirm:final', 'transport.confirm:503', 'store.markConfirmationUnknown'],
   ['store.revoke'],
   [['clock.deadline:600000', 'transport.confirm:final'], ['transport.confirm:final', 'transport.confirm:503'], ['transport.confirm:503', 'store.markConfirmationUnknown']],
 )
 add('G1-P19', 'pairing', 'reservation-in-progress', 'pairing:error:pairing-in-progress', ['store.reserve:pairing-in-progress'], ['transport.redeem', 'store.commitPending'])
-add('G1-P20', 'pairing', 'http-status-matrix', 'pairing:status-matrix', ['pairing.status-matrix:complete', 'pairing.status:redeem-204-body:malformed-response', 'pairing.status:confirm-204-body:malformed-response'])
-add('G1-P21', 'pairing', 'confirm-terminal-refusal', 'pairing:error:refused', ['transport.confirm:403', 'store.revoke'], ['transport.confirm:retry'])
+add('G1-P20', 'pairing', 'http-status-matrix', 'pairing:status-matrix', ['pairing.status-matrix:complete', 'pairing.status:redeem-204-body:pairing-malformed-response', 'pairing.status:confirm-204-body:pairing-malformed-response'])
+add('G1-P21', 'pairing', 'confirm-terminal-refusal', 'pairing:error:pairing-refused', ['transport.confirm:403', 'store.revoke'], ['transport.confirm:retry'])
 add('G1-P22', 'runtime', 'websocket-auth-revoked', 'runtime:auth-revoked', ['runtime.auth-failed:401', 'pairing.revoke'], ['runtime.reconnect'])
-add('G1-P23', 'pairing', 'pending-superseded', 'pairing:error:superseded', ['store.commitPending:superseded', 'store.snapshot:new-binding'], ['store.settle:old-binding', 'store.revoke:new-binding'])
-add('G1-P25', 'pairing', 'redeem-response-lost', 'pairing:error:unreachable', ['transport.redeem:lost-response', 'store.release'], ['transport.redeem:retry', 'store.commitPending'])
+add('G1-P23', 'pairing', 'pending-superseded', 'pairing:error:pairing-superseded', ['store.commitPending:superseded', 'store.snapshot:new-binding'], ['store.settle:old-binding', 'store.revoke:new-binding'])
+add('G1-P25', 'pairing', 'redeem-response-lost', 'pairing:error:pairing-unreachable', ['transport.redeem:lost-response', 'store.release'], ['transport.redeem:retry', 'store.commitPending'])
 
 add('G1-N01', 'job-control', 'v2-valid-session', 'job-control:effects', ['launcher.handle', 'effect.send:SESSION_ACCEPTED'])
 addMany(['G1-N02', 'G1-N03', 'G1-N08'], 'job-control', 'v1-session', 'job-control:effects', ['effect.close:unsupported-session-launch'], ['launcher.handle'])

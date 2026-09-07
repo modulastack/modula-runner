@@ -168,18 +168,18 @@ async function observeHttpStatusMatrix(scenario: RuntimeScenario): Promise<Runti
   const recorder = createRecorder()
   recorder.record(`storage.fixture:${scenario.fixture}`)
   const cases = [
-    ['redeem-204-body', 'pairing:error:malformed-response'],
-    ['redeem-201-body', 'pairing:error:malformed-response'],
-    ['redeem-invalid-404', 'pairing:error:invalid-code'],
-    ['redeem-expired-410', 'pairing:error:expired-code'],
-    ['redeem-refused-501', 'pairing:error:refused'],
-    ['redeem-unreachable-599', 'pairing:error:unreachable'],
-    ['confirm-204-body', 'pairing:error:malformed-response'],
-    ['confirm-malformed-200', 'pairing:error:malformed-response'],
-    ['confirm-unreachable-404', 'pairing:error:unreachable'],
-    ['confirm-expired-status', 'pairing:error:expired-code'],
-    ['confirm-terminal-refusal', 'pairing:error:refused'],
-    ['confirm-unreachable-599', 'pairing:error:unreachable'],
+    ['redeem-204-body', 'pairing:error:pairing-malformed-response'],
+    ['redeem-201-body', 'pairing:error:pairing-malformed-response'],
+    ['redeem-invalid-404', 'pairing:error:pairing-invalid-code'],
+    ['redeem-expired-410', 'pairing:error:pairing-expired-code'],
+    ['redeem-refused-501', 'pairing:error:pairing-refused'],
+    ['redeem-unreachable-599', 'pairing:error:pairing-unreachable'],
+    ['confirm-204-body', 'pairing:error:pairing-malformed-response'],
+    ['confirm-malformed-200', 'pairing:error:pairing-malformed-response'],
+    ['confirm-unreachable-404', 'pairing:error:pairing-unreachable'],
+    ['confirm-expired-status', 'pairing:error:pairing-expired-code'],
+    ['confirm-terminal-refusal', 'pairing:error:pairing-refused'],
+    ['confirm-unreachable-599', 'pairing:error:pairing-unreachable'],
   ] as const
   let complete = true
   for (const [fixture, expected] of cases) {

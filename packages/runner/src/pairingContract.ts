@@ -18,17 +18,17 @@ import { assertSecureControlPlaneUrl } from './secureUrl.js'
 import type { RunnerClock } from './runtimeClock.js'
 
 export const PAIRING_CONTRACT_FAILURES = [
-  'invalid-code',
-  'expired-code',
-  'unreachable',
-  'refused',
-  'malformed-response',
-  'store-failed',
-  'settle-failed',
-  'superseded',
+  'pairing-invalid-code',
+  'pairing-expired-code',
+  'pairing-unreachable',
+  'pairing-refused',
+  'pairing-malformed-response',
+  'pairing-store-failed',
+  'pairing-settle-failed',
+  'pairing-superseded',
   'pairing-in-progress',
-  'already-paired',
-  'confirmation-uncertain',
+  'pairing-already-paired',
+  'pairing-confirmation-uncertain',
 ] as const
 export type PairingContractFailure = (typeof PAIRING_CONTRACT_FAILURES)[number]
 
@@ -143,7 +143,7 @@ class ProductionPairingContractService implements PairingContractService {
 
   async pair(controlPlaneOrigin: string, input: PairingRedemptionRequest): Promise<ContractPairingIdentity> {
     const request = parsePairingRedemptionRequest(input)
-    if (!request) throw failure('invalid-code')
+    if (!request) throw failure('pairing-invalid-code')
     const origin = secureOrigin(controlPlaneOrigin)
     const reservation = await this.reserve()
     let response: PairingHttpResponse
@@ -151,18 +151,18 @@ class ProductionPairingContractService implements PairingContractService {
       response = await this.options.transport.exchange(httpRequest(`${origin}${PAIRING_REDEEM_PATH}`, request))
     } catch {
       await this.release(reservation)
-      throw failure('unreachable')
+      throw failure('pairing-unreachable')
     }
     const status = pairingRedemptionStatus(response.status)
     if (status !== 'pending') {
       await this.release(reservation)
-      throw failure(status)
+      throw failure(protocolFailure(status))
     }
     const nowMs = this.nowMs()
     const envelope = redemptionEnvelope(response)
     if (!envelope) {
       await this.release(reservation)
-      throw failure('malformed-response')
+      throw failure('pairing-malformed-response')
     }
     const record: ContractPairingRecord = { ...envelope, controlPlaneOrigin: origin, pendingSince: new Date(nowMs).toISOString() }
     let committed: PairingMutation
@@ -173,11 +173,11 @@ class ProductionPairingContractService implements PairingContractService {
     }
     if (committed === 'storage-unavailable') {
       await this.release(reservation)
-      throw failure('store-failed')
+      throw failure('pairing-store-failed')
     }
     if (committed === 'superseded') {
       await this.snapshot()
-      throw failure('superseded')
+      throw failure('pairing-superseded')
     }
     return await this.confirm(record, false)
   }
@@ -187,7 +187,7 @@ class ProductionPairingContractService implements PairingContractService {
     if (snapshot.state === 'paired') return identityOf(snapshot.record)
     if (snapshot.state !== 'pending') return null
     const deadline = localConfirmationDeadline(snapshot.record)
-    if (!Number.isFinite(deadline)) throw failure('store-failed')
+    if (!Number.isFinite(deadline)) throw failure('pairing-store-failed')
     return await this.confirm(snapshot.record, deadline <= this.nowMs())
   }
 
@@ -195,7 +195,7 @@ class ProductionPairingContractService implements PairingContractService {
     try {
       return await this.options.store.snapshot()
     } catch {
-      throw failure('store-failed')
+      throw failure('pairing-store-failed')
     }
   }
 
@@ -207,7 +207,7 @@ class ProductionPairingContractService implements PairingContractService {
   async revoke(): Promise<void> {
     const snapshot = await this.snapshot()
     if (snapshot.state !== 'pending' && snapshot.state !== 'paired') return
-    await mutationOrThrow(() => this.options.store.revoke(snapshot.record.bindingId, this.now()), 'settle-failed')
+    await mutationOrThrow(() => this.options.store.revoke(snapshot.record.bindingId, this.now()), 'pairing-settle-failed')
   }
 
   private async reserve(): Promise<string> {
@@ -215,10 +215,10 @@ class ProductionPairingContractService implements PairingContractService {
     try {
       reservation = await this.options.store.reserve()
     } catch {
-      throw failure('store-failed')
+      throw failure('pairing-store-failed')
     }
     if (reservation.status === 'pairing-in-progress') throw failure('pairing-in-progress')
-    if (reservation.status === 'already-paired') throw failure('already-paired')
+    if (reservation.status === 'already-paired') throw failure('pairing-already-paired')
     return reservation.reservationId
   }
 
@@ -226,7 +226,7 @@ class ProductionPairingContractService implements PairingContractService {
     try {
       await this.options.store.release(reservationId)
     } catch {
-      throw failure('store-failed')
+      throw failure('pairing-store-failed')
     }
   }
 
@@ -244,49 +244,49 @@ class ProductionPairingContractService implements PairingContractService {
       return await this.unknownConfirmation(record, finalAttempt)
     }
     if (typeof response.body !== 'string' || Buffer.byteLength(response.body) > MAX_PAIRING_RESPONSE_BYTES) {
-      return await this.unknownConfirmation(record, finalAttempt, 'malformed-response')
+      return await this.unknownConfirmation(record, finalAttempt, 'pairing-malformed-response')
     }
     const status = pairingConfirmationStatus(response.status)
     if (status === 'confirmed') {
       if (response.mediaType !== 'missing' || response.body.length !== 0) {
-        return await this.unknownConfirmation(record, finalAttempt, 'malformed-response')
+        return await this.unknownConfirmation(record, finalAttempt, 'pairing-malformed-response')
       }
-      await mutationOrThrow(() => this.options.store.settle(record.bindingId, this.now()), 'settle-failed')
+      await mutationOrThrow(() => this.options.store.settle(record.bindingId, this.now()), 'pairing-settle-failed')
       return identityOf(record)
     }
     if (status === 'expired-code' || status === 'refused') {
-      await mutationOrThrow(() => this.options.store.revoke(record.bindingId, this.now()), 'settle-failed')
-      throw failure(status)
+      await mutationOrThrow(() => this.options.store.revoke(record.bindingId, this.now()), 'pairing-settle-failed')
+      throw failure(protocolFailure(status))
     }
     if (finalAttempt && finalRouteAbsent(response.status)) {
-      if (record.confirmationUnknownAt) throw failure('confirmation-uncertain')
-      await mutationOrThrow(() => this.options.store.revoke(record.bindingId, this.now()), 'settle-failed')
-      throw failure('expired-code')
+      if (record.confirmationUnknownAt) throw failure('pairing-confirmation-uncertain')
+      await mutationOrThrow(() => this.options.store.revoke(record.bindingId, this.now()), 'pairing-settle-failed')
+      throw failure('pairing-expired-code')
     }
     if (status === 'unreachable' && response.status >= 500) return await this.unknownConfirmation(record, finalAttempt)
-    if (status === 'malformed-response') return await this.unknownConfirmation(record, finalAttempt, status)
-    if (finalAttempt) throw failure('confirmation-uncertain')
-    throw failure(status)
+    if (status === 'malformed-response') return await this.unknownConfirmation(record, finalAttempt, protocolFailure(status))
+    if (finalAttempt) throw failure('pairing-confirmation-uncertain')
+    throw failure(protocolFailure(status))
   }
 
   private async unknownConfirmation(
     record: ContractPairingRecord,
     finalAttempt: boolean,
-    nonFinalFailure: PairingContractFailure = 'unreachable',
+    nonFinalFailure: PairingContractFailure = 'pairing-unreachable',
   ): Promise<never> {
-    await mutationOrThrow(() => this.options.store.markConfirmationUnknown(record.bindingId, this.now()), 'settle-failed')
-    throw failure(finalAttempt ? 'confirmation-uncertain' : nonFinalFailure)
+    await mutationOrThrow(() => this.options.store.markConfirmationUnknown(record.bindingId, this.now()), 'pairing-settle-failed')
+    throw failure(finalAttempt ? 'pairing-confirmation-uncertain' : nonFinalFailure)
   }
 
   private now(): string {
     const date = new Date(this.nowMs())
-    if (!Number.isFinite(date.getTime())) throw failure('store-failed')
+    if (!Number.isFinite(date.getTime())) throw failure('pairing-store-failed')
     return date.toISOString()
   }
 
   private nowMs(): number {
     const value = this.options.clock.now()
-    if (!Number.isFinite(value)) throw failure('store-failed')
+    if (!Number.isFinite(value)) throw failure('pairing-store-failed')
     return value
   }
 }
@@ -311,10 +311,10 @@ function secureOrigin(input: string): string {
   try {
     assertSecureControlPlaneUrl(input)
   } catch {
-    throw failure('refused')
+    throw failure('pairing-refused')
   }
   const origin = canonicalPairingOrigin(input)
-  if (!origin) throw failure('refused')
+  if (!origin) throw failure('pairing-refused')
   return origin
 }
 
@@ -326,7 +326,7 @@ function confirmationProof(record: ContractPairingRecord): string {
     confirmationNonce: record.confirmationNonce,
   })
   const token = pairingSecretBytes(record.token)
-  if (!message || !token) throw failure('malformed-response')
+  if (!message || !token) throw failure('pairing-malformed-response')
   return createHmac('sha256', token).update(message, 'utf8').digest('hex')
 }
 
@@ -343,7 +343,7 @@ function httpRequest(url: string, body: unknown): PairingHttpRequest {
 
 async function mutationOrThrow(
   operation: () => Promise<PairingMutation>,
-  storageFailure: Extract<PairingContractFailure, 'settle-failed'>,
+  storageFailure: Extract<PairingContractFailure, 'pairing-settle-failed'>,
 ): Promise<void> {
   let result: PairingMutation
   try {
@@ -351,7 +351,7 @@ async function mutationOrThrow(
   } catch {
     throw failure(storageFailure)
   }
-  if (result === 'superseded') throw failure('superseded')
+  if (result === 'superseded') throw failure('pairing-superseded')
   if (result === 'storage-unavailable') throw failure(storageFailure)
 }
 
@@ -361,6 +361,12 @@ function finalRouteAbsent(status: number): boolean {
 
 function identityOf(record: ContractPairingRecord): ContractPairingIdentity {
   return { bindingId: record.bindingId, runnerId: record.runnerId }
+}
+
+function protocolFailure(
+  reason: Exclude<ReturnType<typeof pairingRedemptionStatus>, 'pending'>,
+): PairingContractFailure {
+  return `pairing-${reason}`
 }
 
 function failure(reason: PairingContractFailure): PairingContractError {

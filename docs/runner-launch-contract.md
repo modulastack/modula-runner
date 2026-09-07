@@ -195,31 +195,31 @@ or proof is not accepted for another binding, runner, or origin.
 ### Pairing state and status mapping
 
 The local pairing operation durably reserves the store before redemption. `unpaired` or `revoked`
-may reserve; `pending` returns `pairing-in-progress`; `paired` returns `already-paired`. Concurrent
-calls serialize at that reservation, so only one code reaches the control plane. If no valid pending
-envelope is durably stored—any redemption failure, unknown/lost response, or local store failure—the
-reservation is cleared in the same serialized operation. A successfully stored envelope commits the
-reservation to `pending` until settlement, terminal refusal/expiry, or explicit revocation. Re-pair
-after revocation gets a new `bindingId`; compare-and-swap prevents stale confirmation from settling
-or revoking it.
+may reserve; `pending` returns `pairing-in-progress`; `paired` returns
+`pairing-already-paired`. Concurrent calls serialize at that reservation, so only one code reaches
+the control plane. If no valid pending envelope is durably stored—any redemption failure,
+unknown/lost response, or local store failure—the reservation is cleared in the same serialized
+operation. A successfully stored envelope commits the reservation to `pending` until settlement,
+terminal refusal/expiry, or explicit revocation. Re-pair after revocation gets a new `bindingId`;
+compare-and-swap prevents stale confirmation from settling or revoking it.
 
 | HTTP result | Redemption outcome | Confirmation outcome |
 |---|---|---|
-| `100`–`199` | `malformed-response`; clear reservation | `malformed-response`; remain pending |
-| `200` | Parse/store pending envelope; otherwise `malformed-response` and clear | `malformed-response`; remain pending (confirmation requires `204`) |
-| `201`–`203`, `205`–`299` | `malformed-response`; clear reservation | `malformed-response`; remain pending |
-| `204` | `malformed-response`; clear reservation | Confirmed/idempotently confirmed only with an empty body |
-| `300`–`399` | `unreachable`; clear reservation | `unreachable`; remain pending |
-| `400`, `401` | `invalid-code`; clear reservation | `refused`; atomically revoke pending |
-| `403`, `422` | `refused`; clear reservation | `refused`; atomically revoke pending |
-| `404` | `invalid-code`; clear reservation | `unreachable`; remain pending (an adopted counterpart uses `410` for unknown/expired pending) |
-| `405`, `501` | `refused`; clear reservation | `unreachable`; remain pending (route absent/version skew) |
-| `409`, `410` | `expired-code`; clear reservation | `expired-code`; atomically revoke pending |
-| `429` | `unreachable`; clear reservation | `unreachable`; remain pending |
-| Any other `4xx` | `refused`; clear reservation | `refused`; atomically revoke pending |
-| `500`–`599` | `unreachable`; clear reservation | `unreachable`; remain pending |
-| Timeout, network failure, redirect | `unreachable`; clear reservation | `unreachable`; remain pending and record an unknown confirmation result |
-| Wrong media type, oversized/malformed body, invalid fields | `malformed-response`; clear reservation | `malformed-response`; remain pending |
+| `100`–`199` | `pairing-malformed-response`; clear reservation | `pairing-malformed-response`; remain pending |
+| `200` | Parse/store pending envelope; otherwise `pairing-malformed-response` and clear | `pairing-malformed-response`; remain pending (confirmation requires `204`) |
+| `201`–`203`, `205`–`299` | `pairing-malformed-response`; clear reservation | `pairing-malformed-response`; remain pending |
+| `204` | `pairing-malformed-response`; clear reservation | Confirmed/idempotently confirmed only with an empty body |
+| `300`–`399` | `pairing-unreachable`; clear reservation | `pairing-unreachable`; remain pending |
+| `400`, `401` | `pairing-invalid-code`; clear reservation | `pairing-refused`; atomically revoke pending |
+| `403`, `422` | `pairing-refused`; clear reservation | `pairing-refused`; atomically revoke pending |
+| `404` | `pairing-invalid-code`; clear reservation | `pairing-unreachable`; remain pending (an adopted counterpart uses `410` for unknown/expired pending) |
+| `405`, `501` | `pairing-refused`; clear reservation | `pairing-unreachable`; remain pending (route absent/version skew) |
+| `409`, `410` | `pairing-expired-code`; clear reservation | `pairing-expired-code`; atomically revoke pending |
+| `429` | `pairing-unreachable`; clear reservation | `pairing-unreachable`; remain pending |
+| Any other `4xx` | `pairing-refused`; clear reservation | `pairing-refused`; atomically revoke pending |
+| `500`–`599` | `pairing-unreachable`; clear reservation | `pairing-unreachable`; remain pending |
+| Timeout, network failure, redirect | `pairing-unreachable`; clear reservation | `pairing-unreachable`; remain pending and record an unknown confirmation result |
+| Wrong media type, oversized/malformed body, invalid fields | `pairing-malformed-response`; clear reservation | `pairing-malformed-response`; remain pending |
 
 Redemption is never automatically replayed after an unknown result because the code may already be
 spent. Confirmation may replay only the exact stored envelope. The server treats a valid proof as
@@ -234,14 +234,17 @@ revoked/expired locally. A final route-absent
 `404`, `405`, or `501` permits local expiry only when every earlier confirmation attempt also ended
 in a definite route-absent response. After any network, timeout, `5xx`, malformed response, or other
 unknown result, a later route-absent response cannot disprove prior activation: the binding remains
-`pending` and status reports `confirmation-uncertain`. Automatic retry and re-pair stop, while an
-operator may run `status` to redrive that same proof or revoke/inspect the counterpart. This prevents
-permanent route-skew retry without treating a possibly successful confirmation as safe to replace.
+`pending` and status reports `pairing-confirmation-uncertain`. Automatic retry and re-pair stop,
+while an operator may run `status` to redrive that same proof or revoke/inspect the counterpart. This
+prevents permanent route-skew retry without treating a possibly successful confirmation as safe to
+replace.
 
-Local settlement failure remains `settle-failed`; a stale compare-and-swap remains `superseded`.
+Local settlement failure remains `pairing-settle-failed`; a stale compare-and-swap remains
+`pairing-superseded`.
 
-This adds `pairing-in-progress`, `already-paired`, and `confirmation-uncertain` to the finite local
-`PairingFailure` vocabulary. None is put on the wire.
+This adds `pairing-in-progress`, `pairing-already-paired`, and
+`pairing-confirmation-uncertain` to the finite local `PairingContractFailure` vocabulary. None is put
+on the wire.
 
 ## Part 2 — protocol version and launch messages
 

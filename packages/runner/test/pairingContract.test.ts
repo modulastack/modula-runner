@@ -116,7 +116,7 @@ describe('production pairing contract', () => {
 
   it('never replays an unknown redemption and releases its reservation', async () => {
     const subject = service([new Error('response lost')])
-    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'unreachable' })
+    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'pairing-unreachable' })
     expect(subject.held.events).toEqual(['reserve', 'release'])
     expect(subject.requests).toHaveLength(1)
   })
@@ -125,21 +125,21 @@ describe('production pairing contract', () => {
     const held = store()
     held.value.commitPending = async () => { held.events.push('commit'); return 'storage-unavailable' }
     const subject = service([redemption()], held)
-    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'store-failed' })
+    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'pairing-store-failed' })
     expect(held.events).toEqual(['reserve', 'commit', 'release'])
     expect(subject.requests).toHaveLength(1)
   })
 
   it('keeps a durable pending binding resumable after ambiguous confirmation loss', async () => {
     const subject = service([redemption(), new Error('confirmation lost')])
-    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'unreachable' })
+    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'pairing-unreachable' })
     expect(subject.held.events).toEqual(['reserve', 'commit', 'unknown'])
     expect(subject.held.snapshot()).toMatchObject({ state: 'pending', record: { confirmationUnknownAt: '2026-08-21T00:00:00.000Z' } })
   })
 
   it('revokes terminal confirmation refusal and leaves no retry path', async () => {
     const subject = service([redemption(), confirmation(403)])
-    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'refused' })
+    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'pairing-refused' })
     expect(subject.held.events).toEqual(['reserve', 'commit', 'revoke'])
     expect(subject.held.snapshot().state).toBe('revoked')
   })
@@ -163,12 +163,12 @@ describe('production pairing contract', () => {
     }
     const before = store({ state: 'pending', record })
     await expect(service([confirmation(404)], before, Date.parse('2026-08-21T00:09:59Z')).value.resumeConfirmation())
-      .rejects.toMatchObject({ failure: 'unreachable' })
+      .rejects.toMatchObject({ failure: 'pairing-unreachable' })
     expect(before.snapshot().state).toBe('pending')
 
     const atDeadline = store({ state: 'pending', record })
     await expect(service([confirmation(404)], atDeadline, Date.parse('2026-08-21T00:10:00Z')).value.resumeConfirmation())
-      .rejects.toMatchObject({ failure: 'expired-code' })
+      .rejects.toMatchObject({ failure: 'pairing-expired-code' })
     expect(atDeadline.snapshot().state).toBe('revoked')
   })
 
@@ -181,7 +181,7 @@ describe('production pairing contract', () => {
     }
     const held = store({ state: 'pending', record })
     const subject = service([new Error('still unknown')], held, Date.parse(envelope.confirmationExpiresAt))
-    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'confirmation-uncertain' })
+    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'pairing-confirmation-uncertain' })
     expect(held.events).toEqual(['unknown'])
   })
 
@@ -194,7 +194,7 @@ describe('production pairing contract', () => {
     }
     const held = store({ state: 'pending', record })
     const subject = service([confirmation(404)], held, Date.parse(envelope.confirmationExpiresAt))
-    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'confirmation-uncertain' })
+    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'pairing-confirmation-uncertain' })
     expect(held.events).toEqual([])
     expect(held.snapshot().state).toBe('pending')
   })
@@ -207,7 +207,7 @@ describe('production pairing contract', () => {
     }
     const held = store({ state: 'pending', record })
     const subject = service([confirmation(404)], held, Date.parse(envelope.confirmationExpiresAt))
-    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'expired-code' })
+    await expect(subject.value.resumeConfirmation()).rejects.toMatchObject({ failure: 'pairing-expired-code' })
     expect(held.events).toEqual(['revoke'])
     expect(held.snapshot().state).toBe('revoked')
   })
@@ -215,7 +215,7 @@ describe('production pairing contract', () => {
   it('records malformed confirmation success as unknown before reporting it', async () => {
     const malformed = { status: 204, mediaType: 'application/json' as const, body: '{}' }
     const subject = service([redemption(), malformed])
-    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'malformed-response' })
+    await expect(subject.value.pair('https://example.test', request)).rejects.toMatchObject({ failure: 'pairing-malformed-response' })
     expect(subject.held.events).toEqual(['reserve', 'commit', 'unknown'])
     expect(subject.held.snapshot()).toMatchObject({ state: 'pending', record: { confirmationUnknownAt: '2026-08-21T00:00:00.000Z' } })
   })
