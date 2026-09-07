@@ -603,6 +603,14 @@ export class TerminalSession {
         return false
       }
     }
+    if (killSession && !this.paneCompleted) {
+      if (await completeDurably(this.paneComplete, terminatedPaneOutcome())) this.paneCompleted = true
+    }
+    this.finishDisposal()
+    return true
+  }
+
+  private finishDisposal() {
     this.killUnconfirmed = false
     this.phase = 'disposed'
     if (this.flushTimer) clearTimeout(this.flushTimer)
@@ -621,7 +629,6 @@ export class TerminalSession {
       proc?.kill()
     } catch {}
     this.removeExitDir()
-    return true
   }
 
   private handleInit(message: { cols: number; rows: number; profile?: string }) {
@@ -753,7 +760,7 @@ export class TerminalSession {
     // The pane command's admission is answered by the session's own end-of-life, since the
     // command's lifetime is the session's. Once, because every exit path lands here.
     if (!this.paneCompleted) {
-      const outcome: SpawnOutcome = exit.exitCode !== null ? { exitCode: exit.exitCode, signal: null } : exit.signal !== null ? { exitCode: null, signal: exit.signal } : { spawnFailed: true }
+      const outcome: SpawnOutcome = exit.exitCode !== null ? { exitCode: exit.exitCode, signal: null } : exit.signal !== null ? { exitCode: null, signal: exit.signal } : terminatedPaneOutcome()
       // AS-21: the sequenced EXIT is the acknowledgment, and it must not be sent before the pane's
       // outcome record is durable. A burst inside `completeDurably` just failed, so the EXIT is
       // withheld and re-driven on a slow cadence until the append recovers — then the outcome
