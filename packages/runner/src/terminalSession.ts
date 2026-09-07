@@ -331,8 +331,11 @@ export class TerminalSession {
     const paneComplete = authorized.authorization.complete
     // The command launches in the RESOLVED real directory the seam authorized, not the caller's
     // pathname: a symlink swapped between the grant check and the tmux call would otherwise run an
-    // allowlisted command outside the grant.
-    const vettedCwd = authorized.authorization.vetted.cwd
+    // allowlisted command outside the grant. The executable is taken from the same admission for
+    // the same reason: the seam resolves an absolute path once and audits what it approved, so
+    // handing tmux the caller's spelling would let the kernel resolve it a second time and run a
+    // file the audit record does not name.
+    const { command: vettedCommand, cwd: vettedCwd } = authorized.authorization.vetted
     const exitDir = mkdtempSync(path.join(tmpdir(), 'modula-runner-'))
     const ref = { socket: spec.socket ?? worktreeSocket(spec.cwd), sessionName: tmuxSessionName(spec.cwd, id) }
     // A half-launched session is torn down whole: a failed attach must not
@@ -346,7 +349,7 @@ export class TerminalSession {
         file: '/bin/sh',
         // The seam gates and audits the session's creation — the one tmux call that launches
         // the pane's command.
-        args: ['-c', handoff ? `${SECRET_PRELUDE}${EXIT_WRAPPER}` : EXIT_WRAPPER, spec.command, ...(spec.args ?? [])],
+        args: ['-c', handoff ? `${SECRET_PRELUDE}${EXIT_WRAPPER}` : EXIT_WRAPPER, vettedCommand, ...(spec.args ?? [])],
         // Only the PATH of the handoff rides tmux's `-e` arguments, never its contents: a
         // path is not a credential, and this one names a file no other user can open.
         //

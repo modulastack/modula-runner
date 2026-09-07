@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  SessionReceiptBusyError,
   createSessionChannelEventCoordinator,
   type SessionChannelEvent,
   type SessionReceipt,
@@ -134,5 +135,23 @@ describe('generation-scoped channel events', () => {
       .resolves.toEqual({ status: 'storage-unavailable' })
     expect(held.current()).toMatchObject({ state: 'started', channel: { lifecycle: 'live' } })
     expect(held.order).toEqual(['audit'])
+  })
+
+  it('reports a saturated ledger as busy rather than as storage that cannot record', async () => {
+    const current = receipt()
+    const receipts: SessionReceiptLedger = {
+      lookup: async () => ({ status: 'receipt', receipt: structuredClone(current) }),
+      claim: async () => ({ status: 'storage-unavailable' }),
+      replace: async () => { throw new SessionReceiptBusyError() },
+      recover: async () => [structuredClone(current)],
+      compact: async () => undefined,
+    }
+    const coordinator = createSessionChannelEventCoordinator({
+      receipts,
+      audit: { append: async () => undefined },
+      clock: { now: () => Date.parse('2026-08-22T00:01:00Z'), sleep: async () => undefined },
+    })
+
+    await expect(coordinator.handle(terminalEvent(0, null))).resolves.toEqual({ status: 'busy' })
   })
 })
